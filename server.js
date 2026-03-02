@@ -1,21 +1,22 @@
 require("dotenv").config();
 const express = require("express");
 const { google } = require("googleapis");
-const fs = require("fs");
-const path = require("path");
+const { supabase } = require("./supabaseClient");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 🔐 Credenciales desde .env
+// 🔐 Credenciales OAuth (TU app, únicas)
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI;
 
 const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
 
-// 📁 Ruta del archivo donde guardaremos el token
-const TOKEN_PATH = path.join(__dirname, "token.json");
+// ✅ Cliente fijo (por ahora)
+const CLIENTE_FIJO = "cliente_demo";
+const CAL_FIJO = "principal";
+const GOOGLE_CALENDAR_ID = "primary";
 
 const oAuth2Client = new google.auth.OAuth2(
   CLIENT_ID,
@@ -23,14 +24,7 @@ const oAuth2Client = new google.auth.OAuth2(
   REDIRECT_URI
 );
 
-// 🔹 Cargar token si ya existe
-if (fs.existsSync(TOKEN_PATH)) {
-  const savedToken = JSON.parse(fs.readFileSync(TOKEN_PATH));
-  oAuth2Client.setCredentials(savedToken);
-  console.log("✅ token.json cargado correctamente");
-} else {
-  console.log("⚠️ No existe token.json. Debes autorizar en /auth");
-}
+console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
 
 // 🔹 Paso 1: Generar autorización
 app.get("/auth", (req, res) => {
@@ -42,11 +36,12 @@ app.get("/auth", (req, res) => {
 
   res.send(`
     <h2>Autorizar Google Calendar</h2>
+    <p>Cliente: <b>${CLIENTE_FIJO}</b> | Calendario: <b>${CAL_FIJO}</b></p>
     <a href="${url}">Haz clic aquí para autorizar</a>
   `);
 });
 
-// 🔹 Paso 2: Callback de Google
+// 🔹 Paso 2: Callback de Google (guardar tokens en Supabase)
 app.get("/oauth2callback", async (req, res) => {
   try {
     const code = req.query.code;
@@ -54,24 +49,61 @@ app.get("/oauth2callback", async (req, res) => {
     const { tokens } = await oAuth2Client.getToken(code);
     oAuth2Client.setCredentials(tokens);
 
-    // 💾 Guardar token en archivo
-    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
+    if (!tokens.refresh_token) {
+      return res
+        .status(400)
+        .send(
+          "⚠️ No vino refresh_token. Revoca acceso a la app en tu cuenta Google y reautoriza en /auth."
+        );
+    }
 
-    console.log("✅ token.json guardado correctamente");
+    const { error } = await supabase
+      .from("calendar_tokens")
+      .upsert(
+        {
+          client_id: CLIENTE_FIJO,
+          calendar_name: CAL_FIJO,
+          google_calendar_id: GOOGLE_CALENDAR_ID,
+          refresh_token: tokens.refresh_token,
+          access_token: tokens.access_token ?? null,
+          token_type: tokens.token_type ?? null,
+          scope: tokens.scope ?? null,
+          expiry_date: tokens.expiry_date ?? null,
+        },
+        { onConflict: "client_id,calendar_name" }
+      );
 
-    res.send("✅ Autorizado y guardado. Ahora entra a /test-event");
+    if (error) throw error;
+
+    console.log("✅ Tokens guardados en Supabase");
+
+    res.send("✅ Autorizado y guardado en Supabase. Ahora entra a /test-event");
   } catch (error) {
     console.error(error);
-    res.status(500).send("Error en OAuth callback");
+    res.status(500).send("Error en OAuth callback: " + error.message);
   }
 });
 
-// 🔹 Crear evento de prueba
+// 🔹 Crear evento de prueba (leer refresh_token desde Supabase)
 app.get("/test-event", async (req, res) => {
   try {
-    if (!oAuth2Client.credentials || !oAuth2Client.credentials.access_token) {
-      return res.status(401).send("⚠️ No hay token cargado. Entra a /auth primero.");
+    const { data, error } = await supabase
+      .from("calendar_tokens")
+      .select("*")
+      .eq("client_id", CLIENTE_FIJO)
+      .eq("calendar_name", CAL_FIJO)
+      .single();
+
+    if (error) throw error;
+
+    if (!data?.refresh_token) {
+      return res
+        .status(401)
+        .send("⚠️ No hay token en Supabase. Entra a /auth primero.");
     }
+
+    // Usamos el refresh_token para que googleapis gestione access_token automáticamente
+    oAuth2Client.setCredentials({ refresh_token: data.refresh_token });
 
     const calendar = google.calendar({
       version: "v3",
@@ -82,14 +114,14 @@ app.get("/test-event", async (req, res) => {
     const end = new Date(start.getTime() + 30 * 60 * 1000);
 
     const event = {
-      summary: "Prueba Proyecto Independizar",
-      description: "Evento con token persistente",
+      summary: "Prueba Proyecto Independizar (Supabase)",
+      description: "Evento con token persistente en Supabase",
       start: { dateTime: start.toISOString() },
       end: { dateTime: end.toISOString() },
     };
 
     const response = await calendar.events.insert({
-      calendarId: "primary",
+      calendarId: data.google_calendar_id || "primary",
       requestBody: event,
     });
 
@@ -98,7 +130,7 @@ app.get("/test-event", async (req, res) => {
     );
   } catch (error) {
     console.error(error);
-    res.status(500).send("Error creando evento.");
+    res.status(500).send("Error creando evento: " + error.message);
   }
 });
 
