@@ -4,6 +4,7 @@ const { google } = require("googleapis");
 const { supabase } = require("./supabaseClient");
 
 const app = express();
+app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 // ✅ PASO 1: habilitar JSON body
@@ -285,7 +286,97 @@ app.post("/appointments", async (req, res) => {
 app.get("/_ping", (req, res) => {
   res.send("pong ✅");
 });
+app.post("/appointments", async (req, res) => {
+  try {
+    const {
+      calendar_id,
+      date,         // "YYYY-MM-DD" (en horario del calendario, ej America/Santiago)
+      slot_start,   // ISO string con zona o UTC, ej "2026-03-18T14:00:00.000Z"
+      customer_name,
+      customer_phone,
+      source = "web",
+    } = req.body;
 
+    if (!calendar_id || !date || !slot_start) {
+      return res.status(400).json({
+        error: "Faltan campos: calendar_id, date (YYYY-MM-DD) y slot_start (ISO)",
+      });
+    }
+
+    // 1) Traer config del calendario (slot_minutes + buffer_minutes + tenant_id)
+    const { data: cal, error: calErr } = await supabase
+      .from("calendars")
+      .select("tenant_id, slot_minutes, buffer_minutes, timezone, is_active")
+      .eq("id", calendar_id)
+      .single();
+
+    if (calErr || !cal) {
+      return res.status(404).json({ error: "Calendario no encontrado" });
+    }
+    if (!cal.is_active) {
+      return res.status(400).json({ error: "Calendario inactivo" });
+    }
+
+    const slotMinutes = cal.slot_minutes ?? 30;
+    const bufferMinutes = cal.buffer_minutes ?? 0;
+
+    // 2) Verificar que slot_start sea realmente un slot disponible (anti “doble reserva”)
+    const { data: slots, error: slotsErr } = await supabase.rpc(
+      "get_available_slots",
+      { _calendar_id: calendar_id, _day: date }
+    );
+
+    if (slotsErr) {
+      return res.status(500).json({ error: slotsErr.message });
+    }
+
+    const wantedStart = new Date(slot_start).toISOString();
+    const found = (slots || []).some((s) => {
+      // s.slot_start viene como string ISO con +00
+      return new Date(s.slot_start).toISOString() === wantedStart;
+    });
+
+    if (!found) {
+      return res.status(409).json({
+        error: "Ese horario ya no está disponible",
+        hint: "Vuelve a consultar /slots y elige otro slot_start",
+      });
+    }
+
+    // 3) Calcular end_at = start + slot + buffer
+    const start = new Date(slot_start);
+    const end = new Date(start.getTime() + (slotMinutes + bufferMinutes) * 60 * 1000);
+
+    // 4) Insertar cita (si hay choque, la DB lo rechazará por el constraint)
+    const { data: appt, error: insErr } = await supabase
+      .from("appointments")
+      .insert({
+        tenant_id: cal.tenant_id,
+        calendar_id,
+        customer_name: customer_name ?? null,
+        customer_phone: customer_phone ?? null,
+        start_at: start.toISOString(),
+        end_at: end.toISOString(),
+        source,
+        status: "booked",
+      })
+      .select("*")
+      .single();
+
+    if (insErr) {
+      // Si hay overlap constraint, lo tratamos como conflicto
+      const msg = (insErr.message || "").toLowerCase();
+      if (msg.includes("overlap") || msg.includes("conflict") || msg.includes("exclude")) {
+        return res.status(409).json({ error: "Choque de horario (ya reservado)" });
+      }
+      return res.status(500).json({ error: insErr.message });
+    }
+
+    return res.status(201).json({ ok: true, appointment: appt });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 /* ======================================================
    🚀 INICIAR SERVIDOR
 ====================================================== */
