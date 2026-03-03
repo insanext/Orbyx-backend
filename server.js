@@ -426,6 +426,83 @@ app.delete("/appointments/:id", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+app.post("/appointments/slot", async (req, res) => {
+  try {
+    const {
+      calendar_id,
+      date, // "YYYY-MM-DD"
+      slot_start, // ISO (copiado desde /slots)
+      customer_name,
+      customer_phone,
+      source = "whatsapp",
+    } = req.body;
+
+    if (!calendar_id || !date || !slot_start || !customer_name || !customer_phone) {
+      return res.status(400).json({
+        error:
+          "Faltan campos: calendar_id, date (YYYY-MM-DD), slot_start (ISO), customer_name, customer_phone",
+      });
+    }
+
+    const { data: cal, error: calErr } = await supabase
+      .from("calendars")
+      .select("tenant_id, slot_minutes, buffer_minutes, is_active")
+      .eq("id", calendar_id)
+      .single();
+
+    if (calErr || !cal) return res.status(404).json({ error: "Calendario no encontrado" });
+    if (!cal.is_active) return res.status(400).json({ error: "Calendario inactivo" });
+
+    const slotMinutes = cal.slot_minutes ?? 30;
+    const bufferMinutes = cal.buffer_minutes ?? 0;
+
+    const { data: slots, error: slotsErr } = await supabase.rpc("get_available_slots", {
+      _calendar_id: calendar_id,
+      _day: date,
+    });
+
+    if (slotsErr) return res.status(500).json({ error: slotsErr.message });
+
+    const wantedStartIso = new Date(slot_start).toISOString();
+    const ok = (slots || []).some((s) => new Date(s.slot_start).toISOString() === wantedStartIso);
+
+    if (!ok) {
+      return res.status(409).json({
+        error: "Ese horario ya no está disponible. Vuelve a pedir slots y elige otro.",
+      });
+    }
+
+    const start = new Date(slot_start);
+    const end = new Date(start.getTime() + (slotMinutes + bufferMinutes) * 60 * 1000);
+
+    const { data: appt, error: insErr } = await supabase
+      .from("appointments")
+      .insert({
+        tenant_id: cal.tenant_id,
+        calendar_id,
+        customer_name,
+        customer_phone,
+        start_at: start.toISOString(),
+        end_at: end.toISOString(),
+        status: "booked",
+        source,
+      })
+      .select("*")
+      .single();
+
+    if (insErr) {
+      const msg = (insErr.message || "").toLowerCase();
+      if (msg.includes("exclude") || msg.includes("overlap") || msg.includes("conflict")) {
+        return res.status(409).json({ error: "Ese horario ya fue tomado (choque de horario)." });
+      }
+      return res.status(500).json({ error: insErr.message });
+    }
+
+    return res.status(201).json({ ok: true, appointment: appt });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 /* ======================================================
    🚀 INICIAR SERVIDOR
 ====================================================== */
