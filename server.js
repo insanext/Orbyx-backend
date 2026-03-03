@@ -26,7 +26,9 @@ const oAuth2Client = new google.auth.OAuth2(
 
 console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
 
-// 🔹 Paso 1: Generar autorización
+/* ======================================================
+   🔹 ENDPOINT 1: Generar autorización Google
+====================================================== */
 app.get("/auth", (req, res) => {
   const url = oAuth2Client.generateAuthUrl({
     access_type: "offline",
@@ -41,7 +43,9 @@ app.get("/auth", (req, res) => {
   `);
 });
 
-// 🔹 Paso 2: Callback de Google (guardar tokens en Supabase)
+/* ======================================================
+   🔹 ENDPOINT 2: Callback Google OAuth
+====================================================== */
 app.get("/oauth2callback", async (req, res) => {
   try {
     const code = req.query.code;
@@ -84,7 +88,9 @@ app.get("/oauth2callback", async (req, res) => {
   }
 });
 
-// 🔹 Crear evento de prueba (leer refresh_token desde Supabase)
+/* ======================================================
+   🔹 ENDPOINT 3: Crear evento de prueba
+====================================================== */
 app.get("/test-event", async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -102,7 +108,6 @@ app.get("/test-event", async (req, res) => {
         .send("⚠️ No hay token en Supabase. Entra a /auth primero.");
     }
 
-    // Usamos el refresh_token para que googleapis gestione access_token automáticamente
     oAuth2Client.setCredentials({ refresh_token: data.refresh_token });
 
     const calendar = google.calendar({
@@ -134,6 +139,44 @@ app.get("/test-event", async (req, res) => {
   }
 });
 
+/* ======================================================
+   🔹 ENDPOINT 4: Obtener slots disponibles
+====================================================== */
+app.get("/slots", async (req, res) => {
+  try {
+    const { calendar_id, date } = req.query;
+
+    if (!calendar_id || !date) {
+      return res.status(400).json({
+        error: "Faltan parámetros: calendar_id y date (YYYY-MM-DD)",
+      });
+    }
+
+    const { data, error } = await supabase.rpc("get_available_slots", {
+      _calendar_id: calendar_id,
+      _day: date,
+    });
+
+    if (error) {
+      console.error(error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({
+      calendar_id,
+      date,
+      total: data?.length || 0,
+      slots: data || [],
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   🚀 INICIAR SERVIDOR
+====================================================== */
 app.listen(PORT, () => {
   console.log(`🚀 Servidor listo en http://localhost:${PORT}`);
 });
