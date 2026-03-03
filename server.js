@@ -25,7 +25,7 @@ const oAuth2Client = new google.auth.OAuth2(
 );
 
 console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
-
+console.log("🔥 VERSION: PING+SLOTS DEPLOYED");
 /* ======================================================
    🔹 ENDPOINT 1: Generar autorización Google
 ====================================================== */
