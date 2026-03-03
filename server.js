@@ -377,6 +377,55 @@ app.post("/appointments", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+app.delete("/appointments/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 1) Buscar la cita en BD
+    const { data: appt, error: apptErr } = await supabase
+      .from("appointments")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (apptErr || !appt) {
+      return res.status(404).json({ error: "Appointment no encontrado" });
+    }
+
+    // 2) Borrar evento en Google Calendar (si existe event_id)
+    if (appt.event_id) {
+      const { data: tokenRow, error: tokErr } = await supabase
+        .from("calendar_tokens")
+        .select("*")
+        .eq("client_id", CLIENTE_FIJO)
+        .eq("calendar_name", CAL_FIJO)
+        .single();
+
+      if (!tokErr && tokenRow?.refresh_token) {
+        oAuth2Client.setCredentials({ refresh_token: tokenRow.refresh_token });
+
+        const calendar = google.calendar({ version: "v3", auth: oAuth2Client });
+
+        await calendar.events.delete({
+          calendarId: tokenRow.google_calendar_id || "primary",
+          eventId: appt.event_id,
+        });
+      }
+    }
+
+    // 3) Borrar en Supabase
+    const { error: delErr } = await supabase
+      .from("appointments")
+      .delete()
+      .eq("id", id);
+
+    if (delErr) return res.status(500).json({ error: delErr.message });
+
+    return res.json({ ok: true, deleted_id: id });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 /* ======================================================
    🚀 INICIAR SERVIDOR
 ====================================================== */
