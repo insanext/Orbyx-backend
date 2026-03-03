@@ -173,7 +173,9 @@ app.get("/slots", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
+app.get("/_ping", (req, res) => {
+  res.send("pong ✅");
+});
 /* ======================================================
    🚀 INICIAR SERVIDOR
 ====================================================== */
