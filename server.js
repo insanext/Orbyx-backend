@@ -8,22 +8,40 @@ const { supabase } = require("./supabaseClient");
 const app = express();
 
 /* ======================================================
-   ✅ CORS (SOLUCIÓN)
-   - Permite llamadas desde tu Vercel + dominio
-   - Responde preflight (OPTIONS) siempre
+   ✅ CORS (ROBUSTO)
+   - Permite Vercel + dominio
+   - Preflight OPTIONS sin romper Express (NO usar "*")
 ====================================================== */
-app.use(
-  cors({
-    origin: [
-      "https://app.orbyx.cl",
-      "https://orbyx-dashboard.vercel.app",
-    ],
-    methods: ["GET", "POST", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false,
-  })
-);
-app.options("*", cors()); // ✅ preflight
+const ALLOWED_ORIGINS = new Set([
+  "https://app.orbyx.cl",
+  "https://orbyx-dashboard.vercel.app",
+  // Si tienes preview deployments en Vercel y quieres permitirlos:
+  // "https://orbyx-dashboard-git-xxxxx.vercel.app",
+]);
+
+const corsOptions = {
+  origin: (origin, cb) => {
+    // Permite requests sin origin (Postman / server-to-server)
+    if (!origin) return cb(null, true);
+
+    if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
+
+    // (Opcional) permitir previews de Vercel:
+    // if (/^https:\/\/.*\.vercel\.app$/.test(origin)) return cb(null, true);
+
+    return cb(new Error("Not allowed by CORS: " + origin));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false,
+};
+
+app.use(cors(corsOptions));
+
+// 🔥 IMPORTANTE: NO usar "*" aquí (rompe en tu stack)
+app.options("/*", cors(corsOptions));
+// alternativa equivalente:
+// app.options(/.*/, cors(corsOptions));
 
 app.use(express.json());
 
@@ -40,7 +58,11 @@ const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
 const CLIENTE_FIJO = "cliente_demo";
 const CAL_FIJO = "principal";
 
-const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+const oAuth2Client = new google.auth.OAuth2(
+  CLIENT_ID,
+  CLIENT_SECRET,
+  REDIRECT_URI
+);
 
 console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
 console.log("🔥 VERSION: SAAS_TOKEN_BY_CALENDAR_ID + HISTORY DEPLOYED");
@@ -144,7 +166,9 @@ app.get("/oauth2callback", async (req, res) => {
     let state = {};
     try {
       if (stateRaw) {
-        state = JSON.parse(Buffer.from(String(stateRaw), "base64url").toString("utf8"));
+        state = JSON.parse(
+          Buffer.from(String(stateRaw), "base64url").toString("utf8")
+        );
       }
     } catch (_) {
       state = {};
@@ -156,7 +180,9 @@ app.get("/oauth2callback", async (req, res) => {
     if (!tokens.refresh_token) {
       return res
         .status(400)
-        .send("⚠️ No vino refresh_token. Revoca acceso a la app en tu cuenta Google y reautoriza en /auth.");
+        .send(
+          "⚠️ No vino refresh_token. Revoca acceso a la app en tu cuenta Google y reautoriza en /auth."
+        );
     }
 
     // ✅ SaaS: guardar por calendar_id
@@ -172,24 +198,25 @@ app.get("/oauth2callback", async (req, res) => {
       if (calErr || !cal) {
         return res
           .status(404)
-          .send("Calendario no encontrado en tu tabla calendars para calendar_id=" + calendar_id);
+          .send(
+            "Calendario no encontrado en tu tabla calendars para calendar_id=" +
+              calendar_id
+          );
       }
 
-      const { error } = await supabase
-        .from("calendar_tokens")
-        .upsert(
-          {
-            tenant_id: cal.tenant_id,
-            calendar_id,
-            google_calendar_id: "primary",
-            refresh_token: tokens.refresh_token,
-            access_token: tokens.access_token ?? null,
-            token_type: tokens.token_type ?? null,
-            scope: tokens.scope ?? null,
-            expiry_date: tokens.expiry_date ?? null,
-          },
-          { onConflict: "calendar_id" }
-        );
+      const { error } = await supabase.from("calendar_tokens").upsert(
+        {
+          tenant_id: cal.tenant_id,
+          calendar_id,
+          google_calendar_id: "primary",
+          refresh_token: tokens.refresh_token,
+          access_token: tokens.access_token ?? null,
+          token_type: tokens.token_type ?? null,
+          scope: tokens.scope ?? null,
+          expiry_date: tokens.expiry_date ?? null,
+        },
+        { onConflict: "calendar_id" }
+      );
 
       if (error) throw error;
 
@@ -200,21 +227,19 @@ app.get("/oauth2callback", async (req, res) => {
     }
 
     // ✅ Compatibilidad: modo fijo
-    const { error } = await supabase
-      .from("calendar_tokens")
-      .upsert(
-        {
-          client_id: CLIENTE_FIJO,
-          calendar_name: CAL_FIJO,
-          google_calendar_id: "primary",
-          refresh_token: tokens.refresh_token,
-          access_token: tokens.access_token ?? null,
-          token_type: tokens.token_type ?? null,
-          scope: tokens.scope ?? null,
-          expiry_date: tokens.expiry_date ?? null,
-        },
-        { onConflict: "client_id,calendar_name" }
-      );
+    const { error } = await supabase.from("calendar_tokens").upsert(
+      {
+        client_id: CLIENTE_FIJO,
+        calendar_name: CAL_FIJO,
+        google_calendar_id: "primary",
+        refresh_token: tokens.refresh_token,
+        access_token: tokens.access_token ?? null,
+        token_type: tokens.token_type ?? null,
+        scope: tokens.scope ?? null,
+        expiry_date: tokens.expiry_date ?? null,
+      },
+      { onConflict: "client_id,calendar_name" }
+    );
 
     if (error) throw error;
 
@@ -253,7 +278,9 @@ app.get("/test-event", async (req, res) => {
       requestBody: event,
     });
 
-    res.send(`✅ Evento creado: <a href="${response.data.htmlLink}" target="_blank">Ver evento</a>`);
+    res.send(
+      `✅ Evento creado: <a href="${response.data.htmlLink}" target="_blank">Ver evento</a>`
+    );
   } catch (error) {
     console.error(error);
     res.status(500).send("Error creando evento: " + error.message);
