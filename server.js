@@ -421,7 +421,53 @@ app.post("/appointments/slot", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+/* ======================================================
+   ✅ GET /appointments
+   - Lista citas por calendar_id
+   - Soporta filtros opcionales: from, to, status
+====================================================== */
+app.get("/appointments", async (req, res) => {
+  try {
+    const { calendar_id, from, to, status } = req.query;
 
+    if (!calendar_id) {
+      return res.status(400).json({
+        error: "calendar_id es obligatorio",
+      });
+    }
+
+    let query = supabase
+      .from("appointments")
+      .select("*")
+      .eq("calendar_id", calendar_id)
+      .order("start_at", { ascending: true });
+
+    if (status) {
+      query = query.eq("status", status);
+    }
+
+    if (from) {
+      query = query.gte("start_at", from);
+    }
+
+    if (to) {
+      query = query.lte("start_at", to);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({
+      total: data?.length || 0,
+      appointments: data || [],
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 /* ======================================================
    ✅ DELETE /appointments/:id
    - Borra evento en Google (si existe)
