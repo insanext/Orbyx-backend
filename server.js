@@ -16,19 +16,45 @@ const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI;
 
 const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
 
-// ✅ Cliente fijo (por ahora)
+// ✅ (Solo para compatibilidad) si entras a /auth sin calendar_id
 const CLIENTE_FIJO = "cliente_demo";
 const CAL_FIJO = "principal";
 
 const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 
 console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
-console.log("🔥 VERSION: PING+SLOTS+APPOINTMENTS+GOOGLE_SYNC DEPLOYED");
+console.log("🔥 VERSION: SAAS_TOKEN_BY_CALENDAR_ID DEPLOYED");
 
-// ======================================================
-// ✅ Helper: obtener cliente Google Calendar desde tokens en Supabase
-// ======================================================
-async function getGoogleCalendarClient() {
+/* ======================================================
+   ✅ Helper: obtener Google Calendar desde calendar_tokens usando calendar_id
+   (SaaS real: cada calendar_id tiene su refresh_token)
+====================================================== */
+async function getGoogleCalendarClientByCalendarId(calendar_id) {
+  const { data: tokenRow, error: tokErr } = await supabase
+    .from("calendar_tokens")
+    .select("refresh_token, google_calendar_id")
+    .eq("calendar_id", calendar_id)
+    .single();
+
+  if (tokErr) throw tokErr;
+
+  if (!tokenRow?.refresh_token) {
+    throw new Error("⚠️ Este calendar_id no tiene token Google. Debes autorizarlo primero en /auth?calendar_id=...");
+  }
+
+  oAuth2Client.setCredentials({ refresh_token: tokenRow.refresh_token });
+
+  const calendar = google.calendar({ version: "v3", auth: oAuth2Client });
+  const googleCalendarId = tokenRow.google_calendar_id || "primary";
+
+  return { calendar, googleCalendarId };
+}
+
+/* ======================================================
+   ✅ Helper (fallback): buscar token por CLIENTE_FIJO/CAL_FIJO
+   (solo para /test-event si no pasas calendar_id)
+====================================================== */
+async function getGoogleCalendarClientFixed() {
   const { data: tokenRow, error: tokErr } = await supabase
     .from("calendar_tokens")
     .select("*")
@@ -51,28 +77,58 @@ async function getGoogleCalendarClient() {
 }
 
 /* ======================================================
-   🔹 ENDPOINT 1: Generar autorización Google
+   🔹 ENDPOINT: /auth
+   - Si pasas ?calendar_id=<uuid> => autoriza para ese calendario de tu tabla calendars
+   - Si NO pasas calendar_id => modo antiguo (cliente fijo)
 ====================================================== */
-app.get("/auth", (req, res) => {
-  const url = oAuth2Client.generateAuthUrl({
-    access_type: "offline",
-    prompt: "consent",
-    scope: SCOPES,
-  });
+app.get("/auth", async (req, res) => {
+  try {
+    const { calendar_id } = req.query;
 
-  res.send(`
-    <h2>Autorizar Google Calendar</h2>
-    <p>Cliente: <b>${CLIENTE_FIJO}</b> | Calendario: <b>${CAL_FIJO}</b></p>
-    <a href="${url}">Haz clic aquí para autorizar</a>
-  `);
+    // state viaja al callback para saber a qué calendar_id guardar el token
+    const stateObj = calendar_id
+      ? { calendar_id: String(calendar_id) }
+      : { calendar_id: null, fixed: true };
+
+    const state = Buffer.from(JSON.stringify(stateObj)).toString("base64url");
+
+    const url = oAuth2Client.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: SCOPES,
+      state,
+    });
+
+    res.send(`
+      <h2>Autorizar Google Calendar</h2>
+      <p>
+        Modo: <b>${calendar_id ? "SaaS por calendar_id" : "Fijo (compatibilidad)"}</b><br/>
+        ${calendar_id ? `calendar_id: <b>${calendar_id}</b>` : `Cliente: <b>${CLIENTE_FIJO}</b> | Calendario: <b>${CAL_FIJO}</b>`}
+      </p>
+      <a href="${url}">Haz clic aquí para autorizar</a>
+    `);
+  } catch (e) {
+    res.status(500).send("Error en /auth: " + e.message);
+  }
 });
 
 /* ======================================================
-   🔹 ENDPOINT 2: Callback Google OAuth
+   🔹 ENDPOINT: /oauth2callback
+   - Guarda refresh_token en calendar_tokens
+   - Si venía state.calendar_id => guarda asociado a ese calendar_id (SaaS)
+   - Si NO => guarda modo fijo (compatibilidad)
 ====================================================== */
 app.get("/oauth2callback", async (req, res) => {
   try {
     const code = req.query.code;
+    const stateRaw = req.query.state;
+
+    let state = {};
+    try {
+      if (stateRaw) state = JSON.parse(Buffer.from(String(stateRaw), "base64url").toString("utf8"));
+    } catch (_) {
+      state = {};
+    }
 
     const { tokens } = await oAuth2Client.getToken(code);
     oAuth2Client.setCredentials(tokens);
@@ -80,11 +136,49 @@ app.get("/oauth2callback", async (req, res) => {
     if (!tokens.refresh_token) {
       return res
         .status(400)
-        .send(
-          "⚠️ No vino refresh_token. Revoca acceso a la app en tu cuenta Google y reautoriza en /auth."
-        );
+        .send("⚠️ No vino refresh_token. Revoca acceso a la app en tu cuenta Google y reautoriza en /auth.");
     }
 
+    // Si viene calendar_id -> modo SaaS (recomendado)
+    if (state?.calendar_id) {
+      const calendar_id = state.calendar_id;
+
+      // Traemos tenant_id desde calendars para dejarlo guardado también (opcional pero útil)
+      const { data: cal, error: calErr } = await supabase
+        .from("calendars")
+        .select("tenant_id")
+        .eq("id", calendar_id)
+        .single();
+
+      if (calErr || !cal) {
+        return res.status(404).send("Calendario no encontrado en tu tabla calendars para calendar_id=" + calendar_id);
+      }
+
+      const { error } = await supabase
+        .from("calendar_tokens")
+        .upsert(
+          {
+            tenant_id: cal.tenant_id,
+            calendar_id: calendar_id,
+            google_calendar_id: "primary",
+            refresh_token: tokens.refresh_token,
+            access_token: tokens.access_token ?? null,
+            token_type: tokens.token_type ?? null,
+            scope: tokens.scope ?? null,
+            expiry_date: tokens.expiry_date ?? null,
+          },
+          { onConflict: "calendar_id" }
+        );
+
+      if (error) throw error;
+
+      return res.send(
+        `✅ Autorizado y guardado en Supabase para calendar_id=${calendar_id}.<br/>` +
+          `Ahora prueba: <a href="/test-event?calendar_id=${calendar_id}">/test-event?calendar_id=${calendar_id}</a>`
+      );
+    }
+
+    // Si NO viene calendar_id -> modo fijo (compatibilidad)
     const { error } = await supabase
       .from("calendar_tokens")
       .upsert(
@@ -103,8 +197,7 @@ app.get("/oauth2callback", async (req, res) => {
 
     if (error) throw error;
 
-    console.log("✅ Tokens guardados en Supabase");
-    res.send("✅ Autorizado y guardado en Supabase. Ahora entra a /test-event");
+    res.send("✅ Autorizado y guardado en Supabase (modo fijo). Ahora entra a /test-event");
   } catch (error) {
     console.error(error);
     res.status(500).send("Error en OAuth callback: " + error.message);
@@ -112,18 +205,26 @@ app.get("/oauth2callback", async (req, res) => {
 });
 
 /* ======================================================
-   🔹 ENDPOINT 3: Crear evento de prueba
+   🔹 ENDPOINT: /test-event
+   - Si pasas ?calendar_id=<uuid> usa token SaaS
+   - Si no, usa token fijo
 ====================================================== */
 app.get("/test-event", async (req, res) => {
   try {
-    const { calendar, googleCalendarId } = await getGoogleCalendarClient();
+    const { calendar_id } = req.query;
+
+    const { calendar, googleCalendarId } = calendar_id
+      ? await getGoogleCalendarClientByCalendarId(calendar_id)
+      : await getGoogleCalendarClientFixed();
 
     const start = new Date(Date.now() + 5 * 60 * 1000);
     const end = new Date(start.getTime() + 30 * 60 * 1000);
 
     const event = {
       summary: "Prueba Proyecto Independizar (Supabase)",
-      description: "Evento con token persistente en Supabase",
+      description: calendar_id
+        ? `Evento de prueba (SaaS) calendar_id=${calendar_id}`
+        : "Evento de prueba (modo fijo)",
       start: { dateTime: start.toISOString() },
       end: { dateTime: end.toISOString() },
     };
@@ -133,9 +234,7 @@ app.get("/test-event", async (req, res) => {
       requestBody: event,
     });
 
-    res.send(
-      `✅ Evento creado: <a href="${response.data.htmlLink}" target="_blank">Ver evento</a>`
-    );
+    res.send(`✅ Evento creado: <a href="${response.data.htmlLink}" target="_blank">Ver evento</a>`);
   } catch (error) {
     console.error(error);
     res.status(500).send("Error creando evento: " + error.message);
@@ -143,7 +242,7 @@ app.get("/test-event", async (req, res) => {
 });
 
 /* ======================================================
-   🔹 ENDPOINT 4: Obtener slots disponibles
+   🔹 ENDPOINT: /slots
 ====================================================== */
 app.get("/slots", async (req, res) => {
   try {
@@ -160,10 +259,7 @@ app.get("/slots", async (req, res) => {
       _day: date,
     });
 
-    if (error) {
-      console.error(error);
-      return res.status(500).json({ error: error.message });
-    }
+    if (error) return res.status(500).json({ error: error.message });
 
     return res.json({
       calendar_id,
@@ -172,17 +268,12 @@ app.get("/slots", async (req, res) => {
       slots: data || [],
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
 /* ======================================================
-   ✅ ENDPOINT: POST /appointments/slot
-   - Valida slot contra /slots (anti doble-reserva)
-   - Inserta en DB (constraint no solape)
-   - Crea evento en Google Calendar
-   - Guarda event_id en DB
+   ✅ POST /appointments/slot (SaaS token por calendar_id)
 ====================================================== */
 app.post("/appointments/slot", async (req, res) => {
   let apptCreated = null;
@@ -190,8 +281,8 @@ app.post("/appointments/slot", async (req, res) => {
   try {
     const {
       calendar_id,
-      date, // "YYYY-MM-DD"
-      slot_start, // ISO (copiado desde /slots)
+      date,
+      slot_start,
       customer_name,
       customer_phone,
       source = "whatsapp",
@@ -204,7 +295,7 @@ app.post("/appointments/slot", async (req, res) => {
       });
     }
 
-    // 1) Traer config del calendario (slot_minutes + buffer_minutes + tenant_id)
+    // 1) Config calendario
     const { data: cal, error: calErr } = await supabase
       .from("calendars")
       .select("tenant_id, slot_minutes, buffer_minutes, timezone, is_active")
@@ -218,28 +309,22 @@ app.post("/appointments/slot", async (req, res) => {
     const bufferMinutes = cal.buffer_minutes ?? 0;
     const timeZone = cal.timezone || "America/Santiago";
 
-    // 2) Verificar que slot_start sea realmente un slot disponible
+    // 2) Anti doble-reserva: slot debe estar en /slots
     const { data: slots, error: slotsErr } = await supabase.rpc("get_available_slots", {
       _calendar_id: calendar_id,
       _day: date,
     });
-
     if (slotsErr) return res.status(500).json({ error: slotsErr.message });
 
     const wantedStartIso = new Date(slot_start).toISOString();
     const ok = (slots || []).some((s) => new Date(s.slot_start).toISOString() === wantedStartIso);
+    if (!ok) return res.status(409).json({ error: "Ese horario ya no está disponible." });
 
-    if (!ok) {
-      return res.status(409).json({
-        error: "Ese horario ya no está disponible. Vuelve a pedir slots y elige otro.",
-      });
-    }
-
-    // 3) Calcular end_at = start + slot + buffer
+    // 3) start/end
     const start = new Date(slot_start);
     const end = new Date(start.getTime() + (slotMinutes + bufferMinutes) * 60 * 1000);
 
-    // 4) Insertar cita (si hay choque, la DB lo rechazará por el constraint)
+    // 4) Insert appointment (constraint evita solapes)
     const { data: appt, error: insErr } = await supabase
       .from("appointments")
       .insert({
@@ -265,8 +350,8 @@ app.post("/appointments/slot", async (req, res) => {
 
     apptCreated = appt;
 
-    // 5) Crear evento en Google Calendar
-    const { calendar, googleCalendarId } = await getGoogleCalendarClient();
+    // 5) Google Calendar (SaaS por calendar_id)
+    const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(calendar_id);
 
     const event = {
       summary: `Cita - ${customer_name}`,
@@ -282,7 +367,7 @@ app.post("/appointments/slot", async (req, res) => {
 
     const eventId = response?.data?.id || null;
 
-    // 6) Guardar event_id en Supabase
+    // 6) Guardar event_id
     const { data: apptUpdated, error: updErr } = await supabase
       .from("appointments")
       .update({ event_id: eventId })
@@ -291,19 +376,12 @@ app.post("/appointments/slot", async (req, res) => {
       .single();
 
     if (updErr) {
-      // Si no pudimos guardar event_id, intentamos borrar el evento para no dejarlo “huérfano”
       try {
         if (eventId) {
-          await calendar.events.delete({
-            calendarId: googleCalendarId,
-            eventId,
-          });
+          await calendar.events.delete({ calendarId: googleCalendarId, eventId });
         }
       } catch (_) {}
-
-      return res.status(500).json({
-        error: "Se creó evento en Google, pero falló guardar event_id en la DB.",
-      });
+      return res.status(500).json({ error: "Se creó evento, pero falló guardar event_id en DB." });
     }
 
     return res.status(201).json({
@@ -316,53 +394,44 @@ app.post("/appointments/slot", async (req, res) => {
       },
     });
   } catch (err) {
-    // Si Google falló después de insertar la cita, revertimos para no bloquear el slot
+    // rollback si Google falla después del insert
     try {
       if (apptCreated?.id) {
         await supabase.from("appointments").delete().eq("id", apptCreated.id);
       }
     } catch (_) {}
-
     return res.status(500).json({ error: err.message });
   }
 });
 
 /* ======================================================
-   ✅ ENDPOINT: DELETE /appointments/:id
-   - Si hay event_id, borra evento Google
-   - Luego borra appointment de Supabase
+   ✅ DELETE /appointments/:id (borra evento usando token del calendar_id)
 ====================================================== */
 app.delete("/appointments/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
-    // 1) Buscar la cita en BD
     const { data: appt, error: apptErr } = await supabase
       .from("appointments")
       .select("*")
       .eq("id", id)
       .single();
 
-    if (apptErr || !appt) {
-      return res.status(404).json({ error: "Appointment no encontrado" });
-    }
+    if (apptErr || !appt) return res.status(404).json({ error: "Appointment no encontrado" });
 
-    // 2) Borrar evento en Google Calendar (si existe event_id)
     if (appt.event_id) {
       try {
-        const { calendar, googleCalendarId } = await getGoogleCalendarClient();
+        const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(appt.calendar_id);
 
         await calendar.events.delete({
           calendarId: googleCalendarId,
           eventId: appt.event_id,
         });
       } catch (e) {
-        // Si falla Google, igual seguimos borrando en DB (para no “trabar” cancelación)
         console.error("⚠️ Error borrando evento en Google:", e.message);
       }
     }
 
-    // 3) Borrar en Supabase
     const { error: delErr } = await supabase.from("appointments").delete().eq("id", id);
     if (delErr) return res.status(500).json({ error: delErr.message });
 
@@ -380,7 +449,7 @@ app.get("/_ping", (req, res) => {
 });
 
 /* ======================================================
-   🚀 INICIAR SERVIDOR
+   🚀 START
 ====================================================== */
 app.listen(PORT, () => {
   console.log(`🚀 Servidor listo en http://localhost:${PORT}`);
