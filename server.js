@@ -453,11 +453,60 @@ app.get("/appointments", async (req, res) => {
 /* ======================================================
    ✅ DELETE /appointments/:id
 ====================================================== */
-// ✅ Compatibilidad: si algún frontend manda POST por error, lo tratamos como cancelar
+/* ======================================================
+   ✅ POST /appointments/:id (compatibilidad)
+   - Algunos frontends mandan POST. Lo tratamos como cancelar igual.
+====================================================== */
 app.post("/appointments/:id", async (req, res) => {
-  // Reutilizamos la misma lógica del DELETE redirigiendo internamente
-  req.method = "DELETE";
-  return app._router.handle(req, res);
+  try {
+    const { id } = req.params;
+
+    const { data: appt, error: apptErr } = await supabase
+      .from("appointments")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (apptErr || !appt) return res.status(404).json({ error: "Appointment no encontrado" });
+
+    // Idempotente
+    if (String(appt.status).toLowerCase() === "canceled") {
+      return res.json({ ok: true, canceled: true, appointment: appt });
+    }
+
+    // Borrar evento Google si existe
+    if (appt.event_id) {
+      try {
+        const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(
+          appt.calendar_id
+        );
+
+        await calendar.events.delete({
+          calendarId: googleCalendarId,
+          eventId: appt.event_id,
+        });
+      } catch (e) {
+        console.error("⚠️ Error borrando evento en Google:", e.message);
+      }
+    }
+
+    // Cancelar en BD
+    const { data: updated, error: updErr } = await supabase
+      .from("appointments")
+      .update({
+        status: "canceled",
+        canceled_at: new Date().toISOString(),
+      })
+      .eq("id", id)
+      .select("*")
+      .single();
+
+    if (updErr) return res.status(500).json({ error: updErr.message });
+
+    return res.json({ ok: true, canceled: true, appointment: updated });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 app.delete("/appointments/:id", async (req, res) => {
   try {
