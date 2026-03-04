@@ -453,6 +453,12 @@ app.get("/appointments", async (req, res) => {
 /* ======================================================
    ✅ DELETE /appointments/:id
 ====================================================== */
+// ✅ Compatibilidad: si algún frontend manda POST por error, lo tratamos como cancelar
+app.post("/appointments/:id", async (req, res) => {
+  // Reutilizamos la misma lógica del DELETE redirigiendo internamente
+  req.method = "DELETE";
+  return app._router.handle(req, res);
+});
 app.delete("/appointments/:id", async (req, res) => {
   try {
     const { id } = req.params;
