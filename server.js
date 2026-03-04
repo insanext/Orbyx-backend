@@ -1,10 +1,26 @@
 // server.js
 require("dotenv").config();
 const express = require("express");
+const cors = require("cors"); // ✅ NUEVO
 const { google } = require("googleapis");
 const { supabase } = require("./supabaseClient");
 
 const app = express();
+
+// ✅ NUEVO: CORS para permitir llamadas desde tu dashboard
+app.use(
+  cors({
+    origin: [
+      "https://app.orbyx.cl",
+      "https://orbyx-dashboard.vercel.app",
+      // (opcional) si usas previews de Vercel:
+      // /^https:\/\/.*\.vercel\.app$/,
+    ],
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
@@ -78,8 +94,6 @@ async function getGoogleCalendarClientFixed() {
 
 /* ======================================================
    🔹 ENDPOINT: /auth
-   - Si pasas ?calendar_id=<uuid> => autoriza para ese calendario de tu tabla calendars
-   - Si NO pasas calendar_id => modo antiguo (cliente fijo)
 ====================================================== */
 app.get("/auth", async (req, res) => {
   try {
@@ -89,7 +103,6 @@ app.get("/auth", async (req, res) => {
       ? { calendar_id: String(calendar_id) }
       : { calendar_id: null, fixed: true };
 
-    // (Mantengo base64url porque ya te funcionó. Si algún día falla en Render, lo cambiamos.)
     const state = Buffer.from(JSON.stringify(stateObj)).toString("base64url");
 
     const url = oAuth2Client.generateAuthUrl({
@@ -142,7 +155,6 @@ app.get("/oauth2callback", async (req, res) => {
         );
     }
 
-    // ✅ SaaS: guardar por calendar_id
     if (state?.calendar_id) {
       const calendar_id = state.calendar_id;
 
@@ -182,7 +194,6 @@ app.get("/oauth2callback", async (req, res) => {
       );
     }
 
-    // ✅ Compatibilidad: modo fijo
     const { error } = await supabase
       .from("calendar_tokens")
       .upsert(
@@ -275,11 +286,7 @@ app.get("/slots", async (req, res) => {
 });
 
 /* ======================================================
-   ✅ POST /appointments/slot (SaaS token por calendar_id)
-   - Inserta booked
-   - Crea evento Google
-   - Guarda event_id
-   - Si falla Google, NO borra: deja historial como canceled
+   ✅ POST /appointments/slot
 ====================================================== */
 app.post("/appointments/slot", async (req, res) => {
   let apptCreated = null;
@@ -301,7 +308,6 @@ app.post("/appointments/slot", async (req, res) => {
       });
     }
 
-    // 1) Config calendario
     const { data: cal, error: calErr } = await supabase
       .from("calendars")
       .select("tenant_id, slot_minutes, buffer_minutes, timezone, is_active")
@@ -315,7 +321,6 @@ app.post("/appointments/slot", async (req, res) => {
     const bufferMinutes = cal.buffer_minutes ?? 0;
     const timeZone = cal.timezone || "America/Santiago";
 
-    // 2) Anti doble-reserva: slot debe estar en /slots
     const { data: slots, error: slotsErr } = await supabase.rpc("get_available_slots", {
       _calendar_id: calendar_id,
       _day: date,
@@ -326,11 +331,9 @@ app.post("/appointments/slot", async (req, res) => {
     const ok = (slots || []).some((s) => new Date(s.slot_start).toISOString() === wantedStartIso);
     if (!ok) return res.status(409).json({ error: "Ese horario ya no está disponible." });
 
-    // 3) start/end
     const start = new Date(slot_start);
     const end = new Date(start.getTime() + (slotMinutes + bufferMinutes) * 60 * 1000);
 
-    // 4) Insert appointment
     const { data: appt, error: insErr } = await supabase
       .from("appointments")
       .insert({
@@ -356,7 +359,6 @@ app.post("/appointments/slot", async (req, res) => {
 
     apptCreated = appt;
 
-    // 5) Google Calendar
     const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(calendar_id);
 
     const event = {
@@ -373,7 +375,6 @@ app.post("/appointments/slot", async (req, res) => {
 
     const eventId = response?.data?.id || null;
 
-    // 6) Guardar event_id
     const { data: apptUpdated, error: updErr } = await supabase
       .from("appointments")
       .update({ event_id: eventId })
@@ -382,14 +383,12 @@ app.post("/appointments/slot", async (req, res) => {
       .single();
 
     if (updErr) {
-      // Intentar borrar evento para no dejar huérfano
       try {
         if (eventId) {
           await calendar.events.delete({ calendarId: googleCalendarId, eventId });
         }
       } catch (_) {}
 
-      // Dejar historial: cancelar
       await supabase
         .from("appointments")
         .update({ status: "canceled", canceled_at: new Date().toISOString() })
@@ -408,7 +407,6 @@ app.post("/appointments/slot", async (req, res) => {
       },
     });
   } catch (err) {
-    // Si falla Google después de insertar, NO borrar: cancelar para historial
     try {
       if (apptCreated?.id) {
         await supabase
@@ -421,19 +419,16 @@ app.post("/appointments/slot", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
 /* ======================================================
    ✅ GET /appointments
-   - Lista citas por calendar_id
-   - Soporta filtros opcionales: from, to, status
 ====================================================== */
 app.get("/appointments", async (req, res) => {
   try {
     const { calendar_id, from, to, status } = req.query;
 
     if (!calendar_id) {
-      return res.status(400).json({
-        error: "calendar_id es obligatorio",
-      });
+      return res.status(400).json({ error: "calendar_id es obligatorio" });
     }
 
     let query = supabase
@@ -442,36 +437,21 @@ app.get("/appointments", async (req, res) => {
       .eq("calendar_id", calendar_id)
       .order("start_at", { ascending: true });
 
-    if (status) {
-      query = query.eq("status", status);
-    }
-
-    if (from) {
-      query = query.gte("start_at", from);
-    }
-
-    if (to) {
-      query = query.lte("start_at", to);
-    }
+    if (status) query = query.eq("status", status);
+    if (from) query = query.gte("start_at", from);
+    if (to) query = query.lte("start_at", to);
 
     const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
 
-    if (error) {
-      return res.status(500).json({ error: error.message });
-    }
-
-    return res.json({
-      total: data?.length || 0,
-      appointments: data || [],
-    });
+    return res.json({ total: data?.length || 0, appointments: data || [] });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
+
 /* ======================================================
    ✅ DELETE /appointments/:id
-   - Borra evento en Google (si existe)
-   - NO borra la fila: deja historial (status=canceled, canceled_at)
 ====================================================== */
 app.delete("/appointments/:id", async (req, res) => {
   try {
@@ -485,12 +465,10 @@ app.delete("/appointments/:id", async (req, res) => {
 
     if (apptErr || !appt) return res.status(404).json({ error: "Appointment no encontrado" });
 
-    // Si ya estaba cancelado, respondemos ok (idempotente)
     if (String(appt.status).toLowerCase() === "canceled") {
       return res.json({ ok: true, canceled: true, appointment: appt });
     }
 
-    // 1) Borrar evento Google si hay event_id
     if (appt.event_id) {
       try {
         const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(
@@ -503,11 +481,9 @@ app.delete("/appointments/:id", async (req, res) => {
         });
       } catch (e) {
         console.error("⚠️ Error borrando evento en Google:", e.message);
-        // Igual seguimos cancelando en BD
       }
     }
 
-    // 2) Cancelar en BD (historial)
     const { data: updated, error: updErr } = await supabase
       .from("appointments")
       .update({
