@@ -23,11 +23,10 @@ const CAL_FIJO = "principal";
 const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 
 console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
-console.log("🔥 VERSION: SAAS_TOKEN_BY_CALENDAR_ID DEPLOYED");
+console.log("🔥 VERSION: SAAS_TOKEN_BY_CALENDAR_ID + HISTORY DEPLOYED");
 
 /* ======================================================
    ✅ Helper: obtener Google Calendar desde calendar_tokens usando calendar_id
-   (SaaS real: cada calendar_id tiene su refresh_token)
 ====================================================== */
 async function getGoogleCalendarClientByCalendarId(calendar_id) {
   const { data: tokenRow, error: tokErr } = await supabase
@@ -39,7 +38,9 @@ async function getGoogleCalendarClientByCalendarId(calendar_id) {
   if (tokErr) throw tokErr;
 
   if (!tokenRow?.refresh_token) {
-    throw new Error("⚠️ Este calendar_id no tiene token Google. Debes autorizarlo primero en /auth?calendar_id=...");
+    throw new Error(
+      "⚠️ Este calendar_id no tiene token Google. Debes autorizarlo primero en /auth?calendar_id=..."
+    );
   }
 
   oAuth2Client.setCredentials({ refresh_token: tokenRow.refresh_token });
@@ -52,7 +53,6 @@ async function getGoogleCalendarClientByCalendarId(calendar_id) {
 
 /* ======================================================
    ✅ Helper (fallback): buscar token por CLIENTE_FIJO/CAL_FIJO
-   (solo para /test-event si no pasas calendar_id)
 ====================================================== */
 async function getGoogleCalendarClientFixed() {
   const { data: tokenRow, error: tokErr } = await supabase
@@ -85,11 +85,11 @@ app.get("/auth", async (req, res) => {
   try {
     const { calendar_id } = req.query;
 
-    // state viaja al callback para saber a qué calendar_id guardar el token
     const stateObj = calendar_id
       ? { calendar_id: String(calendar_id) }
       : { calendar_id: null, fixed: true };
 
+    // (Mantengo base64url porque ya te funcionó. Si algún día falla en Render, lo cambiamos.)
     const state = Buffer.from(JSON.stringify(stateObj)).toString("base64url");
 
     const url = oAuth2Client.generateAuthUrl({
@@ -103,7 +103,11 @@ app.get("/auth", async (req, res) => {
       <h2>Autorizar Google Calendar</h2>
       <p>
         Modo: <b>${calendar_id ? "SaaS por calendar_id" : "Fijo (compatibilidad)"}</b><br/>
-        ${calendar_id ? `calendar_id: <b>${calendar_id}</b>` : `Cliente: <b>${CLIENTE_FIJO}</b> | Calendario: <b>${CAL_FIJO}</b>`}
+        ${
+          calendar_id
+            ? `calendar_id: <b>${calendar_id}</b>`
+            : `Cliente: <b>${CLIENTE_FIJO}</b> | Calendario: <b>${CAL_FIJO}</b>`
+        }
       </p>
       <a href="${url}">Haz clic aquí para autorizar</a>
     `);
@@ -114,9 +118,6 @@ app.get("/auth", async (req, res) => {
 
 /* ======================================================
    🔹 ENDPOINT: /oauth2callback
-   - Guarda refresh_token en calendar_tokens
-   - Si venía state.calendar_id => guarda asociado a ese calendar_id (SaaS)
-   - Si NO => guarda modo fijo (compatibilidad)
 ====================================================== */
 app.get("/oauth2callback", async (req, res) => {
   try {
@@ -136,14 +137,15 @@ app.get("/oauth2callback", async (req, res) => {
     if (!tokens.refresh_token) {
       return res
         .status(400)
-        .send("⚠️ No vino refresh_token. Revoca acceso a la app en tu cuenta Google y reautoriza en /auth.");
+        .send(
+          "⚠️ No vino refresh_token. Revoca acceso a la app en tu cuenta Google y reautoriza en /auth."
+        );
     }
 
-    // Si viene calendar_id -> modo SaaS (recomendado)
+    // ✅ SaaS: guardar por calendar_id
     if (state?.calendar_id) {
       const calendar_id = state.calendar_id;
 
-      // Traemos tenant_id desde calendars para dejarlo guardado también (opcional pero útil)
       const { data: cal, error: calErr } = await supabase
         .from("calendars")
         .select("tenant_id")
@@ -151,7 +153,9 @@ app.get("/oauth2callback", async (req, res) => {
         .single();
 
       if (calErr || !cal) {
-        return res.status(404).send("Calendario no encontrado en tu tabla calendars para calendar_id=" + calendar_id);
+        return res
+          .status(404)
+          .send("Calendario no encontrado en tu tabla calendars para calendar_id=" + calendar_id);
       }
 
       const { error } = await supabase
@@ -178,7 +182,7 @@ app.get("/oauth2callback", async (req, res) => {
       );
     }
 
-    // Si NO viene calendar_id -> modo fijo (compatibilidad)
+    // ✅ Compatibilidad: modo fijo
     const { error } = await supabase
       .from("calendar_tokens")
       .upsert(
@@ -206,8 +210,6 @@ app.get("/oauth2callback", async (req, res) => {
 
 /* ======================================================
    🔹 ENDPOINT: /test-event
-   - Si pasas ?calendar_id=<uuid> usa token SaaS
-   - Si no, usa token fijo
 ====================================================== */
 app.get("/test-event", async (req, res) => {
   try {
@@ -274,6 +276,10 @@ app.get("/slots", async (req, res) => {
 
 /* ======================================================
    ✅ POST /appointments/slot (SaaS token por calendar_id)
+   - Inserta booked
+   - Crea evento Google
+   - Guarda event_id
+   - Si falla Google, NO borra: deja historial como canceled
 ====================================================== */
 app.post("/appointments/slot", async (req, res) => {
   let apptCreated = null;
@@ -324,7 +330,7 @@ app.post("/appointments/slot", async (req, res) => {
     const start = new Date(slot_start);
     const end = new Date(start.getTime() + (slotMinutes + bufferMinutes) * 60 * 1000);
 
-    // 4) Insert appointment (constraint evita solapes)
+    // 4) Insert appointment
     const { data: appt, error: insErr } = await supabase
       .from("appointments")
       .insert({
@@ -350,7 +356,7 @@ app.post("/appointments/slot", async (req, res) => {
 
     apptCreated = appt;
 
-    // 5) Google Calendar (SaaS por calendar_id)
+    // 5) Google Calendar
     const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(calendar_id);
 
     const event = {
@@ -376,11 +382,19 @@ app.post("/appointments/slot", async (req, res) => {
       .single();
 
     if (updErr) {
+      // Intentar borrar evento para no dejar huérfano
       try {
         if (eventId) {
           await calendar.events.delete({ calendarId: googleCalendarId, eventId });
         }
       } catch (_) {}
+
+      // Dejar historial: cancelar
+      await supabase
+        .from("appointments")
+        .update({ status: "canceled", canceled_at: new Date().toISOString() })
+        .eq("id", appt.id);
+
       return res.status(500).json({ error: "Se creó evento, pero falló guardar event_id en DB." });
     }
 
@@ -394,18 +408,24 @@ app.post("/appointments/slot", async (req, res) => {
       },
     });
   } catch (err) {
-    // rollback si Google falla después del insert
+    // Si falla Google después de insertar, NO borrar: cancelar para historial
     try {
       if (apptCreated?.id) {
-        await supabase.from("appointments").delete().eq("id", apptCreated.id);
+        await supabase
+          .from("appointments")
+          .update({ status: "canceled", canceled_at: new Date().toISOString() })
+          .eq("id", apptCreated.id);
       }
     } catch (_) {}
+
     return res.status(500).json({ error: err.message });
   }
 });
 
 /* ======================================================
-   ✅ DELETE /appointments/:id (borra evento usando token del calendar_id)
+   ✅ DELETE /appointments/:id
+   - Borra evento en Google (si existe)
+   - NO borra la fila: deja historial (status=canceled, canceled_at)
 ====================================================== */
 app.delete("/appointments/:id", async (req, res) => {
   try {
@@ -419,9 +439,17 @@ app.delete("/appointments/:id", async (req, res) => {
 
     if (apptErr || !appt) return res.status(404).json({ error: "Appointment no encontrado" });
 
+    // Si ya estaba cancelado, respondemos ok (idempotente)
+    if (String(appt.status).toLowerCase() === "canceled") {
+      return res.json({ ok: true, canceled: true, appointment: appt });
+    }
+
+    // 1) Borrar evento Google si hay event_id
     if (appt.event_id) {
       try {
-        const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(appt.calendar_id);
+        const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(
+          appt.calendar_id
+        );
 
         await calendar.events.delete({
           calendarId: googleCalendarId,
@@ -429,13 +457,24 @@ app.delete("/appointments/:id", async (req, res) => {
         });
       } catch (e) {
         console.error("⚠️ Error borrando evento en Google:", e.message);
+        // Igual seguimos cancelando en BD
       }
     }
 
-    const { error: delErr } = await supabase.from("appointments").delete().eq("id", id);
-    if (delErr) return res.status(500).json({ error: delErr.message });
+    // 2) Cancelar en BD (historial)
+    const { data: updated, error: updErr } = await supabase
+      .from("appointments")
+      .update({
+        status: "canceled",
+        canceled_at: new Date().toISOString(),
+      })
+      .eq("id", id)
+      .select("*")
+      .single();
 
-    return res.json({ ok: true, deleted_id: id });
+    if (updErr) return res.status(500).json({ error: updErr.message });
+
+    return res.json({ ok: true, canceled: true, appointment: updated });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
