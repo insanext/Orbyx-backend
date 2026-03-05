@@ -554,11 +554,21 @@ app.post("/tenants/provision", async (req, res) => {
       return res.status(400).json({ error: "Faltan campos: user_id, email, plan" });
     }
 
+    // slug simple desde el email (parte antes del @)
+    const baseSlug = String(email).split("@")[0] || "tenant";
+    const slug =
+      baseSlug
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 40) || "tenant";
+
     // 1) Crear tenant
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .insert({
         name: email,
+        slug: slug,
         plan: plan,
       })
       .select()
@@ -567,13 +577,11 @@ app.post("/tenants/provision", async (req, res) => {
     if (tenantError) throw tenantError;
 
     // 2) Crear relación tenant_users (owner)
-    const { error: userError } = await supabase
-      .from("tenant_users")
-      .insert({
-        user_id: user_id,
-        tenant_id: tenant.id,
-        role: "owner",
-      });
+    const { error: userError } = await supabase.from("tenant_users").insert({
+      user_id: user_id,
+      tenant_id: tenant.id,
+      role: "owner",
+    });
 
     if (userError) throw userError;
 
