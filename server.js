@@ -555,13 +555,17 @@ app.post("/tenants/provision", async (req, res) => {
     }
 
     // slug simple desde el email (parte antes del @)
-    const baseSlug = String(email).split("@")[0] || "tenant";
-    const slug =
-      baseSlug
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "")
-        .slice(0, 40) || "tenant";
+   const baseSlug = String(email).split("@")[0] || "tenant";
+const cleanBase =
+  baseSlug
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 30) || "tenant";
+
+// sufijo corto para que sea único
+const suffix = Math.random().toString(16).slice(2, 8);
+const slug = `${cleanBase}-${suffix}`;
 
     // 1) Crear tenant
     const { data: tenant, error: tenantError } = await supabase
