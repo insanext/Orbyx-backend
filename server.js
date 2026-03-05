@@ -15,6 +15,8 @@ const app = express();
 const ALLOWED_ORIGINS = new Set([
   "https://app.orbyx.cl",
   "https://orbyx-dashboard.vercel.app",
+  "https://www.orbyx.cl",
+  "https://orbyx.cl",
 ]);
 
 const corsOptions = {
