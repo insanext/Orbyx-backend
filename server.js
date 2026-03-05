@@ -9,14 +9,12 @@ const app = express();
 
 /* ======================================================
    ✅ CORS (ROBUSTO)
-   - Permite Vercel + dominio
-   - Preflight OPTIONS sin romper Express (NO usar "*")
+   - Permite dominio + Vercel + previews Vercel
+   - Preflight OPTIONS sin romper (NO usar "*" ni "/*")
 ====================================================== */
 const ALLOWED_ORIGINS = new Set([
   "https://app.orbyx.cl",
   "https://orbyx-dashboard.vercel.app",
-  // Si tienes preview deployments en Vercel y quieres permitirlos:
-  // "https://orbyx-dashboard-git-xxxxx.vercel.app",
 ]);
 
 const corsOptions = {
@@ -26,8 +24,8 @@ const corsOptions = {
 
     if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
 
-    // (Opcional) permitir previews de Vercel:
-    // if (/^https:\/\/.*\.vercel\.app$/.test(origin)) return cb(null, true);
+    // ✅ Permitir previews de Vercel (recomendado)
+    if (/^https:\/\/.*\.vercel\.app$/.test(origin)) return cb(null, true);
 
     return cb(new Error("Not allowed by CORS: " + origin));
   },
@@ -38,10 +36,9 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// 🔥 IMPORTANTE: NO usar "*" aquí (rompe en tu stack)
-app.options("*", cors(corsOptions));
-// alternativa equivalente:
-// app.options(/.*/, cors(corsOptions));
+// ✅ Preflight para cualquier ruta (SIN path strings que rompen)
+// NO usar: "/*" ni "*" en este stack
+app.options(/.*/, cors(corsOptions));
 
 app.use(express.json());
 
@@ -58,11 +55,7 @@ const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
 const CLIENTE_FIJO = "cliente_demo";
 const CAL_FIJO = "principal";
 
-const oAuth2Client = new google.auth.OAuth2(
-  CLIENT_ID,
-  CLIENT_SECRET,
-  REDIRECT_URI
-);
+const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 
 console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
 console.log("🔥 VERSION: SAAS_TOKEN_BY_CALENDAR_ID + HISTORY DEPLOYED");
@@ -166,9 +159,7 @@ app.get("/oauth2callback", async (req, res) => {
     let state = {};
     try {
       if (stateRaw) {
-        state = JSON.parse(
-          Buffer.from(String(stateRaw), "base64url").toString("utf8")
-        );
+        state = JSON.parse(Buffer.from(String(stateRaw), "base64url").toString("utf8"));
       }
     } catch (_) {
       state = {};
@@ -198,10 +189,7 @@ app.get("/oauth2callback", async (req, res) => {
       if (calErr || !cal) {
         return res
           .status(404)
-          .send(
-            "Calendario no encontrado en tu tabla calendars para calendar_id=" +
-              calendar_id
-          );
+          .send("Calendario no encontrado en tu tabla calendars para calendar_id=" + calendar_id);
       }
 
       const { error } = await supabase.from("calendar_tokens").upsert(
@@ -278,9 +266,7 @@ app.get("/test-event", async (req, res) => {
       requestBody: event,
     });
 
-    res.send(
-      `✅ Evento creado: <a href="${response.data.htmlLink}" target="_blank">Ver evento</a>`
-    );
+    res.send(`✅ Evento creado: <a href="${response.data.htmlLink}" target="_blank">Ver evento</a>`);
   } catch (error) {
     console.error(error);
     res.status(500).send("Error creando evento: " + error.message);
