@@ -39,7 +39,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 // 🔥 IMPORTANTE: NO usar "*" aquí (rompe en tu stack)
-app.options("/*", cors(corsOptions));
+app.options("*", cors(corsOptions));
 // alternativa equivalente:
 // app.options(/.*/, cors(corsOptions));
 
