@@ -542,6 +542,49 @@ app.get("/_ping", (req, res) => {
 });
 
 /* ======================================================
+   ✅ SAAS: Provision tenant + owner user
+   POST /tenants/provision
+   body: { user_id, email, plan }
+====================================================== */
+app.post("/tenants/provision", async (req, res) => {
+  try {
+    const { user_id, email, plan } = req.body;
+
+    if (!user_id || !email || !plan) {
+      return res.status(400).json({ error: "Faltan campos: user_id, email, plan" });
+    }
+
+    // 1) Crear tenant
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .insert({
+        name: email,
+        plan: plan,
+      })
+      .select()
+      .single();
+
+    if (tenantError) throw tenantError;
+
+    // 2) Crear relación tenant_users (owner)
+    const { error: userError } = await supabase
+      .from("tenant_users")
+      .insert({
+        user_id: user_id,
+        tenant_id: tenant.id,
+        role: "owner",
+      });
+
+    if (userError) throw userError;
+
+    return res.json({ ok: true, tenant_id: tenant.id });
+  } catch (err) {
+    console.error("Provision failed:", err);
+    return res.status(500).json({ error: "Provision failed", detail: err.message });
+  }
+});
+
+/* ======================================================
    🚀 START
 ====================================================== */
 app.listen(PORT, () => {
