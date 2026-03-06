@@ -9,24 +9,21 @@ const app = express();
 
 /* ======================================================
    ✅ CORS (ROBUSTO)
-   - Permite dominio + Vercel + previews Vercel
-   - Preflight OPTIONS sin romper (NO usar "*" ni "/*")
 ====================================================== */
 const ALLOWED_ORIGINS = new Set([
   "https://app.orbyx.cl",
   "https://orbyx-dashboard.vercel.app",
   "https://www.orbyx.cl",
   "https://orbyx.cl",
+  "https://orbyx-web.vercel.app",
 ]);
 
 const corsOptions = {
   origin: (origin, cb) => {
-    // Permite requests sin origin (Postman / server-to-server)
     if (!origin) return cb(null, true);
 
     if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
 
-    // ✅ Permitir previews de Vercel (recomendado)
     if (/^https:\/\/.*\.vercel\.app$/.test(origin)) return cb(null, true);
 
     return cb(new Error("Not allowed by CORS: " + origin));
@@ -37,30 +34,26 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-
-// ✅ Preflight para cualquier ruta (SIN path strings que rompen)
-// NO usar: "/*" ni "*" en este stack
 app.options(/.*/, cors(corsOptions));
-
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// 🔐 Credenciales OAuth (TU app, únicas)
+// 🔐 Credenciales OAuth
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI;
 
 const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
 
-// ✅ (Compatibilidad) si entras a /auth sin calendar_id
+// ✅ Compatibilidad
 const CLIENTE_FIJO = "cliente_demo";
 const CAL_FIJO = "principal";
 
 const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 
 console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
-console.log("🔥 VERSION: SAAS_TOKEN_BY_CALENDAR_ID + HISTORY DEPLOYED");
+console.log("🔥 VERSION: SAAS_TOKEN_BY_CALENDAR_ID + OAUTH REDIRECT TO FRONTEND");
 
 /* ======================================================
    ✅ Helper: obtener Google Calendar desde calendar_tokens usando calendar_id
@@ -210,9 +203,9 @@ app.get("/oauth2callback", async (req, res) => {
 
       if (error) throw error;
 
-      return res.send(
-        `✅ Autorizado y guardado en Supabase para calendar_id=${calendar_id}.<br/>` +
-          `Ahora prueba: <a href="/test-event?calendar_id=${calendar_id}">/test-event?calendar_id=${calendar_id}</a>`
+      const frontendUrl = "https://www.orbyx.cl";
+      return res.redirect(
+        `${frontendUrl}/onboarding?tenant_id=${cal.tenant_id}&calendar_id=${calendar_id}&google_connected=1`
       );
     }
 
@@ -483,12 +476,10 @@ async function cancelById(id, res) {
 
   if (apptErr || !appt) return res.status(404).json({ error: "Appointment no encontrado" });
 
-  // idempotente
   if (String(appt.status).toLowerCase() === "canceled") {
     return res.json({ ok: true, canceled: true, appointment: appt });
   }
 
-  // borrar evento google si existe
   if (appt.event_id) {
     try {
       const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(
@@ -504,7 +495,6 @@ async function cancelById(id, res) {
     }
   }
 
-  // cancelar en BD
   const { data: updated, error: updErr } = await supabase
     .from("appointments")
     .update({
@@ -544,9 +534,7 @@ app.get("/_ping", (req, res) => {
 });
 
 /* ======================================================
-   ✅ SAAS: Provision tenant + owner user
-   POST /tenants/provision
-   body: { user_id, email, plan }
+   ✅ SAAS: Provision tenant + owner user + main calendar
 ====================================================== */
 app.post("/tenants/provision", async (req, res) => {
   try {
@@ -556,42 +544,60 @@ app.post("/tenants/provision", async (req, res) => {
       return res.status(400).json({ error: "Faltan campos: user_id, email, plan" });
     }
 
-    // slug simple desde el email (parte antes del @)
-   const baseSlug = String(email).split("@")[0] || "tenant";
-const cleanBase =
-  baseSlug
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 30) || "tenant";
+    const baseSlug = String(email).split("@")[0] || "tenant";
+    const cleanBase =
+      baseSlug
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 30) || "tenant";
 
-// sufijo corto para que sea único
-const suffix = Math.random().toString(16).slice(2, 8);
-const slug = `${cleanBase}-${suffix}`;
+    const suffix = Math.random().toString(16).slice(2, 8);
+    const slug = `${cleanBase}-${suffix}`;
 
     // 1) Crear tenant
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .insert({
         name: email,
-        slug: slug,
-        plan: plan,
+        slug,
+        plan,
       })
       .select()
       .single();
 
     if (tenantError) throw tenantError;
 
-    // 2) Crear relación tenant_users (owner)
+    // 2) Crear relación tenant_users
     const { error: userError } = await supabase.from("tenant_users").insert({
-      user_id: user_id,
+      user_id,
       tenant_id: tenant.id,
       role: "owner",
     });
 
     if (userError) throw userError;
 
-    return res.json({ ok: true, tenant_id: tenant.id });
+    // 3) Crear calendario principal
+    const { data: calendar, error: calendarError } = await supabase
+      .from("calendars")
+      .insert({
+        tenant_id: tenant.id,
+        name: "Agenda Principal",
+        timezone: "America/Santiago",
+        is_active: true,
+        slot_minutes: 30,
+        buffer_minutes: 0,
+      })
+      .select()
+      .single();
+
+    if (calendarError) throw calendarError;
+
+    return res.json({
+      ok: true,
+      tenant_id: tenant.id,
+      calendar_id: calendar.id,
+    });
   } catch (err) {
     console.error("Provision failed:", err);
     return res.status(500).json({ error: "Provision failed", detail: err.message });
