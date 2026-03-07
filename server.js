@@ -605,6 +605,46 @@ app.post("/tenants/provision", async (req, res) => {
 });
 
 /* ======================================================
+   ✅ GET /services
+====================================================== */
+app.get("/services", async (req, res) => {
+  try {
+    const { tenant_id, active } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    let query = supabase
+      .from("services")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: true });
+
+    if (active === "true") {
+      query = query.eq("active", true);
+    }
+
+    if (active === "false") {
+      query = query.eq("active", false);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({
+      total: data?.length || 0,
+      services: data || [],
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    🚀 START
 ====================================================== */
 app.listen(PORT, () => {
