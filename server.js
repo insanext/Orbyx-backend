@@ -769,6 +769,7 @@ app.get("/services", async (req, res) => {
 /* ======================================================
    🌐 PUBLIC: servicios por slug
 ====================================================== */
+
 app.get("/public/services/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
@@ -780,7 +781,7 @@ app.get("/public/services/:slug", async (req, res) => {
     // 1️⃣ buscar tenant
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, name, slug, calendar_id")
+      .select("id, name, slug")
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -789,7 +790,14 @@ app.get("/public/services/:slug", async (req, res) => {
       return res.status(404).json({ error: "negocio no encontrado" });
     }
 
-    // 2️⃣ buscar servicios activos
+    // 2️⃣ buscar calendar del tenant
+    const { data: calendar } = await supabase
+      .from("calendars")
+      .select("id")
+      .eq("tenant_id", tenant.id)
+      .single();
+
+    // 3️⃣ buscar servicios
     const { data: services, error: servicesError } = await supabase
       .from("services")
       .select("*")
@@ -805,11 +813,12 @@ app.get("/public/services/:slug", async (req, res) => {
       business: {
         name: tenant.name,
         slug: tenant.slug,
-        calendar_id: tenant.calendar_id
+        calendar_id: calendar?.id || null
       },
       total: services?.length || 0,
       services: services || []
     });
+
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
