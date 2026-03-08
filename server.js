@@ -273,12 +273,28 @@ app.get("/test-event", async (req, res) => {
 ====================================================== */
 app.get("/slots", async (req, res) => {
   try {
-    const { calendar_id, date } = req.query;
+    const { calendar_id, service_id, date } = req.query;
 
     if (!calendar_id || !date) {
       return res.status(400).json({
         error: "Faltan parámetros: calendar_id y date (YYYY-MM-DD)",
       });
+    }
+
+    let service = null;
+
+    if (service_id) {
+      const { data: serviceData, error: serviceError } = await supabase
+        .from("services")
+        .select("*")
+        .eq("id", service_id)
+        .single();
+
+      if (serviceError) {
+        return res.status(404).json({ error: "Servicio no encontrado" });
+      }
+
+      service = serviceData;
     }
 
     const { data, error } = await supabase.rpc("get_available_slots", {
@@ -290,6 +306,8 @@ app.get("/slots", async (req, res) => {
 
     return res.json({
       calendar_id,
+      service_id: service_id || null,
+      service,
       date,
       total: data?.length || 0,
       slots: data || [],
@@ -298,7 +316,6 @@ app.get("/slots", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 /* ======================================================
    ✅ POST /appointments/slot
 ====================================================== */
