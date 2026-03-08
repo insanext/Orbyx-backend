@@ -389,25 +389,6 @@ app.post("/appointments/slot", async (req, res) => {
     });
     if (slotsErr) return res.status(500).json({ error: slotsErr.message });
 
-let duration = slotMinutes;
-let bufferBefore = 0;
-let bufferAfter = 0;
-let serviceName = null;
-
-if (service_id) {
-  const { data: service } = await supabase
-    .from("services")
-    .select("*")
-    .eq("id", service_id)
-    .single();
-
-  if (service) {
-    duration = service.duration_minutes;
-    bufferBefore = service.buffer_before_minutes || 0;
-    bufferAfter = service.buffer_after_minutes || 0;
-    serviceName = service.name;
-  }
-}
 
 const wantedStartIso = new Date(slot_start).toISOString();
 
