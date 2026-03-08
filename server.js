@@ -354,13 +354,14 @@ app.post("/appointments/slot", async (req, res) => {
 
   try {
     const {
-      calendar_id,
-      date,
-      slot_start,
-      customer_name,
-      customer_phone,
-      source = "whatsapp",
-    } = req.body;
+  calendar_id,
+  service_id,
+  date,
+  slot_start,
+  customer_name,
+  customer_phone,
+  source = "whatsapp",
+} = req.body;
 
     if (!calendar_id || !date || !slot_start || !customer_name || !customer_phone) {
       return res.status(400).json({
@@ -392,21 +393,46 @@ app.post("/appointments/slot", async (req, res) => {
     const ok = (slots || []).some((s) => new Date(s.slot_start).toISOString() === wantedStartIso);
     if (!ok) return res.status(409).json({ error: "Ese horario ya no está disponible." });
 
-    const start = new Date(slot_start);
-    const end = new Date(start.getTime() + (slotMinutes + bufferMinutes) * 60 * 1000);
+   let duration = slotMinutes;
+let bufferBefore = 0;
+let bufferAfter = 0;
+let serviceName = null;
+
+if (service_id) {
+  const { data: service } = await supabase
+    .from("services")
+    .select("*")
+    .eq("id", service_id)
+    .single();
+
+  if (service) {
+    duration = service.duration_minutes;
+    bufferBefore = service.buffer_before_minutes || 0;
+    bufferAfter = service.buffer_after_minutes || 0;
+    serviceName = service.name;
+  }
+}
+
+const start = new Date(slot_start);
+const end = new Date(
+  start.getTime() + (duration + bufferBefore + bufferAfter) * 60 * 1000
+);
 
     const { data: appt, error: insErr } = await supabase
       .from("appointments")
-      .insert({
-        tenant_id: cal.tenant_id,
-        calendar_id,
-        customer_name,
-        customer_phone,
-        start_at: start.toISOString(),
-        end_at: end.toISOString(),
-        source,
-        status: "booked",
-      })
+.insert({
+  tenant_id: cal.tenant_id,
+  calendar_id,
+  service_id,
+  service_name_snapshot: serviceName,
+  duration_minutes_snapshot: duration,
+  customer_name,
+  customer_phone,
+  start_at: start.toISOString(),
+  end_at: end.toISOString(),
+  source,
+  status: "booked",
+})
       .select("*")
       .single();
 
