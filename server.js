@@ -609,7 +609,9 @@ async function cancelById(id, res) {
 
   if (apptErr || !appt) return res.status(404).json({ error: "Appointment no encontrado" });
 
-  if (String(appt.status).toLowerCase() === "canceled") {
+  const st = String(appt.status).toLowerCase();
+
+if (st === "canceled" || st === "cancelled") {
     return res.json({ ok: true, canceled: true, appointment: appt });
   }
 
