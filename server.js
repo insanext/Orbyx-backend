@@ -771,7 +771,6 @@ app.get("/services", async (req, res) => {
 ====================================================== */
 app.get("/public/services/:slug", async (req, res) => {
   try {
-
     const { slug } = req.params;
 
     if (!slug) {
@@ -781,7 +780,7 @@ app.get("/public/services/:slug", async (req, res) => {
     // 1️⃣ buscar tenant
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, name, slug")
+      .select("id, name, slug, calendar_id")
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -805,12 +804,12 @@ app.get("/public/services/:slug", async (req, res) => {
     return res.json({
       business: {
         name: tenant.name,
-        slug: tenant.slug
+        slug: tenant.slug,
+        calendar_id: tenant.calendar_id
       },
       total: services?.length || 0,
       services: services || []
     });
-
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
