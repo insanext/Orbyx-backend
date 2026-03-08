@@ -290,7 +290,7 @@ app.get("/slots", async (req, res) => {
         .eq("id", service_id)
         .single();
 
-      if (serviceError) {
+      if (serviceError || !serviceData) {
         return res.status(404).json({ error: "Servicio no encontrado" });
       }
 
@@ -302,15 +302,45 @@ app.get("/slots", async (req, res) => {
       _day: date,
     });
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    let slots = data || [];
+
+    if (service && slots.length > 0) {
+      const totalMinutes =
+        (service.duration_minutes || 0) +
+        (service.buffer_before_minutes || 0) +
+        (service.buffer_after_minutes || 0);
+
+      const baseSlotMinutes = 30;
+      const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
+
+      slots = slots.filter((slot, index) => {
+        for (let i = 1; i < neededBlocks; i++) {
+          const current = slots[index + i - 1];
+          const next = slots[index + i];
+
+          if (!current || !next) return false;
+
+          const currentEnd = new Date(current.slot_end).toISOString();
+          const nextStart = new Date(next.slot_start).toISOString();
+
+          if (currentEnd !== nextStart) return false;
+        }
+
+        return true;
+      });
+    }
 
     return res.json({
       calendar_id,
       service_id: service_id || null,
       service,
       date,
-      total: data?.length || 0,
-      slots: data || [],
+      total: slots.length,
+      slots,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
