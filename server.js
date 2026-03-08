@@ -483,13 +483,24 @@ app.post("/appointments/slot", async (req, res) => {
       .select("*")
       .single();
 
-    if (insErr) {
-      const msg = (insErr.message || "").toLowerCase();
-      if (msg.includes("overlap") || msg.includes("conflict") || msg.includes("exclude")) {
-        return res.status(409).json({ error: "Choque de horario (ya reservado)" });
-      }
-      return res.status(500).json({ error: insErr.message });
-    }
+if (insErr) {
+  const constraint = insErr.constraint || "";
+  const msg = (insErr.message || "").toLowerCase();
+
+  if (
+    constraint === "no_overlapping_appointments" ||
+    constraint === "appointments_calendar_start_unique" ||
+    msg.includes("overlap") ||
+    msg.includes("conflict") ||
+    msg.includes("exclude")
+  ) {
+    return res.status(409).json({
+      error: "Ese horario ya fue reservado.",
+    });
+  }
+
+  return res.status(500).json({ error: insErr.message });
+}
 
     apptCreated = appt;
 
