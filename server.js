@@ -767,6 +767,55 @@ app.get("/services", async (req, res) => {
 });
 
 /* ======================================================
+   🌐 PUBLIC: servicios por slug
+====================================================== */
+app.get("/public/services/:slug", async (req, res) => {
+  try {
+
+    const { slug } = req.params;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug requerido" });
+    }
+
+    // 1️⃣ buscar tenant
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, name, slug")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "negocio no encontrado" });
+    }
+
+    // 2️⃣ buscar servicios activos
+    const { data: services, error: servicesError } = await supabase
+      .from("services")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .eq("active", true)
+      .order("created_at", { ascending: true });
+
+    if (servicesError) {
+      return res.status(500).json({ error: servicesError.message });
+    }
+
+    return res.json({
+      business: {
+        name: tenant.name,
+        slug: tenant.slug
+      },
+      total: services?.length || 0,
+      services: services || []
+    });
+
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+/* ======================================================
    🚀 START
 ====================================================== */
 app.listen(PORT, () => {
