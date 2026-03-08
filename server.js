@@ -389,9 +389,59 @@ app.post("/appointments/slot", async (req, res) => {
     });
     if (slotsErr) return res.status(500).json({ error: slotsErr.message });
 
-    const wantedStartIso = new Date(slot_start).toISOString();
-    const ok = (slots || []).some((s) => new Date(s.slot_start).toISOString() === wantedStartIso);
-    if (!ok) return res.status(409).json({ error: "Ese horario ya no está disponible." });
+let duration = slotMinutes;
+let bufferBefore = 0;
+let bufferAfter = 0;
+let serviceName = null;
+
+if (service_id) {
+  const { data: service } = await supabase
+    .from("services")
+    .select("*")
+    .eq("id", service_id)
+    .single();
+
+  if (service) {
+    duration = service.duration_minutes;
+    bufferBefore = service.buffer_before_minutes || 0;
+    bufferAfter = service.buffer_after_minutes || 0;
+    serviceName = service.name;
+  }
+}
+
+const wantedStartIso = new Date(slot_start).toISOString();
+
+let validSlots = slots || [];
+
+if (service_id && validSlots.length > 0) {
+  const totalMinutes = duration + bufferBefore + bufferAfter;
+  const baseSlotMinutes = slotMinutes;
+  const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
+
+  validSlots = validSlots.filter((slot, index) => {
+    for (let i = 1; i < neededBlocks; i++) {
+      const current = validSlots[index + i - 1];
+      const next = validSlots[index + i];
+
+      if (!current || !next) return false;
+
+      const currentEnd = new Date(current.slot_end).toISOString();
+      const nextStart = new Date(next.slot_start).toISOString();
+
+      if (currentEnd !== nextStart) return false;
+    }
+
+    return true;
+  });
+}
+
+const ok = validSlots.some(
+  (s) => new Date(s.slot_start).toISOString() === wantedStartIso
+);
+
+if (!ok) {
+  return res.status(409).json({ error: "Ese horario ya no está disponible." });
+}
 
    let duration = slotMinutes;
 let bufferBefore = 0;
