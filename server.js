@@ -815,6 +815,115 @@ app.get("/public/services/:slug", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+/* ======================================================
+   🌐 PUBLIC: slots por slug + service_id + date
+====================================================== */
+app.get("/public/slots/:slug/:service_id", async (req, res) => {
+  try {
+    const { slug, service_id } = req.params;
+    const { date } = req.query;
+
+    if (!slug || !service_id || !date) {
+      return res.status(400).json({
+        error: "Se requiere slug, service_id y date (YYYY-MM-DD)",
+      });
+    }
+
+    // 1) buscar tenant por slug
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, name, slug")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "negocio no encontrado" });
+    }
+
+    // 2) buscar servicio activo del tenant
+    const { data: service, error: serviceError } = await supabase
+      .from("services")
+      .select("*")
+      .eq("id", service_id)
+      .eq("tenant_id", tenant.id)
+      .eq("active", true)
+      .single();
+
+    if (serviceError || !service) {
+      return res.status(404).json({ error: "servicio no encontrado" });
+    }
+
+    // 3) buscar calendario principal activo del tenant
+    const { data: calendar, error: calendarError } = await supabase
+      .from("calendars")
+      .select("id")
+      .eq("tenant_id", tenant.id)
+      .eq("is_active", true)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .single();
+
+    if (calendarError || !calendar) {
+      return res.status(404).json({ error: "calendario no encontrado" });
+    }
+
+    // 4) reutilizar lógica actual de slots base
+    const { data, error } = await supabase.rpc("get_available_slots", {
+      _calendar_id: calendar.id,
+      _day: date,
+    });
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    let slots = data || [];
+
+    // 5) filtrar según duración real del servicio
+    if (slots.length > 0) {
+      const totalMinutes =
+        (service.duration_minutes || 0) +
+        (service.buffer_before_minutes || 0) +
+        (service.buffer_after_minutes || 0);
+
+      const baseSlotMinutes = 30;
+      const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
+
+      slots = slots.filter((slot, index) => {
+        for (let i = 1; i < neededBlocks; i++) {
+          const current = slots[index + i - 1];
+          const next = slots[index + i];
+
+          if (!current || !next) return false;
+
+          const currentEnd = new Date(current.slot_end).toISOString();
+          const nextStart = new Date(next.slot_start).toISOString();
+
+          if (currentEnd !== nextStart) return false;
+        }
+
+        return true;
+      });
+    }
+
+    return res.json({
+      business: {
+        name: tenant.name,
+        slug: tenant.slug,
+      },
+      calendar_id: calendar.id,
+      service,
+      date,
+      total: slots.length,
+      slots,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 /* ======================================================
    🚀 START
 ====================================================== */
