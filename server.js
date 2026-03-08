@@ -50,7 +50,11 @@ const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
 const CLIENTE_FIJO = "cliente_demo";
 const CAL_FIJO = "principal";
 
-const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+const oAuth2Client = new google.auth.OAuth2(
+  CLIENT_ID,
+  CLIENT_SECRET,
+  REDIRECT_URI
+);
 
 console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
 console.log("🔥 VERSION: SAAS_TOKEN_BY_CALENDAR_ID + OAUTH REDIRECT TO FRONTEND");
@@ -154,7 +158,9 @@ app.get("/oauth2callback", async (req, res) => {
     let state = {};
     try {
       if (stateRaw) {
-        state = JSON.parse(Buffer.from(String(stateRaw), "base64url").toString("utf8"));
+        state = JSON.parse(
+          Buffer.from(String(stateRaw), "base64url").toString("utf8")
+        );
       }
     } catch (_) {
       state = {};
@@ -346,6 +352,7 @@ app.get("/slots", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
 /* ======================================================
    ✅ POST /appointments/slot
 ====================================================== */
@@ -354,14 +361,14 @@ app.post("/appointments/slot", async (req, res) => {
 
   try {
     const {
-  calendar_id,
-  service_id,
-  date,
-  slot_start,
-  customer_name,
-  customer_phone,
-  source = "whatsapp",
-} = req.body;
+      calendar_id,
+      service_id,
+      date,
+      slot_start,
+      customer_name,
+      customer_phone,
+      source = "whatsapp",
+    } = req.body;
 
     if (!calendar_id || !date || !slot_start || !customer_name || !customer_phone) {
       return res.status(400).json({
@@ -376,94 +383,103 @@ app.post("/appointments/slot", async (req, res) => {
       .eq("id", calendar_id)
       .single();
 
-    if (calErr || !cal) return res.status(404).json({ error: "Calendario no encontrado" });
-    if (!cal.is_active) return res.status(400).json({ error: "Calendario inactivo" });
+    if (calErr || !cal) {
+      return res.status(404).json({ error: "Calendario no encontrado" });
+    }
+
+    if (!cal.is_active) {
+      return res.status(400).json({ error: "Calendario inactivo" });
+    }
 
     const slotMinutes = cal.slot_minutes ?? 30;
-    const bufferMinutes = cal.buffer_minutes ?? 0;
     const timeZone = cal.timezone || "America/Santiago";
 
     const { data: slots, error: slotsErr } = await supabase.rpc("get_available_slots", {
       _calendar_id: calendar_id,
       _day: date,
     });
-    if (slotsErr) return res.status(500).json({ error: slotsErr.message });
 
-
-const wantedStartIso = new Date(slot_start).toISOString();
-
-let validSlots = slots || [];
-
-if (service_id && validSlots.length > 0) {
-  const totalMinutes = duration + bufferBefore + bufferAfter;
-  const baseSlotMinutes = slotMinutes;
-  const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
-
-  validSlots = validSlots.filter((slot, index) => {
-    for (let i = 1; i < neededBlocks; i++) {
-      const current = validSlots[index + i - 1];
-      const next = validSlots[index + i];
-
-      if (!current || !next) return false;
-
-      const currentEnd = new Date(current.slot_end).toISOString();
-      const nextStart = new Date(next.slot_start).toISOString();
-
-      if (currentEnd !== nextStart) return false;
+    if (slotsErr) {
+      return res.status(500).json({ error: slotsErr.message });
     }
 
-    return true;
-  });
-}
+    // ✅ Cargar servicio antes de validar disponibilidad
+    let duration = slotMinutes;
+    let bufferBefore = 0;
+    let bufferAfter = 0;
+    let serviceName = null;
 
-const ok = validSlots.some(
-  (s) => new Date(s.slot_start).toISOString() === wantedStartIso
-);
+    if (service_id) {
+      const { data: service, error: serviceErr } = await supabase
+        .from("services")
+        .select("*")
+        .eq("id", service_id)
+        .single();
 
-if (!ok) {
-  return res.status(409).json({ error: "Ese horario ya no está disponible." });
-}
+      if (serviceErr || !service) {
+        return res.status(404).json({ error: "Servicio no encontrado" });
+      }
 
-   let duration = slotMinutes;
-let bufferBefore = 0;
-let bufferAfter = 0;
-let serviceName = null;
+      duration = service.duration_minutes;
+      bufferBefore = service.buffer_before_minutes || 0;
+      bufferAfter = service.buffer_after_minutes || 0;
+      serviceName = service.name;
+    }
 
-if (service_id) {
-  const { data: service } = await supabase
-    .from("services")
-    .select("*")
-    .eq("id", service_id)
-    .single();
+    // ✅ Última validación real del slot según servicio
+    const wantedStartIso = new Date(slot_start).toISOString();
+    let validSlots = slots || [];
 
-  if (service) {
-    duration = service.duration_minutes;
-    bufferBefore = service.buffer_before_minutes || 0;
-    bufferAfter = service.buffer_after_minutes || 0;
-    serviceName = service.name;
-  }
-}
+    if (service_id && validSlots.length > 0) {
+      const totalMinutes = duration + bufferBefore + bufferAfter;
+      const baseSlotMinutes = slotMinutes;
+      const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
 
-const start = new Date(slot_start);
-const end = new Date(
-  start.getTime() + (duration + bufferBefore + bufferAfter) * 60 * 1000
-);
+      validSlots = validSlots.filter((slot, index) => {
+        for (let i = 1; i < neededBlocks; i++) {
+          const current = validSlots[index + i - 1];
+          const next = validSlots[index + i];
+
+          if (!current || !next) return false;
+
+          const currentEnd = new Date(current.slot_end).toISOString();
+          const nextStart = new Date(next.slot_start).toISOString();
+
+          if (currentEnd !== nextStart) return false;
+        }
+
+        return true;
+      });
+    }
+
+    const ok = validSlots.some(
+      (s) => new Date(s.slot_start).toISOString() === wantedStartIso
+    );
+
+    if (!ok) {
+      return res.status(409).json({ error: "Ese horario ya no está disponible." });
+    }
+
+    const start = new Date(slot_start);
+    const end = new Date(
+      start.getTime() + (duration + bufferBefore + bufferAfter) * 60 * 1000
+    );
 
     const { data: appt, error: insErr } = await supabase
       .from("appointments")
-.insert({
-  tenant_id: cal.tenant_id,
-  calendar_id,
-  service_id,
-  service_name_snapshot: serviceName,
-  duration_minutes_snapshot: duration,
-  customer_name,
-  customer_phone,
-  start_at: start.toISOString(),
-  end_at: end.toISOString(),
-  source,
-  status: "booked",
-})
+      .insert({
+        tenant_id: cal.tenant_id,
+        calendar_id,
+        service_id,
+        service_name_snapshot: serviceName,
+        duration_minutes_snapshot: duration,
+        customer_name,
+        customer_phone,
+        start_at: start.toISOString(),
+        end_at: end.toISOString(),
+        source,
+        status: "booked",
+      })
       .select("*")
       .single();
 
@@ -512,7 +528,9 @@ const end = new Date(
         .update({ status: "canceled", canceled_at: new Date().toISOString() })
         .eq("id", appt.id);
 
-      return res.status(500).json({ error: "Se creó evento, pero falló guardar event_id en DB." });
+      return res.status(500).json({
+        error: "Se creó evento, pero falló guardar event_id en DB.",
+      });
     }
 
     return res.status(201).json({
