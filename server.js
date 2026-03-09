@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { google } = require("googleapis");
+const crypto = require("crypto");
 const { supabase } = require("./supabaseClient");
 
 const app = express();
@@ -464,6 +465,7 @@ app.post("/appointments/slot", async (req, res) => {
     const end = new Date(
       start.getTime() + (duration + bufferBefore + bufferAfter) * 60 * 1000
     );
+    const cancelToken = crypto.randomBytes(24).toString("hex");
 
     const { data: appt, error: insErr } = await supabase
       .from("appointments")
@@ -479,28 +481,29 @@ app.post("/appointments/slot", async (req, res) => {
         end_at: end.toISOString(),
         source,
         status: "booked",
+        cancel_token: cancelToken,
       })
       .select("*")
       .single();
 
-if (insErr) {
-  const constraint = insErr.constraint || "";
-  const msg = (insErr.message || "").toLowerCase();
+    if (insErr) {
+      const constraint = insErr.constraint || "";
+      const msg = (insErr.message || "").toLowerCase();
 
-  if (
-    constraint === "no_overlapping_appointments" ||
-    constraint === "appointments_calendar_start_unique" ||
-    msg.includes("overlap") ||
-    msg.includes("conflict") ||
-    msg.includes("exclude")
-  ) {
-    return res.status(409).json({
-      error: "Ese horario ya fue reservado.",
-    });
-  }
+      if (
+        constraint === "no_overlapping_appointments" ||
+        constraint === "appointments_calendar_start_unique" ||
+        msg.includes("overlap") ||
+        msg.includes("conflict") ||
+        msg.includes("exclude")
+      ) {
+        return res.status(409).json({
+          error: "Ese horario ya fue reservado.",
+        });
+      }
 
-  return res.status(500).json({ error: insErr.message });
-}
+      return res.status(500).json({ error: insErr.message });
+    }
 
     apptCreated = appt;
 
@@ -611,7 +614,7 @@ async function cancelById(id, res) {
 
   const st = String(appt.status).toLowerCase();
 
-if (st === "canceled" || st === "cancelled") {
+  if (st === "canceled" || st === "cancelled") {
     return res.json({ ok: true, canceled: true, appointment: appt });
   }
 
@@ -782,7 +785,6 @@ app.get("/services", async (req, res) => {
 /* ======================================================
    🌐 PUBLIC: servicios por slug
 ====================================================== */
-
 app.get("/public/services/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
@@ -826,12 +828,11 @@ app.get("/public/services/:slug", async (req, res) => {
       business: {
         name: tenant.name,
         slug: tenant.slug,
-        calendar_id: calendar?.id || null
+        calendar_id: calendar?.id || null,
       },
       total: services?.length || 0,
-      services: services || []
+      services: services || [],
     });
-
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
