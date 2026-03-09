@@ -368,6 +368,7 @@ app.post("/appointments/slot", async (req, res) => {
       slot_start,
       customer_name,
       customer_phone,
+      customer_email,
       source = "whatsapp",
     } = req.body;
 
@@ -475,6 +476,7 @@ app.post("/appointments/slot", async (req, res) => {
         duration_minutes_snapshot: duration,
         customer_name,
         customer_phone,
+        customer_email,
         start_at: start.toISOString(),
         end_at: end.toISOString(),
         source,
