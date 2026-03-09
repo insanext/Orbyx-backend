@@ -404,7 +404,6 @@ app.post("/appointments/slot", async (req, res) => {
       return res.status(500).json({ error: slotsErr.message });
     }
 
-    // ✅ Cargar servicio antes de validar disponibilidad
     let duration = slotMinutes;
     let bufferBefore = 0;
     let bufferAfter = 0;
@@ -427,7 +426,6 @@ app.post("/appointments/slot", async (req, res) => {
       serviceName = service.name;
     }
 
-    // ✅ Última validación real del slot según servicio
     const wantedStartIso = new Date(slot_start).toISOString();
     let validSlots = slots || [];
 
@@ -550,6 +548,7 @@ app.post("/appointments/slot", async (req, res) => {
     return res.status(201).json({
       ok: true,
       appointment: apptUpdated,
+      cancel_url: `https://www.orbyx.cl/cancel/${appt.id}?token=${cancelToken}`,
       google: {
         calendarId: googleCalendarId,
         event_id: eventId,
@@ -603,14 +602,22 @@ app.get("/appointments", async (req, res) => {
 /* ======================================================
    ✅ CANCEL (DELETE y POST compat)
 ====================================================== */
-async function cancelById(id, res) {
+async function cancelById(id, token, res) {
   const { data: appt, error: apptErr } = await supabase
     .from("appointments")
     .select("*")
     .eq("id", id)
     .single();
 
-  if (apptErr || !appt) return res.status(404).json({ error: "Appointment no encontrado" });
+  if (apptErr || !appt) {
+    return res.status(404).json({ error: "Appointment no encontrado" });
+  }
+
+  if (!token || !appt.cancel_token || token !== appt.cancel_token) {
+    return res.status(403).json({
+      error: "Token inválido para cancelar esta reserva",
+    });
+  }
 
   const st = String(appt.status).toLowerCase();
 
@@ -620,9 +627,8 @@ async function cancelById(id, res) {
 
   if (appt.event_id) {
     try {
-      const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(
-        appt.calendar_id
-      );
+      const { calendar, googleCalendarId } =
+        await getGoogleCalendarClientByCalendarId(appt.calendar_id);
 
       await calendar.events.delete({
         calendarId: googleCalendarId,
@@ -650,7 +656,7 @@ async function cancelById(id, res) {
 
 app.post("/appointments/:id", async (req, res) => {
   try {
-    return await cancelById(req.params.id, res);
+    return await cancelById(req.params.id, req.query.token, res);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -658,7 +664,7 @@ app.post("/appointments/:id", async (req, res) => {
 
 app.delete("/appointments/:id", async (req, res) => {
   try {
-    return await cancelById(req.params.id, res);
+    return await cancelById(req.params.id, req.query.token, res);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -693,7 +699,6 @@ app.post("/tenants/provision", async (req, res) => {
     const suffix = Math.random().toString(16).slice(2, 8);
     const slug = `${cleanBase}-${suffix}`;
 
-    // 1) Crear tenant
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .insert({
@@ -706,7 +711,6 @@ app.post("/tenants/provision", async (req, res) => {
 
     if (tenantError) throw tenantError;
 
-    // 2) Crear relación tenant_users
     const { error: userError } = await supabase.from("tenant_users").insert({
       user_id,
       tenant_id: tenant.id,
@@ -715,7 +719,6 @@ app.post("/tenants/provision", async (req, res) => {
 
     if (userError) throw userError;
 
-    // 3) Crear calendario principal
     const { data: calendar, error: calendarError } = await supabase
       .from("calendars")
       .insert({
@@ -793,7 +796,6 @@ app.get("/public/services/:slug", async (req, res) => {
       return res.status(400).json({ error: "slug requerido" });
     }
 
-    // 1️⃣ buscar tenant
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .select("id, name, slug")
@@ -805,14 +807,12 @@ app.get("/public/services/:slug", async (req, res) => {
       return res.status(404).json({ error: "negocio no encontrado" });
     }
 
-    // 2️⃣ buscar calendar del tenant
     const { data: calendar } = await supabase
       .from("calendars")
       .select("id")
       .eq("tenant_id", tenant.id)
       .single();
 
-    // 3️⃣ buscar servicios
     const { data: services, error: servicesError } = await supabase
       .from("services")
       .select("*")
@@ -852,7 +852,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       });
     }
 
-    // 1) buscar tenant por slug
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .select("id, name, slug")
@@ -864,7 +863,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       return res.status(404).json({ error: "negocio no encontrado" });
     }
 
-    // 2) buscar servicio activo del tenant
     const { data: service, error: serviceError } = await supabase
       .from("services")
       .select("*")
@@ -877,7 +875,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       return res.status(404).json({ error: "servicio no encontrado" });
     }
 
-    // 3) buscar calendario principal activo del tenant
     const { data: calendar, error: calendarError } = await supabase
       .from("calendars")
       .select("id")
@@ -891,7 +888,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       return res.status(404).json({ error: "calendario no encontrado" });
     }
 
-    // 4) reutilizar lógica actual de slots base
     const { data, error } = await supabase.rpc("get_available_slots", {
       _calendar_id: calendar.id,
       _day: date,
@@ -903,7 +899,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 
     let slots = data || [];
 
-    // 5) filtrar según duración real del servicio
     if (slots.length > 0) {
       const totalMinutes =
         (service.duration_minutes || 0) +
