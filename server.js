@@ -814,7 +814,7 @@ app.get("/public/services/:slug", async (req, res) => {
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, name, slug")
+      .select("id, name, slug, logo_url, brand_color, description, phone, address")
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -840,15 +840,20 @@ app.get("/public/services/:slug", async (req, res) => {
       return res.status(500).json({ error: servicesError.message });
     }
 
-    return res.json({
-      business: {
-        name: tenant.name,
-        slug: tenant.slug,
-        calendar_id: calendar?.id || null,
-      },
-      total: services?.length || 0,
-      services: services || [],
-    });
+return res.json({
+  business: {
+    name: tenant.name,
+    slug: tenant.slug,
+    calendar_id: calendar?.id || null,
+    logo_url: tenant.logo_url,
+    brand_color: tenant.brand_color,
+    description: tenant.description,
+    phone: tenant.phone,
+    address: tenant.address,
+  },
+  total: services?.length || 0,
+  services: services || [],
+});
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
