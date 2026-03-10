@@ -5,6 +5,7 @@ const cors = require("cors");
 const { google } = require("googleapis");
 const crypto = require("crypto");
 const { supabase } = require("./supabaseClient");
+const { sendBookingEmail } = require("./email");
 
 const app = express();
 
@@ -547,16 +548,29 @@ app.post("/appointments/slot", async (req, res) => {
       });
     }
 
-    return res.status(201).json({
-      ok: true,
-      appointment: apptUpdated,
-      cancel_url: `https://www.orbyx.cl/cancel/${appt.id}?token=${cancelToken}`,
-      google: {
-        calendarId: googleCalendarId,
-        event_id: eventId,
-        htmlLink: response?.data?.htmlLink,
-      },
-    });
+   const cancelUrl = `https://www.orbyx.cl/cancel/${appt.id}?token=${cancelToken}`;
+
+if (customer_email) {
+  await sendBookingEmail({
+    email: customer_email,
+    customerName: customer_name,
+    serviceName: serviceName || "Reserva",
+    startAt: start.toISOString(),
+    cancelUrl,
+  });
+}
+
+return res.status(201).json({
+  ok: true,
+  appointment: apptUpdated,
+  cancel_url: cancelUrl,
+  google: {
+    calendarId: googleCalendarId,
+    event_id: eventId,
+    htmlLink: response?.data?.htmlLink,
+  },
+});
+
   } catch (err) {
     try {
       if (apptCreated?.id) {
