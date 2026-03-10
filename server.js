@@ -958,6 +958,56 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 });
 
 /* ======================================================
+   🔔 RECORDATORIOS 24H
+====================================================== */
+
+app.get("/jobs/send-reminders", async (req, res) => {
+  try {
+
+    const now = new Date();
+    const in24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+
+    const { data: appointments, error } = await supabase
+      .from("appointments")
+      .select("*")
+      .eq("status", "booked")
+      .gte("start_at", in24h.toISOString())
+      .lte("start_at", new Date(in24h.getTime() + 60 * 60 * 1000).toISOString());
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    let sent = 0;
+
+    for (const appt of appointments) {
+
+      if (!appt.customer_email) continue;
+
+      const cancelUrl = `https://www.orbyx.cl/cancel/${appt.id}?token=${appt.cancel_token}`;
+
+      await sendBookingEmail({
+        email: appt.customer_email,
+        customerName: appt.customer_name,
+        serviceName: appt.service_name_snapshot || "Reserva",
+        startAt: appt.start_at,
+        cancelUrl
+      });
+
+      sent++;
+    }
+
+    return res.json({
+      ok: true,
+      reminders_sent: sent
+    });
+
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    🚀 START
 ====================================================== */
 app.listen(PORT, () => {

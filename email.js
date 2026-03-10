@@ -28,7 +28,7 @@ async function sendBookingEmail({
     await resend.emails.send({
       from: "Orbyx <reservas@notificaciones.orbyx.cl>",
       to: email,
-      subject: "Reserva confirmada",
+      subject: "Recuerda tu reserva de mañana",
       html: `
         <h2>Reserva confirmada</h2>
 
