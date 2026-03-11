@@ -912,7 +912,7 @@ app.get("/public/services/:slug", async (req, res) => {
 
     const { data: services, error: servicesError } = await supabase
       .from("services")
-      .select("*")
+      .select("id, name, duration_minutes, buffer_before_minutes, buffer_after_minutes, price, location_type, location_text")
       .eq("tenant_id", tenant.id)
       .eq("active", true)
       .order("created_at", { ascending: true });
