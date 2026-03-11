@@ -373,10 +373,69 @@ app.post("/appointments/slot", async (req, res) => {
       source = "whatsapp",
     } = req.body;
 
-    if (!calendar_id || !date || !slot_start || !customer_name || !customer_phone) {
+    function normalizeChileanPhone(rawPhone) {
+      if (!rawPhone) return null;
+
+      let digits = String(rawPhone).replace(/\D/g, "");
+
+      if (digits.startsWith("56")) {
+        digits = digits.slice(2);
+      }
+
+      if (digits.length !== 9) return null;
+      if (!digits.startsWith("9")) return null;
+
+      return `+56${digits}`;
+    }
+
+    function isValidEmail(email) {
+      if (!email) return false;
+
+      const normalized = String(email).trim().toLowerCase();
+
+      const emailRegex =
+        /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
+
+      if (!emailRegex.test(normalized)) return false;
+
+      const domain = normalized.split("@")[1];
+      if (!domain) return false;
+      if (domain.startsWith(".") || domain.endsWith(".")) return false;
+      if (domain.includes("..")) return false;
+
+      return true;
+    }
+
+    const normalizedEmail = String(customer_email || "")
+      .trim()
+      .toLowerCase();
+
+    const normalizedPhone = normalizeChileanPhone(customer_phone);
+
+    if (
+      !calendar_id ||
+      !date ||
+      !slot_start ||
+      !customer_name ||
+      !customer_phone ||
+      !customer_email
+    ) {
       return res.status(400).json({
         error:
-          "Faltan campos: calendar_id, date (YYYY-MM-DD), slot_start (ISO), customer_name, customer_phone",
+          "Faltan campos: calendar_id, date (YYYY-MM-DD), slot_start (ISO), customer_name, customer_phone, customer_email",
+      });
+    }
+
+    if (!isValidEmail(normalizedEmail)) {
+      return res.status(400).json({
+        error: "El email ingresado no es válido.",
+      });
+    }
+
+    if (!normalizedPhone) {
+      return res.status(400).json({
+        error:
+          "El teléfono debe ser un número móvil chileno válido de 9 dígitos. Ejemplo: 912345678",
       });
     }
 
@@ -392,6 +451,30 @@ app.post("/appointments/slot", async (req, res) => {
 
     if (!cal.is_active) {
       return res.status(400).json({ error: "Calendario inactivo" });
+    }
+
+    const start = new Date(slot_start);
+
+    const { data: existingAppointment, error: existingErr } = await supabase
+      .from("appointments")
+      .select("id, start_at, status")
+      .eq("tenant_id", cal.tenant_id)
+      .eq("customer_email", normalizedEmail)
+      .eq("status", "booked")
+      .gte("start_at", new Date().toISOString())
+      .order("start_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (existingErr) {
+      return res.status(500).json({ error: existingErr.message });
+    }
+
+    if (existingAppointment) {
+      return res.status(409).json({
+        error:
+          "Este email ya tiene una reserva futura activa. Revisa tu correo o cancela la reserva actual antes de tomar otra.",
+      });
     }
 
     const slotMinutes = cal.slot_minutes ?? 30;
@@ -461,7 +544,6 @@ app.post("/appointments/slot", async (req, res) => {
       return res.status(409).json({ error: "Ese horario ya no está disponible." });
     }
 
-    const start = new Date(slot_start);
     const end = new Date(
       start.getTime() + (duration + bufferBefore + bufferAfter) * 60 * 1000
     );
@@ -475,9 +557,9 @@ app.post("/appointments/slot", async (req, res) => {
         service_id,
         service_name_snapshot: serviceName,
         duration_minutes_snapshot: duration,
-        customer_name,
-        customer_phone,
-        customer_email,
+        customer_name: String(customer_name).trim(),
+        customer_phone: normalizedPhone,
+        customer_email: normalizedEmail,
         start_at: start.toISOString(),
         end_at: end.toISOString(),
         source,
@@ -508,11 +590,12 @@ app.post("/appointments/slot", async (req, res) => {
 
     apptCreated = appt;
 
-    const { calendar, googleCalendarId } = await getGoogleCalendarClientByCalendarId(calendar_id);
+    const { calendar, googleCalendarId } =
+      await getGoogleCalendarClientByCalendarId(calendar_id);
 
     const event = {
-      summary: `Cita - ${customer_name}`,
-      description: `Cliente: ${customer_name}\nTeléfono: ${customer_phone}\ncalendar_id: ${calendar_id}\nappointment_id: ${appt.id}`,
+      summary: `Cita - ${String(customer_name).trim()}`,
+      description: `Cliente: ${String(customer_name).trim()}\nTeléfono: ${normalizedPhone}\nEmail: ${normalizedEmail}\ncalendar_id: ${calendar_id}\nappointment_id: ${appt.id}`,
       start: { dateTime: start.toISOString(), timeZone },
       end: { dateTime: end.toISOString(), timeZone },
     };
@@ -548,29 +631,28 @@ app.post("/appointments/slot", async (req, res) => {
       });
     }
 
-   const cancelUrl = `https://www.orbyx.cl/cancel/${appt.id}?token=${cancelToken}`;
+    const cancelUrl = `https://www.orbyx.cl/cancel/${appt.id}?token=${cancelToken}`;
 
-if (customer_email) {
-  await sendBookingEmail({
-    email: customer_email,
-    customerName: customer_name,
-    serviceName: serviceName || "Reserva",
-    startAt: start.toISOString(),
-    cancelUrl,
-  });
-}
+    if (normalizedEmail) {
+      await sendBookingEmail({
+        email: normalizedEmail,
+        customerName: String(customer_name).trim(),
+        serviceName: serviceName || "Reserva",
+        startAt: start.toISOString(),
+        cancelUrl,
+      });
+    }
 
-return res.status(201).json({
-  ok: true,
-  appointment: apptUpdated,
-  cancel_url: cancelUrl,
-  google: {
-    calendarId: googleCalendarId,
-    event_id: eventId,
-    htmlLink: response?.data?.htmlLink,
-  },
-});
-
+    return res.status(201).json({
+      ok: true,
+      appointment: apptUpdated,
+      cancel_url: cancelUrl,
+      google: {
+        calendarId: googleCalendarId,
+        event_id: eventId,
+        htmlLink: response?.data?.htmlLink,
+      },
+    });
   } catch (err) {
     try {
       if (apptCreated?.id) {
@@ -584,7 +666,6 @@ return res.status(201).json({
     return res.status(500).json({ error: err.message });
   }
 });
-
 /* ======================================================
    ✅ GET /appointments
 ====================================================== */
