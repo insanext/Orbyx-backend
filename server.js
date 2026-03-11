@@ -1072,13 +1072,15 @@ app.get("/jobs/send-reminders", async (req, res) => {
 
       const cancelUrl = `https://www.orbyx.cl/cancel/${appt.id}?token=${appt.cancel_token}`;
 
-      await sendBookingEmail({
-        email: appt.customer_email,
-        customerName: appt.customer_name,
-        serviceName: appt.service_name_snapshot || "Reserva",
-        startAt: appt.start_at,
-        cancelUrl
-      });
+await sendBookingEmail({
+  email: normalizedEmail,
+  customerName: String(customer_name).trim(),
+  serviceName: serviceName || "Reserva",
+  startAt: start.toISOString(),
+  cancelUrl,
+  locationType: service?.location_type || null,
+  locationText: service?.location_text || null,
+});
 
       sent++;
     }

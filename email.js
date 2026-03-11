@@ -21,14 +21,22 @@ async function sendBookingEmail({
   serviceName,
   startAt,
   cancelUrl,
+  locationType,
+  locationText,
 }) {
   try {
     const formattedDate = formatDate(startAt);
 
+    const locationHtml = locationText
+      ? `<strong>${
+          locationType === "online" ? "Modalidad" : "Ubicación"
+        }:</strong> ${locationText}<br/>`
+      : "";
+
     await resend.emails.send({
       from: "Orbyx <reservas@notificaciones.orbyx.cl>",
       to: email,
-      subject: "Recuerda tu reserva de mañana",
+      subject: "Reserva confirmada",
       html: `
         <h2>Reserva confirmada</h2>
 
@@ -38,7 +46,8 @@ async function sendBookingEmail({
 
         <p>
         <strong>Servicio:</strong> ${serviceName}<br/>
-        <strong>Fecha:</strong> ${formattedDate}
+        <strong>Fecha:</strong> ${formattedDate}<br/>
+        ${locationHtml}
         </p>
 
         <p style="margin-top:20px;">
