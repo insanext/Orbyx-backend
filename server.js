@@ -805,7 +805,8 @@ app.get("/appointments/:id", async (req, res) => {
     return res.json({
       service: appt.service_name_snapshot,
       start_at: appt.start_at,
-      location: appt.location_text || null
+      location: appt.location_text || null,
+status: appt.status,
     });
 
   } catch (err) {
