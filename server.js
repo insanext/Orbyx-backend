@@ -631,7 +631,19 @@ app.post("/appointments/slot", async (req, res) => {
       });
     }
 
-    const cancelUrl = `https://www.orbyx.cl/cancel/${appt.id}?token=${cancelToken}`;
+    const { data: tenantData } = await supabase
+  .from("tenants")
+  .select("slug")
+  .eq("id", cal.tenant_id)
+  .single();
+
+const bookingUrl = tenantData?.slug
+  ? `https://www.orbyx.cl/${tenantData.slug}`
+  : "https://www.orbyx.cl";
+
+const cancelUrl =
+  `https://www.orbyx.cl/cancel/${apptUpdated.id}?token=${cancelToken}` +
+  `&redirect=${encodeURIComponent(bookingUrl)}`;
 
     if (normalizedEmail) {
       await sendBookingEmail({
@@ -1049,7 +1061,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 
 app.get("/jobs/send-reminders", async (req, res) => {
   try {
-
     const now = new Date();
     const in24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
@@ -1067,34 +1078,41 @@ app.get("/jobs/send-reminders", async (req, res) => {
     let sent = 0;
 
     for (const appt of appointments) {
-
       if (!appt.customer_email) continue;
 
-      const cancelUrl = `https://www.orbyx.cl/cancel/${appt.id}?token=${appt.cancel_token}`;
+      const { data: tenantData } = await supabase
+        .from("tenants")
+        .select("slug")
+        .eq("id", appt.tenant_id)
+        .single();
 
-await sendBookingEmail({
-  email: normalizedEmail,
-  customerName: String(customer_name).trim(),
-  serviceName: serviceName || "Reserva",
-  startAt: start.toISOString(),
-  cancelUrl,
-  locationType: service?.location_type || null,
-  locationText: service?.location_text || null,
-});
+      const bookingUrl = tenantData?.slug
+        ? `https://www.orbyx.cl/${tenantData.slug}`
+        : "https://www.orbyx.cl";
+
+      const cancelUrl =
+        `https://www.orbyx.cl/cancel/${appt.id}?token=${appt.cancel_token}` +
+        `&redirect=${encodeURIComponent(bookingUrl)}`;
+
+      await sendBookingEmail({
+        email: appt.customer_email,
+        customerName: appt.customer_name,
+        serviceName: appt.service_name_snapshot || "Reserva",
+        startAt: appt.start_at,
+        cancelUrl,
+      });
 
       sent++;
     }
 
     return res.json({
       ok: true,
-      reminders_sent: sent
+      reminders_sent: sent,
     });
-
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
 /* ======================================================
    🚀 START
 ====================================================== */
