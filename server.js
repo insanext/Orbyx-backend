@@ -780,6 +780,40 @@ app.delete("/appointments/:id", async (req, res) => {
 });
 
 /* ======================================================
+   🔎 GET /appointments/:id (info pública para cancelación)
+====================================================== */
+
+app.get("/appointments/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { token } = req.query;
+
+    const { data: appt, error } = await supabase
+      .from("appointments")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (error || !appt) {
+      return res.status(404).json({ error: "Reserva no encontrada" });
+    }
+
+    if (!token || token !== appt.cancel_token) {
+      return res.status(403).json({ error: "Token inválido" });
+    }
+
+    return res.json({
+      service: appt.service_name_snapshot,
+      start_at: appt.start_at,
+      location: appt.location_text || null
+    });
+
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    🔹 HEALTHCHECK
 ====================================================== */
 app.get("/_ping", (req, res) => {
