@@ -1279,8 +1279,8 @@ app.post("/onboarding/setup", async (req, res) => {
       }));
 
       const { error: insertSpecialError } = await supabase
-        .from("special_dates")
-        .insert(specialRows);
+  .from("availability_exceptions")
+  .insert(specialRows);
 
       if (insertSpecialError) {
         return res.status(500).json({ error: insertSpecialError.message });
