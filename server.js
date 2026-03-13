@@ -1148,6 +1148,160 @@ app.get("/jobs/send-reminders", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+/* ======================================================
+   ✅ ONBOARDING SETUP
+====================================================== */
+app.post("/onboarding/setup", async (req, res) => {
+  try {
+    const {
+      tenant_id,
+      business,
+      service,
+      weekly_hours = [],
+      special_dates = [],
+    } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!business?.name || !business?.slug) {
+      return res.status(400).json({
+        error: "Faltan campos obligatorios del negocio: name y slug",
+      });
+    }
+
+    // 1) actualizar negocio
+    const { data: tenantUpdated, error: tenantError } = await supabase
+      .from("tenants")
+      .update({
+        name: String(business.name).trim(),
+        slug: String(business.slug).trim().toLowerCase(),
+        phone: business.contact_phone ? String(business.contact_phone).trim() : null,
+        address: business.address ? String(business.address).trim() : null,
+      })
+      .eq("id", tenant_id)
+      .select()
+      .single();
+
+    if (tenantError) {
+      return res.status(500).json({ error: tenantError.message });
+    }
+
+    // 2) obtener calendario principal del tenant
+    const { data: calendar, error: calendarError } = await supabase
+      .from("calendars")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .single();
+
+    if (calendarError || !calendar) {
+      return res.status(404).json({ error: "Calendario principal no encontrado" });
+    }
+
+    // 3) crear primer servicio
+    let createdService = null;
+
+    if (service?.name) {
+      const { data: serviceInserted, error: serviceError } = await supabase
+        .from("services")
+        .insert({
+          tenant_id,
+          name: String(service.name).trim(),
+          duration_minutes: Number(service.duration_minutes || 30),
+          buffer_before_minutes: Number(service.buffer_before_minutes || 0),
+          buffer_after_minutes: Number(service.buffer_after_minutes || 0),
+          price: Number(service.price || 0),
+          active: true,
+        })
+        .select()
+        .single();
+
+      if (serviceError) {
+        return res.status(500).json({ error: serviceError.message });
+      }
+
+      createdService = serviceInserted;
+    }
+
+    // 4) guardar horarios semanales
+    if (Array.isArray(weekly_hours) && weekly_hours.length > 0) {
+      // borra horarios anteriores de ese calendario
+      const { error: deleteWeeklyError } = await supabase
+        .from("business_hours")
+        .delete()
+        .eq("calendar_id", calendar.id);
+
+      if (deleteWeeklyError) {
+        return res.status(500).json({ error: deleteWeeklyError.message });
+      }
+
+      const weeklyRows = weekly_hours.map((row) => ({
+        calendar_id: calendar.id,
+        day_of_week: Number(row.day_of_week),
+        is_open: Boolean(row.is_open),
+        start_time: row.is_open ? row.start_time : null,
+        end_time: row.is_open ? row.end_time : null,
+      }));
+
+      const { error: insertWeeklyError } = await supabase
+        .from("business_hours")
+        .insert(weeklyRows);
+
+      if (insertWeeklyError) {
+        return res.status(500).json({ error: insertWeeklyError.message });
+      }
+    }
+
+    // 5) guardar fechas especiales
+    if (Array.isArray(special_dates)) {
+      const { error: deleteSpecialError } = await supabase
+        .from("special_dates")
+        .delete()
+        .eq("calendar_id", calendar.id);
+
+      if (deleteSpecialError) {
+        return res.status(500).json({ error: deleteSpecialError.message });
+      }
+
+      if (special_dates.length > 0) {
+        const specialRows = special_dates.map((row) => ({
+          calendar_id: calendar.id,
+          date: row.date,
+          is_open: Boolean(row.is_open),
+          start_time: row.is_open ? row.start_time : null,
+          end_time: row.is_open ? row.end_time : null,
+        }));
+
+        const { error: insertSpecialError } = await supabase
+          .from("special_dates")
+          .insert(specialRows);
+
+        if (insertSpecialError) {
+          return res.status(500).json({ error: insertSpecialError.message });
+        }
+      }
+    }
+
+    return res.json({
+      ok: true,
+      tenant_id,
+      calendar_id: calendar.id,
+      slug: tenantUpdated.slug,
+      service: createdService,
+    });
+  } catch (err) {
+    console.error("Onboarding setup failed:", err);
+    return res.status(500).json({
+      error: "Onboarding setup failed",
+      detail: err.message,
+    });
+  }
+});
+
 /* ======================================================
    🚀 START
 ====================================================== */
