@@ -1258,7 +1258,7 @@ app.post("/onboarding/setup", async (req, res) => {
       }));
 
       const { error: insertWeeklyError } = await supabase
-        .from("business_hours")
+        .from("working_hours")
         .insert(weeklyRows);
 
       if (insertWeeklyError) {
