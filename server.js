@@ -1249,13 +1249,15 @@ app.post("/onboarding/setup", async (req, res) => {
 
     // 5) guardar horarios semanales
     if (Array.isArray(weekly_hours) && weekly_hours.length > 0) {
-      const weeklyRows = weekly_hours.map((row) => ({
-        calendar_id,
-        day_of_week: Number(row.day_of_week),
-        is_open: Boolean(row.is_open),
-        start_time: row.is_open ? row.start_time : null,
-        end_time: row.is_open ? row.end_time : null,
-      }));
+      const weeklyRows = weekly_hours
+  .filter((row) => row.is_open)
+  .map((row) => ({
+    tenant_id,
+    calendar_id,
+    weekday: Number(row.day_of_week),
+    start_time: row.start_time,
+    end_time: row.end_time,
+  }));
 
       const { error: insertWeeklyError } = await supabase
         .from("working_hours")
