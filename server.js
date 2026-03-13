@@ -1271,13 +1271,13 @@ app.post("/onboarding/setup", async (req, res) => {
     // 6) guardar fechas especiales
     if (Array.isArray(special_dates) && special_dates.length > 0) {
       const specialRows = special_dates.map((row) => ({
-        calendar_id,
-        date: row.date,
-        is_open: Boolean(row.is_open),
-        start_time: row.is_open ? row.start_time : null,
-        end_time: row.is_open ? row.end_time : null,
-      }));
-
+  tenant_id,
+  calendar_id,
+  type: row.is_open ? "open" : "block",
+  start_at: row.start_time ? `${row.date}T${row.start_time}:00` : `${row.date}T00:00:00`,
+  end_at: row.end_time ? `${row.date}T${row.end_time}:00` : `${row.date}T23:59:59`,
+  reason: "Configuración especial",
+}));
       const { error: insertSpecialError } = await supabase
   .from("availability_exceptions")
   .insert(specialRows);
