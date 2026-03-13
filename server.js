@@ -1155,16 +1155,11 @@ app.get("/jobs/send-reminders", async (req, res) => {
 app.post("/onboarding/setup", async (req, res) => {
   try {
     const {
-      tenant_id,
       business,
       service,
       weekly_hours = [],
       special_dates = [],
     } = req.body;
-
-    if (!tenant_id) {
-      return res.status(400).json({ error: "tenant_id es obligatorio" });
-    }
 
     if (!business?.name || !business?.slug) {
       return res.status(400).json({
@@ -1172,16 +1167,36 @@ app.post("/onboarding/setup", async (req, res) => {
       });
     }
 
-    // 1) actualizar negocio
-    const { data: tenantUpdated, error: tenantError } = await supabase
+    const normalizedSlug = String(business.slug).trim().toLowerCase();
+
+    // 1) validar slug único
+    const { data: existingTenantBySlug, error: slugCheckError } = await supabase
       .from("tenants")
-      .update({
+      .select("id, slug")
+      .eq("slug", normalizedSlug)
+      .maybeSingle();
+
+    if (slugCheckError) {
+      return res.status(500).json({ error: slugCheckError.message });
+    }
+
+    if (existingTenantBySlug) {
+      return res.status(400).json({
+        error: "Este slug ya está en uso. Prueba con otro nombre de negocio.",
+      });
+    }
+
+    // 2) crear tenant / negocio
+    const { data: createdTenant, error: tenantError } = await supabase
+      .from("tenants")
+      .insert({
         name: String(business.name).trim(),
-        slug: String(business.slug).trim().toLowerCase(),
-        phone: business.contact_phone ? String(business.contact_phone).trim() : null,
+        slug: normalizedSlug,
+        phone: business.contact_phone
+          ? String(business.contact_phone).trim()
+          : null,
         address: business.address ? String(business.address).trim() : null,
       })
-      .eq("id", tenant_id)
       .select()
       .single();
 
@@ -1189,20 +1204,25 @@ app.post("/onboarding/setup", async (req, res) => {
       return res.status(500).json({ error: tenantError.message });
     }
 
-    // 2) obtener calendario principal del tenant
-    const { data: calendar, error: calendarError } = await supabase
+    const tenant_id = createdTenant.id;
+
+    // 3) crear calendario principal
+    const { data: createdCalendar, error: calendarError } = await supabase
       .from("calendars")
-      .select("*")
-      .eq("tenant_id", tenant_id)
-      .order("created_at", { ascending: true })
-      .limit(1)
+      .insert({
+        tenant_id,
+        name: "Principal",
+      })
+      .select()
       .single();
 
-    if (calendarError || !calendar) {
-      return res.status(404).json({ error: "Calendario principal no encontrado" });
+    if (calendarError) {
+      return res.status(500).json({ error: calendarError.message });
     }
 
-    // 3) crear primer servicio
+    const calendar_id = createdCalendar.id;
+
+    // 4) crear primer servicio
     let createdService = null;
 
     if (service?.name) {
@@ -1227,20 +1247,10 @@ app.post("/onboarding/setup", async (req, res) => {
       createdService = serviceInserted;
     }
 
-    // 4) guardar horarios semanales
+    // 5) guardar horarios semanales
     if (Array.isArray(weekly_hours) && weekly_hours.length > 0) {
-      // borra horarios anteriores de ese calendario
-      const { error: deleteWeeklyError } = await supabase
-        .from("business_hours")
-        .delete()
-        .eq("calendar_id", calendar.id);
-
-      if (deleteWeeklyError) {
-        return res.status(500).json({ error: deleteWeeklyError.message });
-      }
-
       const weeklyRows = weekly_hours.map((row) => ({
-        calendar_id: calendar.id,
+        calendar_id,
         day_of_week: Number(row.day_of_week),
         is_open: Boolean(row.is_open),
         start_time: row.is_open ? row.start_time : null,
@@ -1256,41 +1266,30 @@ app.post("/onboarding/setup", async (req, res) => {
       }
     }
 
-    // 5) guardar fechas especiales
-    if (Array.isArray(special_dates)) {
-      const { error: deleteSpecialError } = await supabase
+    // 6) guardar fechas especiales
+    if (Array.isArray(special_dates) && special_dates.length > 0) {
+      const specialRows = special_dates.map((row) => ({
+        calendar_id,
+        date: row.date,
+        is_open: Boolean(row.is_open),
+        start_time: row.is_open ? row.start_time : null,
+        end_time: row.is_open ? row.end_time : null,
+      }));
+
+      const { error: insertSpecialError } = await supabase
         .from("special_dates")
-        .delete()
-        .eq("calendar_id", calendar.id);
+        .insert(specialRows);
 
-      if (deleteSpecialError) {
-        return res.status(500).json({ error: deleteSpecialError.message });
-      }
-
-      if (special_dates.length > 0) {
-        const specialRows = special_dates.map((row) => ({
-          calendar_id: calendar.id,
-          date: row.date,
-          is_open: Boolean(row.is_open),
-          start_time: row.is_open ? row.start_time : null,
-          end_time: row.is_open ? row.end_time : null,
-        }));
-
-        const { error: insertSpecialError } = await supabase
-          .from("special_dates")
-          .insert(specialRows);
-
-        if (insertSpecialError) {
-          return res.status(500).json({ error: insertSpecialError.message });
-        }
+      if (insertSpecialError) {
+        return res.status(500).json({ error: insertSpecialError.message });
       }
     }
 
     return res.json({
       ok: true,
       tenant_id,
-      calendar_id: calendar.id,
-      slug: tenantUpdated.slug,
+      calendar_id,
+      slug: createdTenant.slug,
       service: createdService,
     });
   } catch (err) {
@@ -1301,7 +1300,6 @@ app.post("/onboarding/setup", async (req, res) => {
     });
   }
 });
-
 /* ======================================================
    🚀 START
 ====================================================== */
