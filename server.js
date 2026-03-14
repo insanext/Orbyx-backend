@@ -1108,6 +1108,59 @@ app.post("/services", async (req, res) => {
   }
 });
 
+
+/* ======================================================
+   ✏️ PATCH /services/:id
+====================================================== */
+app.patch("/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const {
+      name,
+      duration_minutes,
+      price,
+      buffer_before_minutes = 0,
+      buffer_after_minutes = 0,
+      active,
+    } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: "id es obligatorio" });
+    }
+
+    const updateData = {};
+
+    if (name !== undefined) updateData.name = String(name).trim();
+    if (duration_minutes !== undefined)
+      updateData.duration_minutes = Number(duration_minutes);
+    if (price !== undefined) updateData.price = Number(price);
+    if (buffer_before_minutes !== undefined)
+      updateData.buffer_before_minutes = Number(buffer_before_minutes);
+    if (buffer_after_minutes !== undefined)
+      updateData.buffer_after_minutes = Number(buffer_after_minutes);
+    if (active !== undefined) updateData.active = Boolean(active);
+
+    const { data, error } = await supabase
+      .from("services")
+      .update(updateData)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({
+      ok: true,
+      service: data,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 /* ======================================================
    🌐 PUBLIC: servicios por slug
 ====================================================== */
