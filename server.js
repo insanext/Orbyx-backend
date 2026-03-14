@@ -133,22 +133,93 @@ app.get("/auth", async (req, res) => {
     });
 
     res.send(`
-      <h2>Autorizar Google Calendar</h2>
-      <p>
-        Modo: <b>${calendar_id ? "SaaS por calendar_id" : "Fijo (compatibilidad)"}</b><br/>
-        ${
-          calendar_id
-            ? `calendar_id: <b>${calendar_id}</b>`
-            : `Cliente: <b>${CLIENTE_FIJO}</b> | Calendario: <b>${CAL_FIJO}</b>`
-        }
-      </p>
-      <a href="${url}">Haz clic aquí para autorizar</a>
-    `);
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Conectar Google Calendar - Orbyx</title>
+
+<style>
+body{
+  margin:0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto;
+  background:#f1f5f9;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  height:100vh;
+}
+
+.card{
+  background:white;
+  padding:40px;
+  border-radius:16px;
+  box-shadow:0 10px 30px rgba(0,0,0,0.1);
+  width:420px;
+  text-align:center;
+}
+
+h1{
+  margin-bottom:10px;
+  font-size:22px;
+}
+
+p{
+  color:#64748b;
+  font-size:14px;
+  margin-bottom:25px;
+}
+
+.btn{
+  display:inline-block;
+  background:#111827;
+  color:white;
+  padding:12px 18px;
+  border-radius:10px;
+  text-decoration:none;
+  font-weight:500;
+}
+
+.btn:hover{
+  background:#374151;
+}
+
+.small{
+  margin-top:20px;
+  font-size:12px;
+  color:#94a3b8;
+}
+</style>
+</head>
+
+<body>
+
+<div class="card">
+
+<h1>Conectar Google Calendar</h1>
+
+<p>
+Orbyx necesita acceso a tu Google Calendar para crear automáticamente
+las reservas cuando un cliente agenda una cita.
+</p>
+
+<a class="btn" href="${url}">
+Autorizar con Google
+</a>
+
+<div class="small">
+Modo: ${calendar_id ? "SaaS" : "Compatibilidad"}
+</div>
+
+</div>
+
+</body>
+</html>
+`);
   } catch (e) {
     res.status(500).send("Error en /auth: " + e.message);
   }
 });
-
 /* ======================================================
    🔹 ENDPOINT: /oauth2callback
 ====================================================== */
