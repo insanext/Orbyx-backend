@@ -1112,6 +1112,12 @@ app.get("/public/business/:slug", async (req, res) => {
       return res.status(404).json({ error: "calendario no encontrado" });
     }
 
+    const { data: tokenRow } = await supabase
+      .from("calendar_tokens")
+      .select("id")
+      .eq("calendar_id", calendar.id)
+      .maybeSingle();
+
     return res.json({
       business: {
         id: tenant.id,
@@ -1119,6 +1125,7 @@ app.get("/public/business/:slug", async (req, res) => {
         slug: tenant.slug,
       },
       calendar_id: calendar.id,
+      google_connected: Boolean(tokenRow?.id),
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
