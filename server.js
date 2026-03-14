@@ -455,26 +455,52 @@ app.post("/appointments/slot", async (req, res) => {
 
     const start = new Date(slot_start);
 
-    const { data: existingAppointments, error: existingErr } = await supabase
+     const { data: apptRows, error: insErr } = await supabase
       .from("appointments")
-      .select("id, start_at, status")
-      .eq("tenant_id", cal.tenant_id)
-      .eq("customer_email", normalizedEmail)
-      .eq("status", "booked")
-      .gte("start_at", new Date().toISOString())
-      .order("start_at", { ascending: true })
-      .limit(1);
+      .insert({
+        tenant_id: cal.tenant_id,
+        calendar_id,
+        service_id,
+        service_name_snapshot: serviceName,
+        duration_minutes_snapshot: duration,
+        customer_name: String(customer_name).trim(),
+        customer_phone: normalizedPhone,
+        customer_email: normalizedEmail,
+        start_at: start.toISOString(),
+        end_at: end.toISOString(),
+        source,
+        status: "booked",
+        cancel_token: cancelToken,
+      })
+      .select("*");
 
-    if (existingErr) {
-      return res.status(500).json({ error: existingErr.message });
+    if (insErr) {
+      const constraint = insErr.constraint || "";
+      const msg = (insErr.message || "").toLowerCase();
+
+      if (
+        constraint === "no_overlapping_appointments" ||
+        constraint === "appointments_calendar_start_unique" ||
+        msg.includes("overlap") ||
+        msg.includes("conflict") ||
+        msg.includes("exclude") ||
+        msg.includes("duplicate key") ||
+        msg.includes("unique constraint") ||
+        msg.includes("appointments_calendar_start_unique")
+      ) {
+        return res.status(409).json({
+          error: "Ese horario ya fue reservado.",
+        });
+      }
+
+      return res.status(500).json({ error: insErr.message });
     }
 
-    const existingAppointment = existingAppointments?.[0] || null;
+    const appt = apptRows?.[0] || null;
 
-    if (existingAppointment) {
-      return res.status(409).json({
-        error:
-          "Este email ya tiene una reserva futura activa. Revisa tu correo o cancela la reserva actual antes de tomar otra.",
+    if (!appt) {
+      return res.status(500).json({
+        error: "No se pudo crear la reserva.",
       });
     }
 
