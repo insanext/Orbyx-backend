@@ -993,6 +993,55 @@ app.get("/public/services/:slug", async (req, res) => {
   }
 });
 
+
+/* ======================================================
+   🌐 PUBLIC: negocio por slug
+====================================================== */
+app.get("/public/business/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug requerido" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, name, slug")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "negocio no encontrado" });
+    }
+
+    const { data: calendar, error: calendarError } = await supabase
+      .from("calendars")
+      .select("id")
+      .eq("tenant_id", tenant.id)
+      .eq("is_active", true)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .single();
+
+    if (calendarError || !calendar) {
+      return res.status(404).json({ error: "calendario no encontrado" });
+    }
+
+    return res.json({
+      business: {
+        id: tenant.id,
+        name: tenant.name,
+        slug: tenant.slug,
+      },
+      calendar_id: calendar.id,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 /* ======================================================
    🌐 PUBLIC: slots por slug + service_id + date
 ====================================================== */
