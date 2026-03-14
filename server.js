@@ -979,6 +979,47 @@ app.post("/tenants/provision", async (req, res) => {
 });
 
 /* ======================================================
+   ✅ PATCH /tenants/:id
+====================================================== */
+app.patch("/tenants/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, phone, address } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: "id es obligatorio" });
+    }
+
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "name es obligatorio" });
+    }
+
+    const { data, error } = await supabase
+      .from("tenants")
+      .update({
+        name: String(name).trim(),
+        phone: phone ? String(phone).trim() : null,
+        address: address ? String(address).trim() : null,
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({
+      ok: true,
+      tenant: data,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+
+/* ======================================================
    ✅ GET /services
 ====================================================== */
 app.get("/services", async (req, res) => {
@@ -1139,7 +1180,7 @@ app.get("/public/business/:slug", async (req, res) => {
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, name, slug")
+      .select("id, name, slug, phone, address")
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -1172,6 +1213,8 @@ app.get("/public/business/:slug", async (req, res) => {
         id: tenant.id,
         name: tenant.name,
         slug: tenant.slug,
+        phone: tenant.phone,
+        address: tenant.address,
       },
       calendar_id: calendar.id,
       google_connected: Boolean(tokenRow?.id),
@@ -1180,6 +1223,7 @@ app.get("/public/business/:slug", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
 
 /* ======================================================
    🌐 PUBLIC: slots por slug + service_id + date
