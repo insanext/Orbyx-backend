@@ -1018,6 +1018,55 @@ app.get("/services", async (req, res) => {
   }
 });
 
+
+/* ======================================================
+   ✅ POST /services
+====================================================== */
+app.post("/services", async (req, res) => {
+  try {
+    const {
+      tenant_id,
+      name,
+      duration_minutes,
+      buffer_before_minutes = 0,
+      buffer_after_minutes = 0,
+      price = 0,
+      active = true,
+    } = req.body;
+
+    if (!tenant_id || !name || !duration_minutes) {
+      return res.status(400).json({
+        error: "Faltan campos obligatorios: tenant_id, name, duration_minutes",
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("services")
+      .insert({
+        tenant_id,
+        name: String(name).trim(),
+        duration_minutes: Number(duration_minutes),
+        buffer_before_minutes: Number(buffer_before_minutes || 0),
+        buffer_after_minutes: Number(buffer_after_minutes || 0),
+        price: Number(price || 0),
+        active: Boolean(active),
+      })
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.status(201).json({
+      ok: true,
+      service: data,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 /* ======================================================
    🌐 PUBLIC: servicios por slug
 ====================================================== */
