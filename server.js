@@ -282,9 +282,21 @@ app.get("/oauth2callback", async (req, res) => {
 
       if (error) throw error;
 
+           const { data: tenantData, error: tenantErr } = await supabase
+        .from("tenants")
+        .select("slug")
+        .eq("id", cal.tenant_id)
+        .single();
+
+      if (tenantErr || !tenantData?.slug) {
+        return res
+          .status(500)
+          .send("No se pudo obtener el slug del negocio después de conectar Google Calendar.");
+      }
+
       const frontendUrl = "https://www.orbyx.cl";
       return res.redirect(
-        `${frontendUrl}/onboarding?tenant_id=${cal.tenant_id}&calendar_id=${calendar_id}&google_connected=1`
+        `${frontendUrl}/dashboard/${tenantData.slug}?google_connected=1`
       );
     }
 
