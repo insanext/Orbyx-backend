@@ -393,8 +393,7 @@ app.post("/appointments/slot", async (req, res) => {
 
       const normalized = String(email).trim().toLowerCase();
 
-      const emailRegex =
-        /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
+      const emailRegex = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
 
       if (!emailRegex.test(normalized)) return false;
 
@@ -406,10 +405,7 @@ app.post("/appointments/slot", async (req, res) => {
       return true;
     }
 
-    const normalizedEmail = String(customer_email || "")
-      .trim()
-      .toLowerCase();
-
+    const normalizedEmail = String(customer_email || "").trim().toLowerCase();
     const normalizedPhone = normalizeChileanPhone(customer_phone);
 
     if (
@@ -455,52 +451,26 @@ app.post("/appointments/slot", async (req, res) => {
 
     const start = new Date(slot_start);
 
-     const { data: apptRows, error: insErr } = await supabase
+    const { data: existingAppointments, error: existingErr } = await supabase
       .from("appointments")
-      .insert({
-        tenant_id: cal.tenant_id,
-        calendar_id,
-        service_id,
-        service_name_snapshot: serviceName,
-        duration_minutes_snapshot: duration,
-        customer_name: String(customer_name).trim(),
-        customer_phone: normalizedPhone,
-        customer_email: normalizedEmail,
-        start_at: start.toISOString(),
-        end_at: end.toISOString(),
-        source,
-        status: "booked",
-        cancel_token: cancelToken,
-      })
-      .select("*");
+      .select("id, start_at, status")
+      .eq("tenant_id", cal.tenant_id)
+      .eq("customer_email", normalizedEmail)
+      .eq("status", "booked")
+      .gte("start_at", new Date().toISOString())
+      .order("start_at", { ascending: true })
+      .limit(1);
 
-    if (insErr) {
-      const constraint = insErr.constraint || "";
-      const msg = (insErr.message || "").toLowerCase();
-
-      if (
-        constraint === "no_overlapping_appointments" ||
-        constraint === "appointments_calendar_start_unique" ||
-        msg.includes("overlap") ||
-        msg.includes("conflict") ||
-        msg.includes("exclude") ||
-        msg.includes("duplicate key") ||
-        msg.includes("unique constraint") ||
-        msg.includes("appointments_calendar_start_unique")
-      ) {
-        return res.status(409).json({
-          error: "Ese horario ya fue reservado.",
-        });
-      }
-
-      return res.status(500).json({ error: insErr.message });
+    if (existingErr) {
+      return res.status(500).json({ error: existingErr.message });
     }
 
-    const appt = apptRows?.[0] || null;
+    const existingAppointment = existingAppointments?.[0] || null;
 
-    if (!appt) {
-      return res.status(500).json({
-        error: "No se pudo crear la reserva.",
+    if (existingAppointment) {
+      return res.status(409).json({
+        error:
+          "Este email ya tiene una reserva futura activa. Revisa tu correo o cancela la reserva actual antes de tomar otra.",
       });
     }
 
@@ -576,7 +546,7 @@ app.post("/appointments/slot", async (req, res) => {
     );
     const cancelToken = crypto.randomBytes(24).toString("hex");
 
-    const { data: appt, error: insErr } = await supabase
+    const { data: apptRows, error: insErr } = await supabase
       .from("appointments")
       .insert({
         tenant_id: cal.tenant_id,
@@ -593,8 +563,7 @@ app.post("/appointments/slot", async (req, res) => {
         status: "booked",
         cancel_token: cancelToken,
       })
-      .select("*")
-      .single();
+      .select("*");
 
     if (insErr) {
       const constraint = insErr.constraint || "";
@@ -605,7 +574,10 @@ app.post("/appointments/slot", async (req, res) => {
         constraint === "appointments_calendar_start_unique" ||
         msg.includes("overlap") ||
         msg.includes("conflict") ||
-        msg.includes("exclude")
+        msg.includes("exclude") ||
+        msg.includes("duplicate key") ||
+        msg.includes("unique constraint") ||
+        msg.includes("appointments_calendar_start_unique")
       ) {
         return res.status(409).json({
           error: "Ese horario ya fue reservado.",
@@ -613,6 +585,14 @@ app.post("/appointments/slot", async (req, res) => {
       }
 
       return res.status(500).json({ error: insErr.message });
+    }
+
+    const appt = apptRows?.[0] || null;
+
+    if (!appt) {
+      return res.status(500).json({
+        error: "No se pudo crear la reserva.",
+      });
     }
 
     apptCreated = appt;
@@ -659,18 +639,18 @@ app.post("/appointments/slot", async (req, res) => {
     }
 
     const { data: tenantData } = await supabase
-  .from("tenants")
-  .select("slug")
-  .eq("id", cal.tenant_id)
-  .single();
+      .from("tenants")
+      .select("slug")
+      .eq("id", cal.tenant_id)
+      .single();
 
-const bookingUrl = tenantData?.slug
-  ? `https://www.orbyx.cl/${tenantData.slug}`
-  : "https://www.orbyx.cl";
+    const bookingUrl = tenantData?.slug
+      ? `https://www.orbyx.cl/${tenantData.slug}`
+      : "https://www.orbyx.cl";
 
-const cancelUrl =
-  `https://www.orbyx.cl/cancel/${apptUpdated.id}?token=${cancelToken}` +
-  `&redirect=${encodeURIComponent(bookingUrl)}`;
+    const cancelUrl =
+      `https://www.orbyx.cl/cancel/${apptUpdated.id}?token=${cancelToken}` +
+      `&redirect=${encodeURIComponent(bookingUrl)}`;
 
     if (normalizedEmail) {
       await sendBookingEmail({
@@ -705,6 +685,7 @@ const cancelUrl =
     return res.status(500).json({ error: err.message });
   }
 });
+
 /* ======================================================
    ✅ GET /appointments
 ====================================================== */
@@ -809,7 +790,6 @@ app.delete("/appointments/:id", async (req, res) => {
 /* ======================================================
    🔎 GET /appointments/:id (info pública para cancelación)
 ====================================================== */
-
 app.get("/appointments/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -833,9 +813,8 @@ app.get("/appointments/:id", async (req, res) => {
       service: appt.service_name_snapshot,
       start_at: appt.start_at,
       location: appt.location_text || null,
-status: appt.status,
+      status: appt.status,
     });
-
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -995,20 +974,20 @@ app.get("/public/services/:slug", async (req, res) => {
       return res.status(500).json({ error: servicesError.message });
     }
 
-return res.json({
-  business: {
-    name: tenant.name,
-    slug: tenant.slug,
-    calendar_id: calendar?.id || null,
-    logo_url: tenant.logo_url,
-    brand_color: tenant.brand_color,
-    description: tenant.description,
-    phone: tenant.phone,
-    address: tenant.address,
-  },
-  total: services?.length || 0,
-  services: services || [],
-});
+    return res.json({
+      business: {
+        name: tenant.name,
+        slug: tenant.slug,
+        calendar_id: calendar?.id || null,
+        logo_url: tenant.logo_url,
+        brand_color: tenant.brand_color,
+        description: tenant.description,
+        phone: tenant.phone,
+        address: tenant.address,
+      },
+      total: services?.length || 0,
+      services: services || [],
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -1120,7 +1099,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 /* ======================================================
    🔔 RECORDATORIOS 24H
 ====================================================== */
-
 app.get("/jobs/send-reminders", async (req, res) => {
   try {
     const now = new Date();
@@ -1277,14 +1255,14 @@ app.post("/onboarding/setup", async (req, res) => {
     // 5) guardar horarios semanales
     if (Array.isArray(weekly_hours) && weekly_hours.length > 0) {
       const weeklyRows = weekly_hours
-  .filter((row) => row.is_open)
-  .map((row) => ({
-    tenant_id,
-    calendar_id,
-    weekday: Number(row.day_of_week),
-    start_time: row.start_time,
-    end_time: row.end_time,
-  }));
+        .filter((row) => row.is_open)
+        .map((row) => ({
+          tenant_id,
+          calendar_id,
+          weekday: Number(row.day_of_week),
+          start_time: row.start_time,
+          end_time: row.end_time,
+        }));
 
       const { error: insertWeeklyError } = await supabase
         .from("working_hours")
@@ -1298,16 +1276,17 @@ app.post("/onboarding/setup", async (req, res) => {
     // 6) guardar fechas especiales
     if (Array.isArray(special_dates) && special_dates.length > 0) {
       const specialRows = special_dates.map((row) => ({
-  tenant_id,
-  calendar_id,
-  type: row.is_open ? "open" : "block",
-  start_at: row.start_time ? `${row.date}T${row.start_time}:00` : `${row.date}T00:00:00`,
-  end_at: row.end_time ? `${row.date}T${row.end_time}:00` : `${row.date}T23:59:59`,
-  reason: "Configuración especial",
-}));
+        tenant_id,
+        calendar_id,
+        type: row.is_open ? "open" : "block",
+        start_at: row.start_time ? `${row.date}T${row.start_time}:00` : `${row.date}T00:00:00`,
+        end_at: row.end_time ? `${row.date}T${row.end_time}:00` : `${row.date}T23:59:59`,
+        reason: "Configuración especial",
+      }));
+
       const { error: insertSpecialError } = await supabase
-  .from("availability_exceptions")
-  .insert(specialRows);
+        .from("availability_exceptions")
+        .insert(specialRows);
 
       if (insertSpecialError) {
         return res.status(500).json({ error: insertSpecialError.message });
@@ -1329,6 +1308,7 @@ app.post("/onboarding/setup", async (req, res) => {
     });
   }
 });
+
 /* ======================================================
    🚀 START
 ====================================================== */
