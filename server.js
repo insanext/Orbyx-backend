@@ -456,31 +456,20 @@ app.post("/appointments/slot", async (req, res) => {
     const start = new Date(slot_start);
 
     const { data: existingAppointments, error: existingErr } = await supabase
-  .from("appointments")
-  .select("id, start_at, status")
-  .eq("tenant_id", cal.tenant_id)
-  .eq("customer_email", normalizedEmail)
-  .eq("status", "booked")
-  .gte("start_at", new Date().toISOString())
-  .order("start_at", { ascending: true })
-  .limit(1);
-
-if (existingErr) {
-  return res.status(500).json({ error: existingErr.message });
-}
-
-const existingAppointment = existingAppointments?.[0] || null;
-
-if (existingAppointment) {
-  return res.status(409).json({
-    error:
-      "Este email ya tiene una reserva futura activa. Revisa tu correo o cancela la reserva actual antes de tomar otra.",
-  });
-}
+      .from("appointments")
+      .select("id, start_at, status")
+      .eq("tenant_id", cal.tenant_id)
+      .eq("customer_email", normalizedEmail)
+      .eq("status", "booked")
+      .gte("start_at", new Date().toISOString())
+      .order("start_at", { ascending: true })
+      .limit(1);
 
     if (existingErr) {
       return res.status(500).json({ error: existingErr.message });
     }
+
+    const existingAppointment = existingAppointments?.[0] || null;
 
     if (existingAppointment) {
       return res.status(409).json({
