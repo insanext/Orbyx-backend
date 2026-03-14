@@ -1168,30 +1168,19 @@ app.get("/public/services/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
 
-    if (!slug) {
-      return res.status(400).json({ error: "slug requerido" });
-    }
-
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, name, slug, logo_url, brand_color, description, phone, address")
+      .select("*")
       .eq("slug", slug)
-      .eq("is_active", true)
       .single();
 
     if (tenantError || !tenant) {
-      return res.status(404).json({ error: "negocio no encontrado" });
+      return res.status(404).json({ error: "Negocio no encontrado" });
     }
-
-    const { data: calendar } = await supabase
-      .from("calendars")
-      .select("id")
-      .eq("tenant_id", tenant.id)
-      .single();
 
     const { data: services, error: servicesError } = await supabase
       .from("services")
-      .select("id, name, duration_minutes, buffer_before_minutes, buffer_after_minutes, price, location_type, location_text")
+      .select("*")
       .eq("tenant_id", tenant.id)
       .eq("active", true)
       .order("created_at", { ascending: true });
@@ -1201,21 +1190,12 @@ app.get("/public/services/:slug", async (req, res) => {
     }
 
     return res.json({
-      business: {
-        name: tenant.name,
-        slug: tenant.slug,
-        calendar_id: calendar?.id || null,
-        logo_url: tenant.logo_url,
-        brand_color: tenant.brand_color,
-        description: tenant.description,
-        phone: tenant.phone,
-        address: tenant.address,
-      },
-      total: services?.length || 0,
+      business: tenant,
       services: services || [],
     });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
+  } catch (error) {
+    console.error("Error en /public/services/:slug", error);
+    return res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
