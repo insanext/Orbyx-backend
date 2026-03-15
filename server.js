@@ -1260,6 +1260,19 @@ app.get("/public/services/:slug", async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
+    const { data: calendar, error: calendarError } = await supabase
+      .from("calendars")
+      .select("id")
+      .eq("tenant_id", tenant.id)
+      .eq("is_active", true)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .single();
+
+    if (calendarError || !calendar) {
+      return res.status(404).json({ error: "Calendario no encontrado" });
+    }
+
     const { data: services, error: servicesError } = await supabase
       .from("services")
       .select("*")
@@ -1274,16 +1287,14 @@ app.get("/public/services/:slug", async (req, res) => {
 
     return res.json({
       business: tenant,
+      calendar_id: calendar.id,
       services: services || [],
     });
   } catch (error) {
     console.error("Error en /public/services/:slug", error);
     return res.status(500).json({ error: "Error interno del servidor" });
   }
-});
-
-
-/* ======================================================
+});/* ======================================================
    🌐 PUBLIC: negocio por slug
 ====================================================== */
 app.get("/public/business/:slug", async (req, res) => {
