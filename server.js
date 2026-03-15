@@ -113,6 +113,175 @@ function subtractRange(windows, blockStart, blockEnd) {
   return result.filter((w) => w.end > w.start);
 }
 
+function intersectWindows(a, b) {
+  const result = [];
+
+  for (const wa of a || []) {
+    for (const wb of b || []) {
+      const start = Math.max(wa.start, wb.start);
+      const end = Math.min(wa.end, wb.end);
+
+      if (end > start) {
+        result.push({ start, end });
+      }
+    }
+  }
+
+  return result.sort((x, y) => x.start - y.start);
+}
+
+function buildSlotsFromWindows(windows, date, slotMinutes) {
+  const slots = [];
+
+  for (const window of windows || []) {
+    let cursor = window.start;
+
+    while (cursor + slotMinutes <= window.end) {
+      const startDate = new Date(`${date}T00:00:00`);
+      startDate.setHours(Math.floor(cursor / 60), cursor % 60, 0, 0);
+
+      const endDate = new Date(startDate.getTime() + slotMinutes * 60 * 1000);
+
+      slots.push({
+        slot_start: startDate.toISOString(),
+        slot_end: endDate.toISOString(),
+      });
+
+      cursor += slotMinutes;
+    }
+  }
+
+  return slots;
+}
+
+async function getStaffAvailabilityWindows({ tenant_id, staff_id, date }) {
+  const weekday = parseDateToWeekday(date);
+
+  const { data: weeklyRows, error: weeklyError } = await supabase
+    .from("staff_hours")
+    .select("*")
+    .eq("tenant_id", tenant_id)
+    .eq("staff_id", staff_id)
+    .eq("day_of_week", weekday);
+
+  if (weeklyError) throw weeklyError;
+
+  const weekly = weeklyRows?.[0] || null;
+
+  let windows = [];
+
+  if (weekly?.enabled && weekly.start_time && weekly.end_time) {
+    const weeklyStart = timeToMinutes(weekly.start_time);
+    const weeklyEnd = timeToMinutes(weekly.end_time);
+
+    if (
+      weeklyStart !== null &&
+      weeklyEnd !== null &&
+      weeklyEnd > weeklyStart
+    ) {
+      windows = [{ start: weeklyStart, end: weeklyEnd }];
+    }
+  }
+
+  const { data: specialRows, error: specialError } = await supabase
+    .from("staff_special_dates")
+    .select("*")
+    .eq("tenant_id", tenant_id)
+    .eq("staff_id", staff_id)
+    .eq("date", date)
+    .order("created_at", { ascending: true });
+
+  if (specialError) throw specialError;
+
+  const specialDates = specialRows || [];
+
+  const fullDayClosed = specialDates.some(
+    (row) => row.is_closed && !row.start_time && !row.end_time
+  );
+
+  if (fullDayClosed) {
+    return [];
+  }
+
+  const openWindows = specialDates
+    .filter((row) => !row.is_closed && row.start_time && row.end_time)
+    .map((row) => ({
+      start: timeToMinutes(row.start_time),
+      end: timeToMinutes(row.end_time),
+    }))
+    .filter((row) => row.start !== null && row.end !== null && row.end > row.start);
+
+  if (openWindows.length > 0) {
+    windows = openWindows;
+  }
+
+  const partialClosedWindows = specialDates
+    .filter((row) => row.is_closed && row.start_time && row.end_time)
+    .map((row) => ({
+      start: timeToMinutes(row.start_time),
+      end: timeToMinutes(row.end_time),
+    }))
+    .filter((row) => row.start !== null && row.end !== null && row.end > row.start);
+
+  for (const blocked of partialClosedWindows) {
+    windows = subtractRange(windows, blocked.start, blocked.end);
+  }
+
+  return windows.sort((a, b) => a.start - b.start);
+}
+
+async function subtractAppointmentsFromWindows({
+  tenant_id,
+  staff_id,
+  date,
+  windows,
+}) {
+  const start = `${date}T00:00:00`;
+  const end = `${date}T23:59:59`;
+
+  let query = supabase
+    .from("appointments")
+    .select("id, start_at, end_at, staff_id, status")
+    .eq("tenant_id", tenant_id)
+    .eq("status", "booked")
+    .gte("start_at", start)
+    .lte("start_at", end)
+    .order("start_at", { ascending: true });
+
+  if (staff_id) {
+    query = query.eq("staff_id", staff_id);
+  }
+
+  const { data: appointments, error } = await query;
+
+  if (error) throw error;
+
+  let result = [...(windows || [])];
+
+  for (const appt of appointments || []) {
+    const apptStart = isoToMinutesInDate(appt.start_at, date);
+    const apptEnd = isoToMinutesInDate(appt.end_at, date);
+
+    if (apptStart === null || apptEnd === null) continue;
+
+    result = subtractRange(result, apptStart, apptEnd);
+  }
+
+  return result;
+}
+
+async function getServiceStaffIds({ tenant_id, service_id }) {
+  const { data, error } = await supabase
+    .from("staff_services")
+    .select("staff_id")
+    .eq("tenant_id", tenant_id)
+    .eq("service_id", service_id);
+
+  if (error) throw error;
+
+  return [...new Set((data || []).map((row) => row.staff_id).filter(Boolean))];
+}
+
 async function getBusinessAvailabilityWindows({ tenant_id, date }) {
   const weekday = parseDateToWeekday(date);
 
@@ -1395,6 +1564,7 @@ app.post("/appointments/slot", async (req, res) => {
     const {
       calendar_id,
       service_id,
+      staff_id,
       date,
       slot_start,
       customer_name,
@@ -1506,22 +1676,6 @@ app.post("/appointments/slot", async (req, res) => {
     const slotMinutes = cal.slot_minutes ?? 30;
     const timeZone = cal.timezone || "America/Santiago";
 
-    const { data: rawSlots, error: slotsErr } = await supabase.rpc("get_available_slots", {
-      _calendar_id: calendar_id,
-      _day: date,
-    });
-
-    if (slotsErr) {
-      return res.status(500).json({ error: slotsErr.message });
-    }
-
-    const windows = await getBusinessAvailabilityWindows({
-      tenant_id: cal.tenant_id,
-      date,
-    });
-
-    let validSlots = filterSlotsByWindows(rawSlots || [], windows, date);
-
     let duration = slotMinutes;
     let bufferBefore = 0;
     let bufferAfter = 0;
@@ -1543,8 +1697,62 @@ app.post("/appointments/slot", async (req, res) => {
       bufferBefore = service.buffer_before_minutes || 0;
       bufferAfter = service.buffer_after_minutes || 0;
       serviceName = service.name;
+    }
 
-      const totalMinutes = duration + bufferBefore + bufferAfter;
+    const totalMinutes = duration + bufferBefore + bufferAfter;
+
+    const slotDateObj = new Date(slot_start);
+    const slotDateStr = formatDateForServer(slotDateObj);
+
+    let validSlots = [];
+
+    if (staff_id) {
+      const businessWindows = await getBusinessAvailabilityWindows({
+        tenant_id: cal.tenant_id,
+        date: slotDateStr,
+      });
+
+      const staffWindows = await getStaffAvailabilityWindows({
+        tenant_id: cal.tenant_id,
+        staff_id,
+        date: slotDateStr,
+      });
+
+      let finalWindows = intersectWindows(businessWindows, staffWindows);
+
+      finalWindows = await subtractAppointmentsFromWindows({
+        tenant_id: cal.tenant_id,
+        staff_id,
+        date: slotDateStr,
+        windows: finalWindows,
+      });
+
+      validSlots = buildSlotsFromWindows(finalWindows, slotDateStr, slotMinutes);
+
+      validSlots = filterSlotsForServiceDuration(
+        validSlots,
+        totalMinutes,
+        slotMinutes
+      ).map((slot) => ({
+        ...slot,
+        staff_id,
+      }));
+    } else {
+      const { data: rawSlots, error: slotsErr } = await supabase.rpc("get_available_slots", {
+        _calendar_id: calendar_id,
+        _day: date,
+      });
+
+      if (slotsErr) {
+        return res.status(500).json({ error: slotsErr.message });
+      }
+
+      const windows = await getBusinessAvailabilityWindows({
+        tenant_id: cal.tenant_id,
+        date,
+      });
+
+      validSlots = filterSlotsByWindows(rawSlots || [], windows, date);
 
       validSlots = filterSlotsForServiceDuration(
         validSlots,
@@ -1574,6 +1782,7 @@ app.post("/appointments/slot", async (req, res) => {
         tenant_id: cal.tenant_id,
         calendar_id,
         service_id,
+        staff_id: staff_id || null,
         service_name_snapshot: serviceName,
         duration_minutes_snapshot: duration,
         customer_name: String(customer_name).trim(),
@@ -1588,24 +1797,6 @@ app.post("/appointments/slot", async (req, res) => {
       .select("*");
 
     if (insErr) {
-      const constraint = insErr.constraint || "";
-      const msg = (insErr.message || "").toLowerCase();
-
-      if (
-        constraint === "no_overlapping_appointments" ||
-        constraint === "appointments_calendar_start_unique" ||
-        msg.includes("overlap") ||
-        msg.includes("conflict") ||
-        msg.includes("exclude") ||
-        msg.includes("duplicate key") ||
-        msg.includes("unique constraint") ||
-        msg.includes("appointments_calendar_start_unique")
-      ) {
-        return res.status(409).json({
-          error: "Ese horario ya fue reservado.",
-        });
-      }
-
       return res.status(500).json({ error: insErr.message });
     }
 
@@ -1624,7 +1815,7 @@ app.post("/appointments/slot", async (req, res) => {
 
     const event = {
       summary: `Cita - ${String(customer_name).trim()}`,
-      description: `Cliente: ${String(customer_name).trim()}\nTeléfono: ${normalizedPhone}\nEmail: ${normalizedEmail}\ncalendar_id: ${calendar_id}\nappointment_id: ${appt.id}`,
+      description: `Cliente: ${String(customer_name).trim()}\nTeléfono: ${normalizedPhone}\nEmail: ${normalizedEmail}\ncalendar_id: ${calendar_id}\nappointment_id: ${appt.id}\nstaff_id: ${staff_id || "no_asignado"}`,
       start: { dateTime: start.toISOString(), timeZone },
       end: { dateTime: end.toISOString(), timeZone },
     };
@@ -1707,6 +1898,13 @@ app.post("/appointments/slot", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+function formatDateForServer(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
 
 /* ======================================================
    ✅ GET /appointments/by-day/:slug/:date
@@ -2472,7 +2670,7 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
 app.get("/public/slots/:slug/:service_id", async (req, res) => {
   try {
     const { slug, service_id } = req.params;
-    const { date } = req.query;
+    const { date, staff_id } = req.query;
 
     if (!slug || !service_id || !date) {
       return res.status(400).json({
@@ -2517,36 +2715,112 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       return res.status(404).json({ error: "calendario no encontrado" });
     }
 
-    const { data, error } = await supabase.rpc("get_available_slots", {
-      _calendar_id: calendar.id,
-      _day: date,
+    const serviceStaffIds = await getServiceStaffIds({
+      tenant_id: tenant.id,
+      service_id,
     });
 
-    if (error) {
-      return res.status(500).json({ error: error.message });
+    const requestedStaffId = staff_id ? String(staff_id) : null;
+
+    let candidateStaffIds = requestedStaffId
+      ? serviceStaffIds.filter((id) => id === requestedStaffId)
+      : serviceStaffIds;
+
+    if (requestedStaffId && candidateStaffIds.length === 0) {
+      return res.status(400).json({
+        error: "El staff seleccionado no realiza este servicio",
+      });
     }
 
-    const windows = await getBusinessAvailabilityWindows({
+    const businessWindows = await getBusinessAvailabilityWindows({
       tenant_id: tenant.id,
       date,
     });
 
-    let slots = filterSlotsByWindows(data || [], windows, date);
+    if (!candidateStaffIds.length) {
+      let slots = buildSlotsFromWindows(
+        businessWindows,
+        date,
+        calendar.slot_minutes || 30
+      );
 
-    if (slots.length > 0) {
       const totalMinutes =
         (service.duration_minutes || 0) +
         (service.buffer_before_minutes || 0) +
         (service.buffer_after_minutes || 0);
 
-      const baseSlotMinutes = calendar.slot_minutes || 30;
-
       slots = filterSlotsForServiceDuration(
         slots,
         totalMinutes,
-        baseSlotMinutes
+        calendar.slot_minutes || 30
       );
+
+      return res.json({
+        business: {
+          name: tenant.name,
+          slug: tenant.slug,
+        },
+        calendar_id: calendar.id,
+        service,
+        date,
+        total: slots.length,
+        slots,
+      });
     }
+
+    let mergedSlots = [];
+
+    for (const currentStaffId of candidateStaffIds) {
+      const staffWindows = await getStaffAvailabilityWindows({
+        tenant_id: tenant.id,
+        staff_id: currentStaffId,
+        date,
+      });
+
+      let finalWindows = intersectWindows(businessWindows, staffWindows);
+
+      finalWindows = await subtractAppointmentsFromWindows({
+        tenant_id: tenant.id,
+        staff_id: currentStaffId,
+        date,
+        windows: finalWindows,
+      });
+
+      let staffSlots = buildSlotsFromWindows(
+        finalWindows,
+        date,
+        calendar.slot_minutes || 30
+      );
+
+      const totalMinutes =
+        (service.duration_minutes || 0) +
+        (service.buffer_before_minutes || 0) +
+        (service.buffer_after_minutes || 0);
+
+      staffSlots = filterSlotsForServiceDuration(
+        staffSlots,
+        totalMinutes,
+        calendar.slot_minutes || 30
+      ).map((slot) => ({
+        ...slot,
+        staff_id: currentStaffId,
+      }));
+
+      mergedSlots.push(...staffSlots);
+    }
+
+    const uniqueMap = new Map();
+
+    for (const slot of mergedSlots) {
+      const key = `${slot.slot_start}_${slot.staff_id || ""}`;
+      if (!uniqueMap.has(key)) {
+        uniqueMap.set(key, slot);
+      }
+    }
+
+    const slots = Array.from(uniqueMap.values()).sort(
+      (a, b) => new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
+    );
 
     return res.json({
       business: {
