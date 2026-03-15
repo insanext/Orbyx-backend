@@ -2377,6 +2377,96 @@ app.get("/public/business/:slug", async (req, res) => {
 });
 
 /* ======================================================
+   🌐 PUBLIC: staff por slug + service_id
+====================================================== */
+app.get("/public/staff/:slug/:service_id", async (req, res) => {
+  try {
+    const { slug, service_id } = req.params;
+
+    if (!slug || !service_id) {
+      return res.status(400).json({
+        error: "Se requiere slug y service_id",
+      });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, slug, name")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "negocio no encontrado" });
+    }
+
+    const { data: service, error: serviceError } = await supabase
+      .from("services")
+      .select("id, tenant_id, active, deleted_at")
+      .eq("id", service_id)
+      .eq("tenant_id", tenant.id)
+      .eq("active", true)
+      .is("deleted_at", null)
+      .single();
+
+    if (serviceError || !service) {
+      return res.status(404).json({ error: "servicio no encontrado" });
+    }
+
+    const { data: relations, error: relationsError } = await supabase
+      .from("staff_services")
+      .select("staff_id")
+      .eq("tenant_id", tenant.id)
+      .eq("service_id", service_id);
+
+    if (relationsError) {
+      return res.status(500).json({ error: relationsError.message });
+    }
+
+    const staffIds = [...new Set((relations || []).map((row) => row.staff_id).filter(Boolean))];
+
+    if (staffIds.length === 0) {
+      return res.json({
+        business: {
+          id: tenant.id,
+          name: tenant.name,
+          slug: tenant.slug,
+        },
+        service_id,
+        total: 0,
+        staff: [],
+      });
+    }
+
+    const { data: staffRows, error: staffError } = await supabase
+      .from("staff")
+      .select("id, name, role, color, is_active, sort_order")
+      .eq("tenant_id", tenant.id)
+      .eq("is_active", true)
+      .in("id", staffIds)
+      .order("sort_order", { ascending: true })
+      .order("created_at", { ascending: true });
+
+    if (staffError) {
+      return res.status(500).json({ error: staffError.message });
+    }
+
+    return res.json({
+      business: {
+        id: tenant.id,
+        name: tenant.name,
+        slug: tenant.slug,
+      },
+      service_id,
+      total: staffRows?.length || 0,
+      staff: staffRows || [],
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    🌐 PUBLIC: slots por slug + service_id + date
 ====================================================== */
 app.get("/public/slots/:slug/:service_id", async (req, res) => {
