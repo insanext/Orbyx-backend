@@ -62,6 +62,173 @@ console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
 console.log("🔥 VERSION: SAAS_TOKEN_BY_CALENDAR_ID + OAUTH REDIRECT TO FRONTEND");
 
 /* ======================================================
+   ✅ HELPERS GENERALES
+====================================================== */
+function parseDateToWeekday(dateStr) {
+  const [year, month, day] = String(dateStr).split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day, 12, 0, 0)).getUTCDay();
+}
+
+function timeToMinutes(value) {
+  if (!value) return null;
+  const [h, m] = String(value).slice(0, 5).split(":").map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+  return h * 60 + m;
+}
+
+function isoToMinutesInDate(iso, dateStr) {
+  const d = new Date(iso);
+
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const localDate = `${yyyy}-${mm}-${dd}`;
+
+  if (localDate !== dateStr) return null;
+
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+function subtractRange(windows, blockStart, blockEnd) {
+  const result = [];
+
+  for (const window of windows) {
+    const start = window.start;
+    const end = window.end;
+
+    if (blockEnd <= start || blockStart >= end) {
+      result.push(window);
+      continue;
+    }
+
+    if (blockStart > start) {
+      result.push({ start, end: blockStart });
+    }
+
+    if (blockEnd < end) {
+      result.push({ start: blockEnd, end });
+    }
+  }
+
+  return result.filter((w) => w.end > w.start);
+}
+
+async function getBusinessAvailabilityWindows({ tenant_id, date }) {
+  const weekday = parseDateToWeekday(date);
+
+  const { data: weeklyRows, error: weeklyError } = await supabase
+    .from("business_hours")
+    .select("*")
+    .eq("tenant_id", tenant_id)
+    .eq("day_of_week", weekday);
+
+  if (weeklyError) throw weeklyError;
+
+  const weekly = weeklyRows?.[0] || null;
+
+  let windows = [];
+
+  if (weekly?.enabled && weekly.start_time && weekly.end_time) {
+    const weeklyStart = timeToMinutes(weekly.start_time);
+    const weeklyEnd = timeToMinutes(weekly.end_time);
+
+    if (
+      weeklyStart !== null &&
+      weeklyEnd !== null &&
+      weeklyEnd > weeklyStart
+    ) {
+      windows = [{ start: weeklyStart, end: weeklyEnd }];
+    }
+  }
+
+  const { data: specialRows, error: specialError } = await supabase
+    .from("business_special_dates")
+    .select("*")
+    .eq("tenant_id", tenant_id)
+    .eq("date", date)
+    .order("created_at", { ascending: true });
+
+  if (specialError) throw specialError;
+
+  const specialDates = specialRows || [];
+
+  const fullDayClosed = specialDates.some(
+    (row) => row.is_closed && !row.start_time && !row.end_time
+  );
+
+  if (fullDayClosed) {
+    return [];
+  }
+
+  const openWindows = specialDates
+    .filter((row) => !row.is_closed && row.start_time && row.end_time)
+    .map((row) => ({
+      start: timeToMinutes(row.start_time),
+      end: timeToMinutes(row.end_time),
+    }))
+    .filter((row) => row.start !== null && row.end !== null && row.end > row.start);
+
+  if (openWindows.length > 0) {
+    windows = openWindows;
+  }
+
+  const partialClosedWindows = specialDates
+    .filter((row) => row.is_closed && row.start_time && row.end_time)
+    .map((row) => ({
+      start: timeToMinutes(row.start_time),
+      end: timeToMinutes(row.end_time),
+    }))
+    .filter((row) => row.start !== null && row.end !== null && row.end > row.start);
+
+  for (const blocked of partialClosedWindows) {
+    windows = subtractRange(windows, blocked.start, blocked.end);
+  }
+
+  return windows.sort((a, b) => a.start - b.start);
+}
+
+function filterSlotsByWindows(slots, windows, date) {
+  if (!Array.isArray(slots) || slots.length === 0) return [];
+  if (!Array.isArray(windows) || windows.length === 0) return [];
+
+  return slots.filter((slot) => {
+    const startMinutes = isoToMinutesInDate(slot.slot_start, date);
+    const endMinutes = isoToMinutesInDate(slot.slot_end, date);
+
+    if (startMinutes === null || endMinutes === null) return false;
+
+    return windows.some(
+      (window) => startMinutes >= window.start && endMinutes <= window.end
+    );
+  });
+}
+
+function filterSlotsForServiceDuration(slots, totalMinutes, baseSlotMinutes) {
+  if (!Array.isArray(slots) || slots.length === 0) return [];
+  if (!totalMinutes || totalMinutes <= 0) return slots;
+
+  const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
+
+  if (neededBlocks <= 1) return slots;
+
+  return slots.filter((slot, index) => {
+    for (let i = 1; i < neededBlocks; i++) {
+      const current = slots[index + i - 1];
+      const next = slots[index + i];
+
+      if (!current || !next) return false;
+
+      const currentEnd = new Date(current.slot_end).toISOString();
+      const nextStart = new Date(next.slot_start).toISOString();
+
+      if (currentEnd !== nextStart) return false;
+    }
+
+    return true;
+  });
+}
+
+/* ======================================================
    ✅ Helper: obtener Google Calendar desde calendar_tokens usando calendar_id
 ====================================================== */
 async function getGoogleCalendarClientByCalendarId(calendar_id) {
@@ -220,6 +387,7 @@ Modo: ${calendar_id ? "SaaS" : "Compatibilidad"}
     res.status(500).send("Error en /auth: " + e.message);
   }
 });
+
 /* ======================================================
    🔹 ENDPOINT: /oauth2callback
 ====================================================== */
@@ -282,7 +450,7 @@ app.get("/oauth2callback", async (req, res) => {
 
       if (error) throw error;
 
-           const { data: tenantData, error: tenantErr } = await supabase
+      const { data: tenantData, error: tenantErr } = await supabase
         .from("tenants")
         .select("slug")
         .eq("id", cal.tenant_id)
@@ -360,6 +528,219 @@ app.get("/test-event", async (req, res) => {
 });
 
 /* ======================================================
+   ✅ GET /business-hours
+====================================================== */
+app.get("/business-hours", async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    const { data, error } = await supabase
+      .from("business_hours")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("day_of_week", { ascending: true });
+
+    if (error) throw error;
+
+    return res.json({ hours: data || [] });
+  } catch (err) {
+    console.error("GET /business-hours error:", err.message);
+    return res.status(500).json({ error: "Error obteniendo horarios" });
+  }
+});
+
+/* ======================================================
+   ✅ PUT /business-hours
+====================================================== */
+app.put("/business-hours", async (req, res) => {
+  try {
+    const { tenant_id, hours } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!Array.isArray(hours)) {
+      return res.status(400).json({ error: "hours debe ser un arreglo" });
+    }
+
+    const payload = hours.map((item) => ({
+      tenant_id,
+      day_of_week: Number(item.day_of_week),
+      enabled: !!item.enabled,
+      start_time: item.enabled ? item.start_time || null : null,
+      end_time: item.enabled ? item.end_time || null : null,
+      updated_at: new Date().toISOString(),
+    }));
+
+    const { data, error } = await supabase
+      .from("business_hours")
+      .upsert(payload, { onConflict: "tenant_id,day_of_week" })
+      .select("*");
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      message: "Horarios guardados correctamente",
+      hours: data || [],
+    });
+  } catch (err) {
+    console.error("PUT /business-hours error:", err.message);
+    return res.status(500).json({ error: "Error guardando horarios" });
+  }
+});
+
+/* ======================================================
+   ✅ GET /business-special-dates
+====================================================== */
+app.get("/business-special-dates", async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    const { data, error } = await supabase
+      .from("business_special_dates")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("date", { ascending: true })
+      .order("created_at", { ascending: true });
+
+    if (error) throw error;
+
+    return res.json({ special_dates: data || [] });
+  } catch (err) {
+    console.error("GET /business-special-dates error:", err.message);
+    return res.status(500).json({ error: "Error obteniendo fechas especiales" });
+  }
+});
+
+/* ======================================================
+   ✅ POST /business-special-dates
+====================================================== */
+app.post("/business-special-dates", async (req, res) => {
+  try {
+    const {
+      tenant_id,
+      date,
+      label,
+      is_closed,
+      start_time,
+      end_time,
+    } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!date) {
+      return res.status(400).json({ error: "date es obligatorio" });
+    }
+
+    const payload = {
+      tenant_id,
+      date,
+      label: label || null,
+      is_closed: !!is_closed,
+      start_time: is_closed ? (start_time || null) : (start_time || null),
+      end_time: is_closed ? (end_time || null) : (end_time || null),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from("business_special_dates")
+      .insert(payload)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      message: "Fecha especial creada correctamente",
+      item: data,
+    });
+  } catch (err) {
+    console.error("POST /business-special-dates error:", err.message);
+    return res.status(500).json({ error: "Error creando fecha especial" });
+  }
+});
+
+/* ======================================================
+   ✅ PUT /business-special-dates/:id
+====================================================== */
+app.put("/business-special-dates/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      label,
+      date,
+      is_closed,
+      start_time,
+      end_time,
+    } = req.body;
+
+    const payload = {
+      label: label || null,
+      date,
+      is_closed: !!is_closed,
+      start_time: start_time || null,
+      end_time: end_time || null,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from("business_special_dates")
+      .update(payload)
+      .eq("id", id)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      message: "Fecha especial actualizada correctamente",
+      item: data,
+    });
+  } catch (err) {
+    console.error("PUT /business-special-dates/:id error:", err.message);
+    return res.status(500).json({ error: "Error actualizando fecha especial" });
+  }
+});
+
+/* ======================================================
+   ✅ DELETE /business-special-dates/:id
+====================================================== */
+app.delete("/business-special-dates/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from("business_special_dates")
+      .delete()
+      .eq("id", id);
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      message: "Fecha especial eliminada correctamente",
+    });
+  } catch (err) {
+    console.error("DELETE /business-special-dates/:id error:", err.message);
+    return res.status(500).json({ error: "Error eliminando fecha especial" });
+  }
+});
+
+/* ======================================================
    🔹 ENDPOINT: /slots
 ====================================================== */
 app.get("/slots", async (req, res) => {
@@ -379,6 +760,7 @@ app.get("/slots", async (req, res) => {
         .from("services")
         .select("*")
         .eq("id", service_id)
+        .is("deleted_at", null)
         .single();
 
       if (serviceError || !serviceData) {
@@ -386,6 +768,20 @@ app.get("/slots", async (req, res) => {
       }
 
       service = serviceData;
+    }
+
+    const { data: cal, error: calErr } = await supabase
+      .from("calendars")
+      .select("id, tenant_id, slot_minutes, is_active")
+      .eq("id", calendar_id)
+      .single();
+
+    if (calErr || !cal) {
+      return res.status(404).json({ error: "Calendario no encontrado" });
+    }
+
+    if (!cal.is_active) {
+      return res.status(400).json({ error: "Calendario inactivo" });
     }
 
     const { data, error } = await supabase.rpc("get_available_slots", {
@@ -397,7 +793,12 @@ app.get("/slots", async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
-    let slots = data || [];
+    const windows = await getBusinessAvailabilityWindows({
+      tenant_id: cal.tenant_id,
+      date,
+    });
+
+    let slots = filterSlotsByWindows(data || [], windows, date);
 
     if (service && slots.length > 0) {
       const totalMinutes =
@@ -405,24 +806,13 @@ app.get("/slots", async (req, res) => {
         (service.buffer_before_minutes || 0) +
         (service.buffer_after_minutes || 0);
 
-      const baseSlotMinutes = 30;
-      const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
+      const baseSlotMinutes = cal.slot_minutes || 30;
 
-      slots = slots.filter((slot, index) => {
-        for (let i = 1; i < neededBlocks; i++) {
-          const current = slots[index + i - 1];
-          const next = slots[index + i];
-
-          if (!current || !next) return false;
-
-          const currentEnd = new Date(current.slot_end).toISOString();
-          const nextStart = new Date(next.slot_start).toISOString();
-
-          if (currentEnd !== nextStart) return false;
-        }
-
-        return true;
-      });
+      slots = filterSlotsForServiceDuration(
+        slots,
+        totalMinutes,
+        baseSlotMinutes
+      );
     }
 
     return res.json({
@@ -475,7 +865,6 @@ app.post("/appointments/slot", async (req, res) => {
       if (!email) return false;
 
       const normalized = String(email).trim().toLowerCase();
-
       const emailRegex = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
 
       if (!emailRegex.test(normalized)) return false;
@@ -560,7 +949,7 @@ app.post("/appointments/slot", async (req, res) => {
     const slotMinutes = cal.slot_minutes ?? 30;
     const timeZone = cal.timezone || "America/Santiago";
 
-    const { data: slots, error: slotsErr } = await supabase.rpc("get_available_slots", {
+    const { data: rawSlots, error: slotsErr } = await supabase.rpc("get_available_slots", {
       _calendar_id: calendar_id,
       _day: date,
     });
@@ -568,6 +957,13 @@ app.post("/appointments/slot", async (req, res) => {
     if (slotsErr) {
       return res.status(500).json({ error: slotsErr.message });
     }
+
+    const windows = await getBusinessAvailabilityWindows({
+      tenant_id: cal.tenant_id,
+      date,
+    });
+
+    let validSlots = filterSlotsByWindows(rawSlots || [], windows, date);
 
     let duration = slotMinutes;
     let bufferBefore = 0;
@@ -579,6 +975,7 @@ app.post("/appointments/slot", async (req, res) => {
         .from("services")
         .select("*")
         .eq("id", service_id)
+        .is("deleted_at", null)
         .single();
 
       if (serviceErr || !service) {
@@ -589,32 +986,17 @@ app.post("/appointments/slot", async (req, res) => {
       bufferBefore = service.buffer_before_minutes || 0;
       bufferAfter = service.buffer_after_minutes || 0;
       serviceName = service.name;
+
+      const totalMinutes = duration + bufferBefore + bufferAfter;
+
+      validSlots = filterSlotsForServiceDuration(
+        validSlots,
+        totalMinutes,
+        slotMinutes
+      );
     }
 
     const wantedStartIso = new Date(slot_start).toISOString();
-    let validSlots = slots || [];
-
-    if (service_id && validSlots.length > 0) {
-      const totalMinutes = duration + bufferBefore + bufferAfter;
-      const baseSlotMinutes = slotMinutes;
-      const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
-
-      validSlots = validSlots.filter((slot, index) => {
-        for (let i = 1; i < neededBlocks; i++) {
-          const current = validSlots[index + i - 1];
-          const next = validSlots[index + i];
-
-          if (!current || !next) return false;
-
-          const currentEnd = new Date(current.slot_end).toISOString();
-          const nextStart = new Date(next.slot_start).toISOString();
-
-          if (currentEnd !== nextStart) return false;
-        }
-
-        return true;
-      });
-    }
 
     const ok = validSlots.some(
       (s) => new Date(s.slot_start).toISOString() === wantedStartIso
@@ -810,7 +1192,6 @@ app.get("/appointments/by-day/:slug/:date", async (req, res) => {
     return res.status(500).json({ error: "Error obteniendo agenda" });
   }
 });
-
 
 /* ======================================================
    ✅ GET /appointments/by-range/:slug
@@ -1166,7 +1547,6 @@ app.get("/services", async (req, res) => {
   }
 });
 
-
 /* ======================================================
    ✅ POST /services
 ====================================================== */
@@ -1217,7 +1597,6 @@ app.post("/services", async (req, res) => {
   }
 });
 
-
 /* ======================================================
    ✏️ PATCH /services/:id
 ====================================================== */
@@ -1243,7 +1622,8 @@ app.patch("/services/:id", async (req, res) => {
 
     if (name !== undefined) updateData.name = String(name).trim();
     if (description !== undefined)
-      updateData.description = String(description).trim();
+      updateData.description =
+        description === null ? null : String(description).trim();
     if (duration_minutes !== undefined)
       updateData.duration_minutes = Number(duration_minutes);
     if (price !== undefined) updateData.price = Number(price);
@@ -1272,6 +1652,7 @@ app.patch("/services/:id", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
 /* ======================================================
    🗑️ DELETE /services/:id
 ====================================================== */
@@ -1362,7 +1743,9 @@ app.get("/public/services/:slug", async (req, res) => {
     console.error("Error en /public/services/:slug", error);
     return res.status(500).json({ error: "Error interno del servidor" });
   }
-});/* ======================================================
+});
+
+/* ======================================================
    🌐 PUBLIC: negocio por slug
 ====================================================== */
 app.get("/public/business/:slug", async (req, res) => {
@@ -1375,7 +1758,19 @@ app.get("/public/business/:slug", async (req, res) => {
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, name, slug, phone, address")
+      .select(`
+        id,
+        name,
+        slug,
+        phone,
+        address,
+        email,
+        whatsapp,
+        instagram_url,
+        facebook_url,
+        description,
+        is_active
+      `)
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -1410,6 +1805,11 @@ app.get("/public/business/:slug", async (req, res) => {
         slug: tenant.slug,
         phone: tenant.phone,
         address: tenant.address,
+        email: tenant.email,
+        whatsapp: tenant.whatsapp,
+        instagram_url: tenant.instagram_url,
+        facebook_url: tenant.facebook_url,
+        description: tenant.description,
       },
       calendar_id: calendar.id,
       google_connected: Boolean(tokenRow?.id),
@@ -1418,7 +1818,6 @@ app.get("/public/business/:slug", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 /* ======================================================
    🌐 PUBLIC: slots por slug + service_id + date
@@ -1460,7 +1859,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 
     const { data: calendar, error: calendarError } = await supabase
       .from("calendars")
-      .select("id")
+      .select("id, slot_minutes")
       .eq("tenant_id", tenant.id)
       .eq("is_active", true)
       .order("created_at", { ascending: true })
@@ -1480,7 +1879,12 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
-    let slots = data || [];
+    const windows = await getBusinessAvailabilityWindows({
+      tenant_id: tenant.id,
+      date,
+    });
+
+    let slots = filterSlotsByWindows(data || [], windows, date);
 
     if (slots.length > 0) {
       const totalMinutes =
@@ -1488,24 +1892,13 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
         (service.buffer_before_minutes || 0) +
         (service.buffer_after_minutes || 0);
 
-      const baseSlotMinutes = 30;
-      const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
+      const baseSlotMinutes = calendar.slot_minutes || 30;
 
-      slots = slots.filter((slot, index) => {
-        for (let i = 1; i < neededBlocks; i++) {
-          const current = slots[index + i - 1];
-          const next = slots[index + i];
-
-          if (!current || !next) return false;
-
-          const currentEnd = new Date(current.slot_end).toISOString();
-          const nextStart = new Date(next.slot_start).toISOString();
-
-          if (currentEnd !== nextStart) return false;
-        }
-
-        return true;
-      });
+      slots = filterSlotsForServiceDuration(
+        slots,
+        totalMinutes,
+        baseSlotMinutes
+      );
     }
 
     return res.json({
@@ -1602,7 +1995,6 @@ app.post("/onboarding/setup", async (req, res) => {
 
     const normalizedSlug = String(business.slug).trim().toLowerCase();
 
-    // 1) validar slug único
     const { data: existingTenantBySlug, error: slugCheckError } = await supabase
       .from("tenants")
       .select("id, slug")
@@ -1619,7 +2011,6 @@ app.post("/onboarding/setup", async (req, res) => {
       });
     }
 
-    // 2) crear tenant / negocio
     const { data: createdTenant, error: tenantError } = await supabase
       .from("tenants")
       .insert({
@@ -1639,12 +2030,15 @@ app.post("/onboarding/setup", async (req, res) => {
 
     const tenant_id = createdTenant.id;
 
-    // 3) crear calendario principal
     const { data: createdCalendar, error: calendarError } = await supabase
       .from("calendars")
       .insert({
         tenant_id,
         name: "Principal",
+        timezone: "America/Santiago",
+        is_active: true,
+        slot_minutes: 30,
+        buffer_minutes: 0,
       })
       .select()
       .single();
@@ -1655,7 +2049,6 @@ app.post("/onboarding/setup", async (req, res) => {
 
     const calendar_id = createdCalendar.id;
 
-    // 4) crear primer servicio
     let createdService = null;
 
     if (service?.name) {
@@ -1680,40 +2073,36 @@ app.post("/onboarding/setup", async (req, res) => {
       createdService = serviceInserted;
     }
 
-    // 5) guardar horarios semanales
     if (Array.isArray(weekly_hours) && weekly_hours.length > 0) {
-      const weeklyRows = weekly_hours
-        .filter((row) => row.is_open)
-        .map((row) => ({
-          tenant_id,
-          calendar_id,
-          weekday: Number(row.day_of_week),
-          start_time: row.start_time,
-          end_time: row.end_time,
-        }));
+      const weeklyRows = weekly_hours.map((row) => ({
+        tenant_id,
+        day_of_week: Number(row.day_of_week),
+        enabled: !!row.enabled,
+        start_time: row.enabled ? row.start_time || null : null,
+        end_time: row.enabled ? row.end_time || null : null,
+      }));
 
       const { error: insertWeeklyError } = await supabase
-        .from("working_hours")
-        .insert(weeklyRows);
+        .from("business_hours")
+        .upsert(weeklyRows, { onConflict: "tenant_id,day_of_week" });
 
       if (insertWeeklyError) {
         return res.status(500).json({ error: insertWeeklyError.message });
       }
     }
 
-    // 6) guardar fechas especiales
     if (Array.isArray(special_dates) && special_dates.length > 0) {
       const specialRows = special_dates.map((row) => ({
         tenant_id,
-        calendar_id,
-        type: row.is_open ? "open" : "block",
-        start_at: row.start_time ? `${row.date}T${row.start_time}:00` : `${row.date}T00:00:00`,
-        end_at: row.end_time ? `${row.date}T${row.end_time}:00` : `${row.date}T23:59:59`,
-        reason: "Configuración especial",
+        date: row.date,
+        label: row.label || "Configuración especial",
+        is_closed: !!row.is_closed,
+        start_time: row.start_time || null,
+        end_time: row.end_time || null,
       }));
 
       const { error: insertSpecialError } = await supabase
-        .from("availability_exceptions")
+        .from("business_special_dates")
         .insert(specialRows);
 
       if (insertSpecialError) {
