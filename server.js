@@ -1076,7 +1076,17 @@ app.post("/tenants/provision", async (req, res) => {
 app.patch("/tenants/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, phone, address } = req.body;
+
+    const {
+      name,
+      phone,
+      address,
+      email,
+      whatsapp,
+      instagram_url,
+      facebook_url,
+      description,
+    } = req.body;
 
     if (!id) {
       return res.status(400).json({ error: "id es obligatorio" });
@@ -1092,6 +1102,11 @@ app.patch("/tenants/:id", async (req, res) => {
         name: String(name).trim(),
         phone: phone ? String(phone).trim() : null,
         address: address ? String(address).trim() : null,
+        email: email ? String(email).trim() : null,
+        whatsapp: whatsapp ? String(whatsapp).trim() : null,
+        instagram_url: instagram_url ? String(instagram_url).trim() : null,
+        facebook_url: facebook_url ? String(facebook_url).trim() : null,
+        description: description ? String(description).trim() : null,
       })
       .eq("id", id)
       .select()
@@ -1109,7 +1124,6 @@ app.patch("/tenants/:id", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 /* ======================================================
    ✅ GET /services
@@ -1161,6 +1175,7 @@ app.post("/services", async (req, res) => {
     const {
       tenant_id,
       name,
+      description,
       duration_minutes,
       buffer_before_minutes = 0,
       buffer_after_minutes = 0,
@@ -1179,6 +1194,7 @@ app.post("/services", async (req, res) => {
       .insert({
         tenant_id,
         name: String(name).trim(),
+        description: description ? String(description).trim() : null,
         duration_minutes: Number(duration_minutes),
         buffer_before_minutes: Number(buffer_before_minutes || 0),
         buffer_after_minutes: Number(buffer_after_minutes || 0),
@@ -1211,6 +1227,7 @@ app.patch("/services/:id", async (req, res) => {
 
     const {
       name,
+      description,
       duration_minutes,
       price,
       buffer_before_minutes = 0,
@@ -1225,6 +1242,8 @@ app.patch("/services/:id", async (req, res) => {
     const updateData = {};
 
     if (name !== undefined) updateData.name = String(name).trim();
+    if (description !== undefined)
+      updateData.description = String(description).trim();
     if (duration_minutes !== undefined)
       updateData.duration_minutes = Number(duration_minutes);
     if (price !== undefined) updateData.price = Number(price);
@@ -1253,7 +1272,6 @@ app.patch("/services/:id", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 /* ======================================================
    🗑️ DELETE /services/:id
 ====================================================== */
