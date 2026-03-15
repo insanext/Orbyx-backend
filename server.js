@@ -811,6 +811,56 @@ app.get("/appointments/by-day/:slug/:date", async (req, res) => {
   }
 });
 
+
+/* ======================================================
+   ✅ GET /appointments/by-range/:slug
+====================================================== */
+app.get("/appointments/by-range/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { from, to } = req.query;
+
+    if (!from || !to) {
+      return res.status(400).json({
+        error: "Se requieren los parámetros from y to en formato YYYY-MM-DD",
+      });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const start = `${from}T00:00:00`;
+    const end = `${to}T23:59:59`;
+
+    const { data: appointments, error: appointmentsError } = await supabase
+      .from("appointments")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .eq("status", "booked")
+      .gte("start_at", start)
+      .lte("start_at", end)
+      .order("start_at", { ascending: true });
+
+    if (appointmentsError) {
+      return res.status(500).json({ error: appointmentsError.message });
+    }
+
+    return res.json({
+      appointments: appointments || [],
+    });
+  } catch (error) {
+    console.error("Error en /appointments/by-range/:slug", error);
+    return res.status(500).json({ error: "Error obteniendo agenda semanal" });
+  }
+});
+
 /* ======================================================
    ✅ GET /appointments
 ====================================================== */
