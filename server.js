@@ -740,6 +740,563 @@ app.delete("/business-special-dates/:id", async (req, res) => {
   }
 });
 
+
+/* ======================================================
+   ✅ HELPERS STAFF
+====================================================== */
+function isValidDayOfWeek(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 && n <= 6;
+}
+
+function normalizeNullableText(value) {
+  if (value === undefined || value === null) return null;
+  const trimmed = String(value).trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeColor(value) {
+  const color = String(value || "").trim();
+  if (!color) return "#0f172a";
+  return color;
+}
+
+/* ======================================================
+   ✅ GET /staff
+====================================================== */
+app.get("/staff", async (req, res) => {
+  try {
+    const { tenant_id, active } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    let query = supabase
+      .from("staff")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("sort_order", { ascending: true })
+      .order("created_at", { ascending: true });
+
+    if (active === "true") query = query.eq("is_active", true);
+    if (active === "false") query = query.eq("is_active", false);
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      staff: data || [],
+    });
+  } catch (err) {
+    console.error("GET /staff error:", err.message);
+    return res.status(500).json({ error: "Error obteniendo staff" });
+  }
+});
+
+/* ======================================================
+   ✅ POST /staff
+====================================================== */
+app.post("/staff", async (req, res) => {
+  try {
+    const {
+      tenant_id,
+      name,
+      role,
+      email,
+      phone,
+      color = "#0f172a",
+      is_active = true,
+      sort_order = 0,
+    } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "name es obligatorio" });
+    }
+
+    const payload = {
+      tenant_id,
+      name: String(name).trim(),
+      role: normalizeNullableText(role),
+      email: normalizeNullableText(email),
+      phone: normalizeNullableText(phone),
+      color: normalizeColor(color),
+      is_active: Boolean(is_active),
+      sort_order: Number(sort_order || 0),
+    };
+
+    const { data, error } = await supabase
+      .from("staff")
+      .insert(payload)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.status(201).json({
+      ok: true,
+      staff: data,
+    });
+  } catch (err) {
+    console.error("POST /staff error:", err.message);
+    return res.status(500).json({ error: "Error creando staff" });
+  }
+});
+
+/* ======================================================
+   ✅ PUT /staff/:id
+====================================================== */
+app.put("/staff/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      name,
+      role,
+      email,
+      phone,
+      color,
+      is_active,
+      sort_order,
+    } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: "id es obligatorio" });
+    }
+
+    const updateData = {};
+
+    if (name !== undefined) {
+      if (!String(name).trim()) {
+        return res.status(400).json({ error: "name no puede estar vacío" });
+      }
+      updateData.name = String(name).trim();
+    }
+
+    if (role !== undefined) updateData.role = normalizeNullableText(role);
+    if (email !== undefined) updateData.email = normalizeNullableText(email);
+    if (phone !== undefined) updateData.phone = normalizeNullableText(phone);
+    if (color !== undefined) updateData.color = normalizeColor(color);
+    if (is_active !== undefined) updateData.is_active = Boolean(is_active);
+    if (sort_order !== undefined) updateData.sort_order = Number(sort_order || 0);
+
+    const { data, error } = await supabase
+      .from("staff")
+      .update(updateData)
+      .eq("id", id)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      staff: data,
+    });
+  } catch (err) {
+    console.error("PUT /staff/:id error:", err.message);
+    return res.status(500).json({ error: "Error actualizando staff" });
+  }
+});
+
+/* ======================================================
+   ✅ DELETE /staff/:id
+====================================================== */
+app.delete("/staff/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from("staff")
+      .delete()
+      .eq("id", id);
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      message: "Staff eliminado correctamente",
+    });
+  } catch (err) {
+    console.error("DELETE /staff/:id error:", err.message);
+    return res.status(500).json({ error: "Error eliminando staff" });
+  }
+});
+
+/* ======================================================
+   ✅ GET /staff-services
+====================================================== */
+app.get("/staff-services", async (req, res) => {
+  try {
+    const { tenant_id, staff_id } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    let query = supabase
+      .from("staff_services")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: true });
+
+    if (staff_id) {
+      query = query.eq("staff_id", staff_id);
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      staff_services: data || [],
+    });
+  } catch (err) {
+    console.error("GET /staff-services error:", err.message);
+    return res.status(500).json({ error: "Error obteniendo staff_services" });
+  }
+});
+
+/* ======================================================
+   ✅ PUT /staff-services
+   Reemplaza todas las relaciones de un staff
+====================================================== */
+app.put("/staff-services", async (req, res) => {
+  try {
+    const { tenant_id, staff_id, service_ids } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!staff_id) {
+      return res.status(400).json({ error: "staff_id es obligatorio" });
+    }
+
+    if (!Array.isArray(service_ids)) {
+      return res.status(400).json({ error: "service_ids debe ser un arreglo" });
+    }
+
+    const uniqueServiceIds = [...new Set(service_ids.filter(Boolean))];
+
+    const { error: deleteError } = await supabase
+      .from("staff_services")
+      .delete()
+      .eq("tenant_id", tenant_id)
+      .eq("staff_id", staff_id);
+
+    if (deleteError) throw deleteError;
+
+    if (uniqueServiceIds.length === 0) {
+      return res.json({
+        ok: true,
+        staff_services: [],
+      });
+    }
+
+    const payload = uniqueServiceIds.map((service_id) => ({
+      tenant_id,
+      staff_id,
+      service_id,
+    }));
+
+    const { data, error } = await supabase
+      .from("staff_services")
+      .insert(payload)
+      .select("*");
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      staff_services: data || [],
+    });
+  } catch (err) {
+    console.error("PUT /staff-services error:", err.message);
+    return res.status(500).json({ error: "Error guardando staff_services" });
+  }
+});
+
+/* ======================================================
+   ✅ DELETE /staff-services/:id
+====================================================== */
+app.delete("/staff-services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from("staff_services")
+      .delete()
+      .eq("id", id);
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      message: "Relación staff-servicio eliminada correctamente",
+    });
+  } catch (err) {
+    console.error("DELETE /staff-services/:id error:", err.message);
+    return res.status(500).json({ error: "Error eliminando relación staff-servicio" });
+  }
+});
+
+/* ======================================================
+   ✅ GET /staff-hours
+====================================================== */
+app.get("/staff-hours", async (req, res) => {
+  try {
+    const { tenant_id, staff_id } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    let query = supabase
+      .from("staff_hours")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("staff_id", { ascending: true })
+      .order("day_of_week", { ascending: true });
+
+    if (staff_id) {
+      query = query.eq("staff_id", staff_id);
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      hours: data || [],
+    });
+  } catch (err) {
+    console.error("GET /staff-hours error:", err.message);
+    return res.status(500).json({ error: "Error obteniendo staff_hours" });
+  }
+});
+
+/* ======================================================
+   ✅ PUT /staff-hours
+   Reemplaza horarios semanales de un staff
+====================================================== */
+app.put("/staff-hours", async (req, res) => {
+  try {
+    const { tenant_id, staff_id, hours } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!staff_id) {
+      return res.status(400).json({ error: "staff_id es obligatorio" });
+    }
+
+    if (!Array.isArray(hours)) {
+      return res.status(400).json({ error: "hours debe ser un arreglo" });
+    }
+
+    for (const item of hours) {
+      if (!isValidDayOfWeek(item.day_of_week)) {
+        return res.status(400).json({ error: "day_of_week inválido" });
+      }
+    }
+
+    const payload = hours.map((item) => ({
+      tenant_id,
+      staff_id,
+      day_of_week: Number(item.day_of_week),
+      enabled: Boolean(item.enabled),
+      start_time: item.enabled ? item.start_time || null : null,
+      end_time: item.enabled ? item.end_time || null : null,
+      updated_at: new Date().toISOString(),
+    }));
+
+    const { data, error } = await supabase
+      .from("staff_hours")
+      .upsert(payload, { onConflict: "staff_id,day_of_week" })
+      .select("*");
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      hours: data || [],
+    });
+  } catch (err) {
+    console.error("PUT /staff-hours error:", err.message);
+    return res.status(500).json({ error: "Error guardando staff_hours" });
+  }
+});
+
+/* ======================================================
+   ✅ GET /staff-special-dates
+====================================================== */
+app.get("/staff-special-dates", async (req, res) => {
+  try {
+    const { tenant_id, staff_id } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    let query = supabase
+      .from("staff_special_dates")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("date", { ascending: true })
+      .order("created_at", { ascending: true });
+
+    if (staff_id) {
+      query = query.eq("staff_id", staff_id);
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      special_dates: data || [],
+    });
+  } catch (err) {
+    console.error("GET /staff-special-dates error:", err.message);
+    return res.status(500).json({ error: "Error obteniendo staff_special_dates" });
+  }
+});
+
+/* ======================================================
+   ✅ POST /staff-special-dates
+====================================================== */
+app.post("/staff-special-dates", async (req, res) => {
+  try {
+    const {
+      tenant_id,
+      staff_id,
+      date,
+      label,
+      is_closed,
+      start_time,
+      end_time,
+    } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!staff_id) {
+      return res.status(400).json({ error: "staff_id es obligatorio" });
+    }
+
+    if (!date) {
+      return res.status(400).json({ error: "date es obligatorio" });
+    }
+
+    const payload = {
+      tenant_id,
+      staff_id,
+      date,
+      label: normalizeNullableText(label),
+      is_closed: Boolean(is_closed),
+      start_time: start_time || null,
+      end_time: end_time || null,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from("staff_special_dates")
+      .insert(payload)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.status(201).json({
+      ok: true,
+      item: data,
+    });
+  } catch (err) {
+    console.error("POST /staff-special-dates error:", err.message);
+    return res.status(500).json({ error: "Error creando staff_special_date" });
+  }
+});
+
+/* ======================================================
+   ✅ PUT /staff-special-dates/:id
+====================================================== */
+app.put("/staff-special-dates/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      staff_id,
+      date,
+      label,
+      is_closed,
+      start_time,
+      end_time,
+    } = req.body;
+
+    const payload = {
+      updated_at: new Date().toISOString(),
+    };
+
+    if (staff_id !== undefined) payload.staff_id = staff_id;
+    if (date !== undefined) payload.date = date;
+    if (label !== undefined) payload.label = normalizeNullableText(label);
+    if (is_closed !== undefined) payload.is_closed = Boolean(is_closed);
+    if (start_time !== undefined) payload.start_time = start_time || null;
+    if (end_time !== undefined) payload.end_time = end_time || null;
+
+    const { data, error } = await supabase
+      .from("staff_special_dates")
+      .update(payload)
+      .eq("id", id)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      item: data,
+    });
+  } catch (err) {
+    console.error("PUT /staff-special-dates/:id error:", err.message);
+    return res.status(500).json({ error: "Error actualizando staff_special_date" });
+  }
+});
+
+/* ======================================================
+   ✅ DELETE /staff-special-dates/:id
+====================================================== */
+app.delete("/staff-special-dates/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from("staff_special_dates")
+      .delete()
+      .eq("id", id);
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      message: "Fecha especial de staff eliminada correctamente",
+    });
+  } catch (err) {
+    console.error("DELETE /staff-special-dates/:id error:", err.message);
+    return res.status(500).json({ error: "Error eliminando staff_special_date" });
+  }
+});
+
 /* ======================================================
    🔹 ENDPOINT: /slots
 ====================================================== */
