@@ -1034,7 +1034,6 @@ app.get("/services", async (req, res) => {
       .from("services")
       .select("*")
       .eq("tenant_id", tenant_id)
-      .is("deleted_at", null)
       .order("created_at", { ascending: true });
 
     if (active === "true") {
@@ -1059,6 +1058,7 @@ app.get("/services", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
 
 /* ======================================================
    ✅ POST /services
@@ -1161,44 +1161,6 @@ app.patch("/services/:id", async (req, res) => {
   }
 });
 
-
-app.delete("/services/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!id) {
-      return res.status(400).json({ error: "id es obligatorio" });
-    }
-
-    const { data, error } = await supabase
-      .from("services")
-      .update({
-        deleted_at: new Date().toISOString(),
-        active: false,
-      })
-      .eq("id", id)
-      .is("deleted_at", null)
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(500).json({ error: error.message });
-    }
-
-    if (!data) {
-      return res.status(404).json({ error: "Servicio no encontrado" });
-    }
-
-    return res.json({
-      ok: true,
-      service: data,
-    });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-
 /* ======================================================
    🌐 PUBLIC: servicios por slug
 ====================================================== */
@@ -1221,7 +1183,6 @@ app.get("/public/services/:slug", async (req, res) => {
       .select("*")
       .eq("tenant_id", tenant.id)
       .eq("active", true)
-      .is("deleted_at", null)
       .order("created_at", { ascending: true });
 
     if (servicesError) {
@@ -1322,14 +1283,13 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       return res.status(404).json({ error: "negocio no encontrado" });
     }
 
-const { data: service, error: serviceError } = await supabase
-  .from("services")
-  .select("*")
-  .eq("id", service_id)
-  .eq("tenant_id", tenant.id)
-  .eq("active", true)
-  .is("deleted_at", null)
-  .single();
+    const { data: service, error: serviceError } = await supabase
+      .from("services")
+      .select("*")
+      .eq("id", service_id)
+      .eq("tenant_id", tenant.id)
+      .eq("active", true)
+      .single();
 
     if (serviceError || !service) {
       return res.status(404).json({ error: "servicio no encontrado" });
