@@ -157,6 +157,106 @@ function buildSlotsFromWindows(windows, date, slotMinutes) {
 async function getStaffAvailabilityWindows({ tenant_id, staff_id, date }) {
   const weekday = parseDateToWeekday(date);
 
+  const { data: staffRow, error: staffError } = await supabase
+    .from("staff")
+    .select("id, tenant_id, use_business_hours, is_active")
+    .eq("tenant_id", tenant_id)
+    .eq("id", staff_id)
+    .single();
+
+  if (staffError) throw staffError;
+
+  if (!staffRow || !staffRow.is_active) {
+    return [];
+  }
+
+  let windows = [];
+
+  if (staffRow.use_business_hours) {
+    const businessWindows = await getBusinessAvailabilityWindows({
+      tenant_id,
+      date,
+    });
+
+    windows = businessWindows;
+  } else {
+    const { data: weeklyRows, error: weeklyError } = await supabase
+      .from("staff_hours")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .eq("staff_id", staff_id)
+      .eq("day_of_week", weekday);
+
+    if (weeklyError) throw weeklyError;
+
+    const weekly = weeklyRows?.[0] || null;
+
+    if (weekly?.enabled && weekly.start_time && weekly.end_time) {
+      const weeklyStart = timeToMinutes(weekly.start_time);
+      const weeklyEnd = timeToMinutes(weekly.end_time);
+
+      if (
+        weeklyStart !== null &&
+        weeklyEnd !== null &&
+        weeklyEnd > weeklyStart
+      ) {
+        windows = [{ start: weeklyStart, end: weeklyEnd }];
+      }
+    }
+  }
+
+  const { data: specialRows, error: specialError } = await supabase
+    .from("staff_special_dates")
+    .select("*")
+    .eq("tenant_id", tenant_id)
+    .eq("staff_id", staff_id)
+    .eq("date", date)
+    .order("created_at", { ascending: true });
+
+  if (specialError) throw specialError;
+
+  const specialDates = specialRows || [];
+
+  const fullDayClosed = specialDates.some(
+    (row) => row.is_closed && !row.start_time && !row.end_time
+  );
+
+  if (fullDayClosed) {
+    return [];
+  }
+
+  const openWindows = specialDates
+    .filter((row) => !row.is_closed && row.start_time && row.end_time)
+    .map((row) => ({
+      start: timeToMinutes(row.start_time),
+      end: timeToMinutes(row.end_time),
+    }))
+    .filter(
+      (row) => row.start !== null && row.end !== null && row.end > row.start
+    );
+
+  if (openWindows.length > 0) {
+    windows = openWindows;
+  }
+
+  const partialClosedWindows = specialDates
+    .filter((row) => row.is_closed && row.start_time && row.end_time)
+    .map((row) => ({
+      start: timeToMinutes(row.start_time),
+      end: timeToMinutes(row.end_time),
+    }))
+    .filter(
+      (row) => row.start !== null && row.end !== null && row.end > row.start
+    );
+
+  for (const blocked of partialClosedWindows) {
+    windows = subtractRange(windows, blocked.start, blocked.end);
+  }
+
+  return windows.sort((a, b) => a.start - b.start);
+}
+  const weekday = parseDateToWeekday(date);
+
   const { data: weeklyRows, error: weeklyError } = await supabase
     .from("staff_hours")
     .select("*")
