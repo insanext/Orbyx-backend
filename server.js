@@ -970,16 +970,17 @@ app.get("/staff", async (req, res) => {
 ====================================================== */
 app.post("/staff", async (req, res) => {
   try {
-    const {
-      tenant_id,
-      name,
-      role,
-      email,
-      phone,
-      color = "#0f172a",
-      is_active = true,
-      sort_order = 0,
-    } = req.body;
+const {
+  tenant_id,
+  name,
+  role,
+  email,
+  phone,
+  color = "#0f172a",
+  is_active = true,
+  sort_order = 0,
+  use_business_hours = true,
+} = req.body;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -989,16 +990,17 @@ app.post("/staff", async (req, res) => {
       return res.status(400).json({ error: "name es obligatorio" });
     }
 
-    const payload = {
-      tenant_id,
-      name: String(name).trim(),
-      role: normalizeNullableText(role),
-      email: normalizeNullableText(email),
-      phone: normalizeNullableText(phone),
-      color: normalizeColor(color),
-      is_active: Boolean(is_active),
-      sort_order: Number(sort_order || 0),
-    };
+const payload = {
+  tenant_id,
+  name: String(name).trim(),
+  role: normalizeNullableText(role),
+  email: normalizeNullableText(email),
+  phone: normalizeNullableText(phone),
+  color: normalizeColor(color),
+  is_active: Boolean(is_active),
+  sort_order: Number(sort_order || 0),
+  use_business_hours: Boolean(use_business_hours),
+};
 
     const { data, error } = await supabase
       .from("staff")
@@ -1032,6 +1034,7 @@ app.put("/staff/:id", async (req, res) => {
       color,
       is_active,
       sort_order,
+      use_business_hours,
     } = req.body;
 
     if (!id) {
@@ -1053,6 +1056,9 @@ app.put("/staff/:id", async (req, res) => {
     if (color !== undefined) updateData.color = normalizeColor(color);
     if (is_active !== undefined) updateData.is_active = Boolean(is_active);
     if (sort_order !== undefined) updateData.sort_order = Number(sort_order || 0);
+    if (use_business_hours !== undefined) {
+      updateData.use_business_hours = Boolean(use_business_hours);
+    }
 
     const { data, error } = await supabase
       .from("staff")
