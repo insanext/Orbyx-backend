@@ -137,10 +137,15 @@ function buildSlotsFromWindows(windows, date, slotMinutes) {
     let cursor = window.start;
 
     while (cursor + slotMinutes <= window.end) {
-      const startDate = new Date(`${date}T00:00:00-03:00`);
-      startDate.setHours(Math.floor(cursor / 60), cursor % 60, 0, 0);
+      const startHour = String(Math.floor(cursor / 60)).padStart(2, "0");
+      const startMinute = String(cursor % 60).padStart(2, "0");
 
-      const endDate = new Date(startDate.getTime() + slotMinutes * 60 * 1000);
+      const endCursor = cursor + slotMinutes;
+      const endHour = String(Math.floor(endCursor / 60)).padStart(2, "0");
+      const endMinute = String(endCursor % 60).padStart(2, "0");
+
+      const startDate = new Date(`${date}T${startHour}:${startMinute}:00-03:00`);
+      const endDate = new Date(`${date}T${endHour}:${endMinute}:00-03:00`);
 
       slots.push({
         slot_start: startDate.toISOString(),
