@@ -137,7 +137,7 @@ function buildSlotsFromWindows(windows, date, slotMinutes) {
     let cursor = window.start;
 
     while (cursor + slotMinutes <= window.end) {
-      const startDate = new Date(`${date}T00:00:00`);
+      const startDate = new Date(`${date}T00:00:00-03:00`);
       startDate.setHours(Math.floor(cursor / 60), cursor % 60, 0, 0);
 
       const endDate = new Date(startDate.getTime() + slotMinutes * 60 * 1000);
