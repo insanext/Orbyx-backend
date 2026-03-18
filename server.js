@@ -1698,7 +1698,7 @@ if (!cal.is_active) {
 
 const { data: tenantConfig, error: tenantConfigError } = await supabase
   .from("tenants")
-  .select("min_booking_notice_minutes")
+  .select("min_booking_notice_minutes, max_booking_days_ahead")
   .eq("id", cal.tenant_id)
   .single();
 
@@ -1708,6 +1708,10 @@ if (tenantConfigError || !tenantConfig) {
 
 const minBookingNoticeMinutes = Number(
   tenantConfig.min_booking_notice_minutes || 0
+);
+
+const maxBookingDaysAhead = Number(
+  tenantConfig.max_booking_days_ahead || 60
 );
 
 const start = new Date(slot_start);
@@ -1720,6 +1724,27 @@ if (start.getTime() < minAllowedStart.getTime()) {
     error: `Este negocio permite reservas con al menos ${minBookingNoticeMinutes} minutos de anticipación.`,
   });
 }
+
+const maxAllowedStart = new Date();
+maxAllowedStart.setHours(23, 59, 59, 999);
+maxAllowedStart.setDate(maxAllowedStart.getDate() + maxBookingDaysAhead);
+
+if (start.getTime() > maxAllowedStart.getTime()) {
+  return res.status(409).json({
+    error: `Este negocio permite reservas con hasta ${maxBookingDaysAhead} días de anticipación.`,
+  });
+}
+
+const maxAllowedStart = new Date();
+maxAllowedStart.setHours(23, 59, 59, 999);
+maxAllowedStart.setDate(maxAllowedStart.getDate() + maxBookingDaysAhead);
+
+if (start.getTime() > maxAllowedStart.getTime()) {
+  return res.status(409).json({
+    error: `Este negocio permite reservas con hasta ${maxBookingDaysAhead} días de anticipación.`,
+  });
+}
+
 // 🔒 Anti doble reserva
 const startIso = start.toISOString();
 
@@ -2335,6 +2360,7 @@ app.post("/tenants/provision", async (req, res) => {
 /* ======================================================
    ✅ PATCH /tenants/:id
 ====================================================== */
+
 app.patch("/tenants/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -2349,6 +2375,7 @@ app.patch("/tenants/:id", async (req, res) => {
       facebook_url,
       description,
       min_booking_notice_minutes,
+      max_booking_days_ahead,
     } = req.body;
 
     if (!id) {
@@ -2364,6 +2391,11 @@ app.patch("/tenants/:id", async (req, res) => {
       Number(min_booking_notice_minutes || 0)
     );
 
+    const normalizedMaxBookingDaysAhead = Math.max(
+      1,
+      Number(max_booking_days_ahead || 60)
+    );
+
     const { data, error } = await supabase
       .from("tenants")
       .update({
@@ -2376,6 +2408,7 @@ app.patch("/tenants/:id", async (req, res) => {
         facebook_url: facebook_url ? String(facebook_url).trim() : null,
         description: description ? String(description).trim() : null,
         min_booking_notice_minutes: normalizedMinBookingNoticeMinutes,
+        max_booking_days_ahead: normalizedMaxBookingDaysAhead,
       })
       .eq("id", id)
       .select()
@@ -2393,6 +2426,8 @@ app.patch("/tenants/:id", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+
 /* ======================================================
    ✅ GET /services
 ====================================================== */
@@ -2657,6 +2692,7 @@ app.get("/public/business/:slug", async (req, res) => {
         facebook_url,
         description,
         min_booking_notice_minutes,
+        max_booking_days_ahead,
         is_active
       `)
       .eq("slug", slug)
@@ -2667,47 +2703,27 @@ app.get("/public/business/:slug", async (req, res) => {
       return res.status(404).json({ error: "negocio no encontrado" });
     }
 
-    const { data: calendar, error: calendarError } = await supabase
+    const { data: calendar } = await supabase
       .from("calendars")
       .select("id")
       .eq("tenant_id", tenant.id)
       .eq("is_active", true)
-      .order("created_at", { ascending: true })
       .limit(1)
       .single();
 
-    if (calendarError || !calendar) {
-      return res.status(404).json({ error: "calendario no encontrado" });
-    }
-
-    const { data: tokenRow } = await supabase
-      .from("calendar_tokens")
-      .select("id")
-      .eq("calendar_id", calendar.id)
-      .maybeSingle();
-
     return res.json({
       business: {
-        id: tenant.id,
-        name: tenant.name,
-        slug: tenant.slug,
-        phone: tenant.phone,
-        address: tenant.address,
-        email: tenant.email,
-        whatsapp: tenant.whatsapp,
-        instagram_url: tenant.instagram_url,
-        facebook_url: tenant.facebook_url,
-        description: tenant.description,
+        ...tenant,
         min_booking_notice_minutes: tenant.min_booking_notice_minutes || 0,
+        max_booking_days_ahead: tenant.max_booking_days_ahead || 60,
       },
-      calendar_id: calendar.id,
-      google_connected: Boolean(tokenRow?.id),
+      calendar_id: calendar?.id,
+      google_connected: false,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
 /* ======================================================
    🌐 PUBLIC: staff por slug + service_id
 ====================================================== */
@@ -2801,6 +2817,7 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
 /* ======================================================
    🌐 PUBLIC: slots por slug + service_id + date
 ====================================================== */
+
 app.get("/public/slots/:slug/:service_id", async (req, res) => {
   try {
     const { slug, service_id } = req.params;
@@ -2814,7 +2831,9 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, name, slug, min_booking_notice_minutes")
+      .select(
+        "id, name, slug, min_booking_notice_minutes, max_booking_days_ahead"
+      )
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -2826,6 +2845,26 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
     const minBookingNoticeMinutes = Number(
       tenant.min_booking_notice_minutes || 0
     );
+    const maxBookingDaysAhead = Number(tenant.max_booking_days_ahead || 60);
+
+    const requestedDate = new Date(`${date}T00:00:00-03:00`);
+    const maxAllowedDate = new Date();
+    maxAllowedDate.setHours(0, 0, 0, 0);
+    maxAllowedDate.setDate(maxAllowedDate.getDate() + maxBookingDaysAhead);
+
+    if (requestedDate.getTime() > maxAllowedDate.getTime()) {
+      return res.json({
+        business: {
+          name: tenant.name,
+          slug: tenant.slug,
+        },
+        calendar_id: null,
+        service: null,
+        date,
+        total: 0,
+        slots: [],
+      });
+    }
 
     const { data: service, error: serviceError } = await supabase
       .from("services")
@@ -2893,7 +2932,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
         calendar.slot_minutes || 30
       );
 
-      // 🔥 AQUÍ SE APLICA EL TIEMPO MÍNIMO
       slots = filterPastSlots(slots, minBookingNoticeMinutes);
 
       return res.json({
@@ -2965,7 +3003,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
         new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
     );
 
-    // 🔥 AQUÍ TAMBIÉN SE APLICA
     slots = filterPastSlots(slots, minBookingNoticeMinutes);
 
     return res.json({
@@ -2982,7 +3019,10 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-});/* ======================================================
+});
+
+
+/* ======================================================
    🔔 RECORDATORIOS 24H
 ====================================================== */
 app.get("/jobs/send-reminders", async (req, res) => {
