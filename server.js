@@ -2348,6 +2348,7 @@ app.patch("/tenants/:id", async (req, res) => {
       instagram_url,
       facebook_url,
       description,
+      min_booking_notice_minutes,
     } = req.body;
 
     if (!id) {
@@ -2357,6 +2358,11 @@ app.patch("/tenants/:id", async (req, res) => {
     if (!name || !String(name).trim()) {
       return res.status(400).json({ error: "name es obligatorio" });
     }
+
+    const normalizedMinBookingNoticeMinutes = Math.max(
+      0,
+      Number(min_booking_notice_minutes || 0)
+    );
 
     const { data, error } = await supabase
       .from("tenants")
@@ -2369,6 +2375,7 @@ app.patch("/tenants/:id", async (req, res) => {
         instagram_url: instagram_url ? String(instagram_url).trim() : null,
         facebook_url: facebook_url ? String(facebook_url).trim() : null,
         description: description ? String(description).trim() : null,
+        min_booking_notice_minutes: normalizedMinBookingNoticeMinutes,
       })
       .eq("id", id)
       .select()
@@ -2386,7 +2393,6 @@ app.patch("/tenants/:id", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 /* ======================================================
    ✅ GET /services
 ====================================================== */
