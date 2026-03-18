@@ -1686,6 +1686,27 @@ app.post("/appointments/slot", async (req, res) => {
     }
 
     const start = new Date(slot_start);
+// 🔒 Anti doble reserva
+const startIso = start.toISOString();
+
+let doubleBookingQuery = supabase
+  .from("appointments")
+  .select("id")
+  .eq("tenant_id", cal.tenant_id)
+  .eq("start_at", startIso)
+  .eq("status", "booked");
+
+if (staff_id) {
+  doubleBookingQuery = doubleBookingQuery.eq("staff_id", staff_id);
+}
+
+const { data: existingSlot } = await doubleBookingQuery.limit(1);
+
+if (existingSlot && existingSlot.length > 0) {
+  return res.status(409).json({
+    error: "Este horario acaba de ser reservado por otro cliente.",
+  });
+}
 
     const { data: existingAppointments, error: existingErr } = await supabase
       .from("appointments")
