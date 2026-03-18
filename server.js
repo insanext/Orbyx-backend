@@ -2155,7 +2155,6 @@ app.patch("/appointments/:id/status", async (req, res) => {
       .from("appointments")
       .update({
         status,
-        updated_at: new Date().toISOString(),
       })
       .eq("id", id)
       .select()
