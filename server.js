@@ -1982,11 +1982,12 @@ app.get("/appointments/by-day/:slug/:date", async (req, res) => {
   try {
     const { slug, date } = req.params;
 
-    const { data: tenant, error: tenantError } = await supabase
-      .from("tenants")
-      .select("id")
-      .eq("slug", slug)
-      .single();
+const { data: tenant, error: tenantError } = await supabase
+  .from("tenants")
+  .select("id, name, slug, min_booking_notice_minutes")
+  .eq("slug", slug)
+  .eq("is_active", true)
+  .single();
 
     if (tenantError || !tenant) {
       return res.status(404).json({ error: "Negocio no encontrado" });
@@ -2782,7 +2783,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, name, slug")
+      .select("id, name, slug, min_booking_notice_minutes")
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -2790,6 +2791,10 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
     if (tenantError || !tenant) {
       return res.status(404).json({ error: "negocio no encontrado" });
     }
+
+    const minBookingNoticeMinutes = Number(
+      tenant.min_booking_notice_minutes || 0
+    );
 
     const { data: service, error: serviceError } = await supabase
       .from("services")
@@ -2857,7 +2862,8 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
         calendar.slot_minutes || 30
       );
 
-      slots = filterPastSlots(slots, 0);
+      // 🔥 AQUÍ SE APLICA EL TIEMPO MÍNIMO
+      slots = filterPastSlots(slots, minBookingNoticeMinutes);
 
       return res.json({
         business: {
@@ -2928,7 +2934,8 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
         new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
     );
 
-    slots = filterPastSlots(slots, 0);
+    // 🔥 AQUÍ TAMBIÉN SE APLICA
+    slots = filterPastSlots(slots, minBookingNoticeMinutes);
 
     return res.json({
       business: {
@@ -2944,8 +2951,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-});
-/* ======================================================
+});/* ======================================================
    🔔 RECORDATORIOS 24H
 ====================================================== */
 app.get("/jobs/send-reminders", async (req, res) => {
