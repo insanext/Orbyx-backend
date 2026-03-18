@@ -2925,12 +2925,8 @@ for (const slot of mergedSlots) {
 }
 
 let slots = Array.from(uniqueMap.values()).sort(
-  (a, b) => new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
-);
 
 slots = filterPastSlots(slots, date, 0);
-  (a, b) => new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
-);
 
     return res.json({
       business: {
