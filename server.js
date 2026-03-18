@@ -2846,18 +2846,19 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       mergedSlots.push(...staffSlots);
     }
 
-    const uniqueMap = new Map();
+const uniqueMap = new Map();
 
-    for (const slot of mergedSlots) {
-      const key = `${slot.slot_start}_${slot.staff_id || ""}`;
-      if (!uniqueMap.has(key)) {
-        uniqueMap.set(key, slot);
-      }
-    }
+for (const slot of mergedSlots) {
+  const key = slot.slot_start; // solo por hora, no por staff
 
-    const slots = Array.from(uniqueMap.values()).sort(
-      (a, b) => new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
-    );
+  if (!uniqueMap.has(key)) {
+    uniqueMap.set(key, slot);
+  }
+}
+
+const slots = Array.from(uniqueMap.values()).sort(
+  (a, b) => new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
+);
 
     return res.json({
       business: {
