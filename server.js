@@ -428,7 +428,7 @@ function filterSlotsForServiceDuration(slots, totalMinutes, baseSlotMinutes) {
   });
 }
 
-function filterPastSlots(slots, date, minNoticeMinutes = 0) {
+function filterPastSlots(slots, minNoticeMinutes = 0) {
   if (!Array.isArray(slots) || slots.length === 0) return [];
 
   const now = new Date();
@@ -439,7 +439,6 @@ function filterPastSlots(slots, date, minNoticeMinutes = 0) {
     return start.getTime() >= limit.getTime();
   });
 }
-
 /* ======================================================
    ✅ Helper: obtener Google Calendar desde calendar_tokens usando calendar_id
 ====================================================== */
@@ -2858,7 +2857,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
         calendar.slot_minutes || 30
       );
 
-      slots = filterPastSlots(slots, date, 0);
+      slots = filterPastSlots(slots, 0);
 
       return res.json({
         business: {
@@ -2925,10 +2924,11 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
     }
 
     let slots = Array.from(uniqueMap.values()).sort(
-      (a, b) => new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
+      (a, b) =>
+        new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
     );
 
-    slots = filterPastSlots(slots, date, 0);
+    slots = filterPastSlots(slots, 0);
 
     return res.json({
       business: {
@@ -2945,7 +2945,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 /* ======================================================
    🔔 RECORDATORIOS 24H
 ====================================================== */
