@@ -1683,20 +1683,43 @@ app.post("/appointments/slot", async (req, res) => {
     }
 
     const { data: cal, error: calErr } = await supabase
-      .from("calendars")
-      .select("tenant_id, slot_minutes, buffer_minutes, timezone, is_active")
-      .eq("id", calendar_id)
-      .single();
+  .from("calendars")
+  .select("tenant_id, slot_minutes, buffer_minutes, timezone, is_active")
+  .eq("id", calendar_id)
+  .single();
 
-    if (calErr || !cal) {
-      return res.status(404).json({ error: "Calendario no encontrado" });
-    }
+if (calErr || !cal) {
+  return res.status(404).json({ error: "Calendario no encontrado" });
+}
 
-    if (!cal.is_active) {
-      return res.status(400).json({ error: "Calendario inactivo" });
-    }
+if (!cal.is_active) {
+  return res.status(400).json({ error: "Calendario inactivo" });
+}
 
-    const start = new Date(slot_start);
+const { data: tenantConfig, error: tenantConfigError } = await supabase
+  .from("tenants")
+  .select("min_booking_notice_minutes")
+  .eq("id", cal.tenant_id)
+  .single();
+
+if (tenantConfigError || !tenantConfig) {
+  return res.status(404).json({ error: "Negocio no encontrado" });
+}
+
+const minBookingNoticeMinutes = Number(
+  tenantConfig.min_booking_notice_minutes || 0
+);
+
+const start = new Date(slot_start);
+const minAllowedStart = new Date(
+  Date.now() + minBookingNoticeMinutes * 60 * 1000
+);
+
+if (start.getTime() < minAllowedStart.getTime()) {
+  return res.status(409).json({
+    error: `Este negocio permite reservas con al menos ${minBookingNoticeMinutes} minutos de anticipación.`,
+  });
+}
 // 🔒 Anti doble reserva
 const startIso = start.toISOString();
 
