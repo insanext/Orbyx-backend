@@ -1988,7 +1988,6 @@ app.get("/appointments/by-day/:slug/:date", async (req, res) => {
       .from("appointments")
       .select("*")
       .eq("tenant_id", tenant.id)
-      .eq("status", "booked")
       .gte("start_at", start)
       .lte("start_at", end)
       .order("start_at", { ascending: true });
@@ -2037,7 +2036,6 @@ app.get("/appointments/by-range/:slug", async (req, res) => {
       .from("appointments")
       .select("*")
       .eq("tenant_id", tenant.id)
-      .eq("status", "booked")
       .gte("start_at", start)
       .lte("start_at", end)
       .order("start_at", { ascending: true });
