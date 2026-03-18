@@ -2858,7 +2858,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
         calendar.slot_minutes || 30
       );
 
-slots = filterPastSlots(slots, date, 0);
+      slots = filterPastSlots(slots, date, 0);
 
       return res.json({
         business: {
@@ -2914,19 +2914,21 @@ slots = filterPastSlots(slots, date, 0);
       mergedSlots.push(...staffSlots);
     }
 
-const uniqueMap = new Map();
+    const uniqueMap = new Map();
 
-for (const slot of mergedSlots) {
-  const key = slot.slot_start; // solo por hora, no por staff
+    for (const slot of mergedSlots) {
+      const key = slot.slot_start;
 
-  if (!uniqueMap.has(key)) {
-    uniqueMap.set(key, slot);
-  }
-}
+      if (!uniqueMap.has(key)) {
+        uniqueMap.set(key, slot);
+      }
+    }
 
-let slots = Array.from(uniqueMap.values()).sort(
+    let slots = Array.from(uniqueMap.values()).sort(
+      (a, b) => new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
+    );
 
-slots = filterPastSlots(slots, date, 0);
+    slots = filterPastSlots(slots, date, 0);
 
     return res.json({
       business: {
