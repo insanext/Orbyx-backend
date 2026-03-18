@@ -2656,6 +2656,7 @@ app.get("/public/business/:slug", async (req, res) => {
         instagram_url,
         facebook_url,
         description,
+        min_booking_notice_minutes,
         is_active
       `)
       .eq("slug", slug)
@@ -2697,6 +2698,7 @@ app.get("/public/business/:slug", async (req, res) => {
         instagram_url: tenant.instagram_url,
         facebook_url: tenant.facebook_url,
         description: tenant.description,
+        min_booking_notice_minutes: tenant.min_booking_notice_minutes || 0,
       },
       calendar_id: calendar.id,
       google_connected: Boolean(tokenRow?.id),
