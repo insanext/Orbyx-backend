@@ -1682,7 +1682,8 @@ app.post("/appointments/slot", async (req, res) => {
       });
     }
 
-    const { data: cal, error: calErr } = await supabase
+    
+const { data: cal, error: calErr } = await supabase
   .from("calendars")
   .select("tenant_id, slot_minutes, buffer_minutes, timezone, is_active")
   .eq("id", calendar_id)
@@ -1715,6 +1716,7 @@ const maxBookingDaysAhead = Number(
 );
 
 const start = new Date(slot_start);
+
 const minAllowedStart = new Date(
   Date.now() + minBookingNoticeMinutes * 60 * 1000
 );
@@ -1725,21 +1727,13 @@ if (start.getTime() < minAllowedStart.getTime()) {
   });
 }
 
-const maxAllowedStart = new Date();
-maxAllowedStart.setHours(23, 59, 59, 999);
-maxAllowedStart.setDate(maxAllowedStart.getDate() + maxBookingDaysAhead);
+const maxAllowedBookingStart = new Date();
+maxAllowedBookingStart.setHours(23, 59, 59, 999);
+maxAllowedBookingStart.setDate(
+  maxAllowedBookingStart.getDate() + maxBookingDaysAhead
+);
 
-if (start.getTime() > maxAllowedStart.getTime()) {
-  return res.status(409).json({
-    error: `Este negocio permite reservas con hasta ${maxBookingDaysAhead} días de anticipación.`,
-  });
-}
-
-const maxAllowedStart = new Date();
-maxAllowedStart.setHours(23, 59, 59, 999);
-maxAllowedStart.setDate(maxAllowedStart.getDate() + maxBookingDaysAhead);
-
-if (start.getTime() > maxAllowedStart.getTime()) {
+if (start.getTime() > maxAllowedBookingStart.getTime()) {
   return res.status(409).json({
     error: `Este negocio permite reservas con hasta ${maxBookingDaysAhead} días de anticipación.`,
   });
