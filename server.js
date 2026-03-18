@@ -2086,6 +2086,41 @@ app.get("/appointments", async (req, res) => {
 });
 
 /* ======================================================
+   ✅ PATCH /appointments/:id/status
+====================================================== */
+app.patch("/appointments/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    const allowed = ["booked", "completed", "no_show", "canceled"];
+
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ error: "Estado inválido" });
+    }
+
+    const { data, error } = await supabase
+      .from("appointments")
+      .update({
+        status,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      appointment: data,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    ✅ CANCEL (DELETE y POST compat)
 ====================================================== */
 async function cancelById(id, token, res) {
