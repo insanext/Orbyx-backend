@@ -9,6 +9,40 @@ const { sendBookingEmail } = require("./email");
 
 const app = express();
 
+function getPlanCapabilities(plan) {
+  const plans = {
+    starter: { max_staff: 1 },
+    pro: { max_staff: 3 },
+    premium: { max_staff: 10 },
+    vip: { max_staff: 999 },
+  };
+
+  return plans[plan] || plans.starter;
+}
+
+async function getStaffCount(tenant_id) {
+  const { count, error } = await supabase
+    .from("staff")
+    .select("*", { count: "exact", head: true })
+    .eq("tenant_id", tenant_id);
+
+  if (error) throw error;
+
+  return count || 0;
+}
+
+async function getPlan(tenant_id) {
+  const { data, error } = await supabase
+    .from("tenants")
+    .select("plan_slug, plan")
+    .eq("id", tenant_id)
+    .single();
+
+  if (error) throw error;
+
+  return (data?.plan_slug || data?.plan || "starter").toLowerCase();
+}
+
 /* ======================================================
    ✅ CORS (ROBUSTO)
 ====================================================== */
@@ -1061,6 +1095,17 @@ const payload = {
     return res.status(500).json({ error: "Error creando staff" });
   }
 });
+
+const plan = await getPlan(tenant_id);
+const caps = getPlanCapabilities(plan);
+const staffCount = await getStaffCount(tenant_id);
+
+if (staffCount >= caps.max_staff) {
+  return res.status(403).json({
+    error: "Límite de staff alcanzado",
+    upgrade_required: true,
+  });
+}
 
 /* ======================================================
    ✅ PUT /staff/:id
