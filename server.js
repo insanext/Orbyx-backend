@@ -11,10 +11,10 @@ const app = express();
 
 function getPlanCapabilities(plan) {
   const plans = {
-    starter: { max_staff: 1 },
-    pro: { max_staff: 3 },
-    premium: { max_staff: 10 },
-    vip: { max_staff: 999 },
+    starter: { max_staff: 1, max_services: 3 },
+    pro: { max_staff: 3, max_services: 10 },
+    premium: { max_staff: 10, max_services: 999 },
+    vip: { max_staff: 999, max_services: 999 },
   };
 
   return plans[plan] || plans.starter;
@@ -41,6 +41,17 @@ async function getPlan(tenant_id) {
   if (error) throw error;
 
   return (data?.plan_slug || data?.plan || "starter").toLowerCase();
+}
+
+async function getServicesCount(tenant_id) {
+  const { count, error } = await supabase
+    .from("services")
+    .select("*", { count: "exact", head: true })
+    .eq("tenant_id", tenant_id);
+
+  if (error) throw error;
+
+  return count || 0;
 }
 
 /* ======================================================
@@ -1046,17 +1057,17 @@ app.get("/staff", async (req, res) => {
 ====================================================== */
 app.post("/staff", async (req, res) => {
   try {
-const {
-  tenant_id,
-  name,
-  role,
-  email,
-  phone,
-  color = "#0f172a",
-  is_active = true,
-  sort_order = 0,
-  use_business_hours = true,
-} = req.body;
+    const {
+      tenant_id,
+      name,
+      role,
+      email,
+      phone,
+      color = "#0f172a",
+      is_active = true,
+      sort_order = 0,
+      use_business_hours = true,
+    } = req.body;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -1066,17 +1077,18 @@ const {
       return res.status(400).json({ error: "name es obligatorio" });
     }
 
-const payload = {
-  tenant_id,
-  name: String(name).trim(),
-  role: normalizeNullableText(role),
-  email: normalizeNullableText(email),
-  phone: normalizeNullableText(phone),
-  color: normalizeColor(color),
-  is_active: Boolean(is_active),
-  sort_order: Number(sort_order || 0),
-  use_business_hours: Boolean(use_business_hours),
-};
+
+    const payload = {
+      tenant_id,
+      name: String(name).trim(),
+      role: normalizeNullableText(role),
+      email: normalizeNullableText(email),
+      phone: normalizeNullableText(phone),
+      color: normalizeColor(color),
+      is_active: Boolean(is_active),
+      sort_order: Number(sort_order || 0),
+      use_business_hours: Boolean(use_business_hours),
+    };
 
     const { data, error } = await supabase
       .from("staff")
@@ -1095,18 +1107,6 @@ const payload = {
     return res.status(500).json({ error: "Error creando staff" });
   }
 });
-
-const plan = await getPlan(tenant_id);
-const caps = getPlanCapabilities(plan);
-const staffCount = await getStaffCount(tenant_id);
-
-if (staffCount >= caps.max_staff) {
-  return res.status(403).json({
-    error: "Límite de staff alcanzado",
-    upgrade_required: true,
-  });
-}
-
 /* ======================================================
    ✅ PUT /staff/:id
 ====================================================== */
@@ -2528,6 +2528,17 @@ app.post("/services", async (req, res) => {
         error: "Faltan campos obligatorios: tenant_id, name, duration_minutes",
       });
     }
+
+const plan = await getPlan(tenant_id);
+const caps = getPlanCapabilities(plan);
+const servicesCount = await getServicesCount(tenant_id);
+
+if (servicesCount >= (caps.max_services || 3)) {
+  return res.status(403).json({
+    error: "Límite de servicios alcanzado",
+    upgrade_required: true,
+  });
+}
 
     const { data, error } = await supabase
       .from("services")
