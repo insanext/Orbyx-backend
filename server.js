@@ -2729,21 +2729,22 @@ app.get("/public/business/:slug", async (req, res) => {
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select(`
-        id,
-        name,
-        slug,
-        phone,
-        address,
-        email,
-        whatsapp,
-        instagram_url,
-        facebook_url,
-        description,
-        min_booking_notice_minutes,
-        max_booking_days_ahead,
-        is_active
-      `)
+.select(`
+  id,
+  name,
+  slug,
+  phone,
+  address,
+  email,
+  whatsapp,
+  instagram_url,
+  facebook_url,
+  description,
+  min_booking_notice_minutes,
+  max_booking_days_ahead,
+  is_active,
+  plan_slug
+`)
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
