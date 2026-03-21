@@ -1077,6 +1077,16 @@ app.post("/staff", async (req, res) => {
       return res.status(400).json({ error: "name es obligatorio" });
     }
 
+    const plan = await getPlan(tenant_id);
+    const caps = getPlanCapabilities(plan);
+    const staffCount = await getStaffCount(tenant_id);
+
+    if (staffCount >= caps.max_staff) {
+      return res.status(403).json({
+        error: "Límite de staff alcanzado",
+        upgrade_required: true,
+      });
+    }
 
     const payload = {
       tenant_id,
@@ -1107,6 +1117,8 @@ app.post("/staff", async (req, res) => {
     return res.status(500).json({ error: "Error creando staff" });
   }
 });
+
+
 /* ======================================================
    ✅ PUT /staff/:id
 ====================================================== */
