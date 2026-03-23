@@ -734,6 +734,11 @@ app.get("/oauth2callback", async (req, res) => {
         .eq("id", calendar_id)
         .single();
 
+const resolvedBranchId = await resolveBranchId({
+  tenant_id: cal.tenant_id,
+  branch_id: branch_id || null,
+});
+
       if (calErr || !cal) {
         return res
           .status(404)
@@ -1754,17 +1759,18 @@ app.post("/appointments/slot", async (req, res) => {
   let apptCreated = null;
 
   try {
-    const {
-      calendar_id,
-      service_id,
-      staff_id,
-      date,
-      slot_start,
-      customer_name,
-      customer_phone,
-      customer_email,
-      source = "whatsapp",
-    } = req.body;
+const {
+  calendar_id,
+  branch_id,
+  service_id,
+  staff_id,
+  date,
+  slot_start,
+  customer_name,
+  customer_phone,
+  customer_email,
+  source = "whatsapp",
+} = req.body;
 
     function normalizeChileanPhone(rawPhone) {
       if (!rawPhone) return null;
@@ -1833,6 +1839,11 @@ const { data: cal, error: calErr } = await supabase
   .select("tenant_id, slot_minutes, buffer_minutes, timezone, is_active")
   .eq("id", calendar_id)
   .single();
+
+const resolvedBranchId = await resolveBranchId({
+  tenant_id: cal.tenant_id,
+  branch_id: branch_id || null,
+});
 
 if (calErr || !cal) {
   return res.status(404).json({ error: "Calendario no encontrado" });
@@ -2035,10 +2046,11 @@ if (existingSlot && existingSlot.length > 0) {
     const { data: apptRows, error: insErr } = await supabase
       .from("appointments")
       .insert({
-        tenant_id: cal.tenant_id,
-        calendar_id,
-        service_id,
-        staff_id: staff_id || null,
+  tenant_id: cal.tenant_id,
+  branch_id: resolvedBranchId,
+  calendar_id,
+  service_id,
+  staff_id: staff_id || null,
         service_name_snapshot: serviceName,
         duration_minutes_snapshot: duration,
         customer_name: String(customer_name).trim(),
