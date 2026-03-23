@@ -2859,9 +2859,11 @@ app.delete("/services/:id", async (req, res) => {
 /* ======================================================
    🌐 PUBLIC: servicios por slug
 ====================================================== */
+
 app.get("/public/services/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
+    const { branch_id } = req.query;
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
@@ -2871,6 +2873,22 @@ app.get("/public/services/:slug", async (req, res) => {
 
     if (tenantError || !tenant) {
       return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id: tenant.id,
+      branch_id: branch_id || null,
+    });
+
+    const { data: branch, error: branchError } = await supabase
+      .from("branches")
+      .select("id, tenant_id, name, slug, address, phone, is_active")
+      .eq("id", resolvedBranchId)
+      .eq("tenant_id", tenant.id)
+      .single();
+
+    if (branchError || !branch || !branch.is_active) {
+      return res.status(404).json({ error: "Sucursal no encontrada" });
     }
 
     const { data: calendar, error: calendarError } = await supabase
@@ -2890,6 +2908,7 @@ app.get("/public/services/:slug", async (req, res) => {
       .from("services")
       .select("*")
       .eq("tenant_id", tenant.id)
+      .eq("branch_id", resolvedBranchId)
       .eq("active", true)
       .is("deleted_at", null)
       .order("created_at", { ascending: true });
@@ -2900,6 +2919,7 @@ app.get("/public/services/:slug", async (req, res) => {
 
     return res.json({
       business: tenant,
+      branch,
       calendar_id: calendar.id,
       services: services || [],
     });
@@ -2970,9 +2990,11 @@ app.get("/public/business/:slug", async (req, res) => {
 /* ======================================================
    🌐 PUBLIC: staff por slug + service_id
 ====================================================== */
+
 app.get("/public/staff/:slug/:service_id", async (req, res) => {
   try {
     const { slug, service_id } = req.params;
+    const { branch_id } = req.query;
 
     if (!slug || !service_id) {
       return res.status(400).json({
@@ -2991,11 +3013,28 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
       return res.status(404).json({ error: "negocio no encontrado" });
     }
 
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id: tenant.id,
+      branch_id: branch_id || null,
+    });
+
+    const { data: branch, error: branchError } = await supabase
+      .from("branches")
+      .select("id, tenant_id, name, slug, is_active")
+      .eq("id", resolvedBranchId)
+      .eq("tenant_id", tenant.id)
+      .single();
+
+    if (branchError || !branch || !branch.is_active) {
+      return res.status(404).json({ error: "sucursal no encontrada" });
+    }
+
     const { data: service, error: serviceError } = await supabase
       .from("services")
-      .select("id, tenant_id, active, deleted_at")
+      .select("id, tenant_id, branch_id, active, deleted_at")
       .eq("id", service_id)
       .eq("tenant_id", tenant.id)
+      .eq("branch_id", resolvedBranchId)
       .eq("active", true)
       .is("deleted_at", null)
       .single();
@@ -3008,6 +3047,7 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
       .from("staff_services")
       .select("staff_id")
       .eq("tenant_id", tenant.id)
+      .eq("branch_id", resolvedBranchId)
       .eq("service_id", service_id);
 
     if (relationsError) {
@@ -3023,6 +3063,7 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
           name: tenant.name,
           slug: tenant.slug,
         },
+        branch,
         service_id,
         total: 0,
         staff: [],
@@ -3033,6 +3074,7 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
       .from("staff")
       .select("id, name, role, color, is_active, sort_order")
       .eq("tenant_id", tenant.id)
+      .eq("branch_id", resolvedBranchId)
       .eq("is_active", true)
       .in("id", staffIds)
       .order("sort_order", { ascending: true })
@@ -3048,6 +3090,7 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
         name: tenant.name,
         slug: tenant.slug,
       },
+      branch,
       service_id,
       total: staffRows?.length || 0,
       staff: staffRows || [],
@@ -3064,7 +3107,7 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
 app.get("/public/slots/:slug/:service_id", async (req, res) => {
   try {
     const { slug, service_id } = req.params;
-    const { date, staff_id } = req.query;
+    const { date, staff_id, branch_id } = req.query;
 
     if (!slug || !service_id || !date) {
       return res.status(400).json({
@@ -3085,6 +3128,22 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       return res.status(404).json({ error: "negocio no encontrado" });
     }
 
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id: tenant.id,
+      branch_id: branch_id || null,
+    });
+
+    const { data: branch, error: branchError } = await supabase
+      .from("branches")
+      .select("id, tenant_id, name, slug, address, phone, is_active")
+      .eq("id", resolvedBranchId)
+      .eq("tenant_id", tenant.id)
+      .single();
+
+    if (branchError || !branch || !branch.is_active) {
+      return res.status(404).json({ error: "sucursal no encontrada" });
+    }
+
     const minBookingNoticeMinutes = Number(
       tenant.min_booking_notice_minutes || 0
     );
@@ -3101,6 +3160,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
           name: tenant.name,
           slug: tenant.slug,
         },
+        branch,
         calendar_id: null,
         service: null,
         date,
@@ -3114,6 +3174,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       .select("*")
       .eq("id", service_id)
       .eq("tenant_id", tenant.id)
+      .eq("branch_id", resolvedBranchId)
       .eq("active", true)
       .is("deleted_at", null)
       .single();
@@ -3137,6 +3198,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 
     const serviceStaffIds = await getServiceStaffIds({
       tenant_id: tenant.id,
+      branch_id: resolvedBranchId,
       service_id,
     });
 
@@ -3154,12 +3216,27 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 
     const businessWindows = await getBusinessAvailabilityWindows({
       tenant_id: tenant.id,
+      branch_id: resolvedBranchId,
       date,
     });
 
     if (!candidateStaffIds.length) {
       let slots = buildSlotsFromWindows(
         businessWindows,
+        date,
+        calendar.slot_minutes || 30
+      );
+
+      slots = await subtractAppointmentsFromWindows({
+        tenant_id: tenant.id,
+        branch_id: resolvedBranchId,
+        staff_id: null,
+        date,
+        windows: businessWindows,
+      });
+
+      slots = buildSlotsFromWindows(
+        slots,
         date,
         calendar.slot_minutes || 30
       );
@@ -3182,6 +3259,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
           name: tenant.name,
           slug: tenant.slug,
         },
+        branch,
         calendar_id: calendar.id,
         service,
         date,
@@ -3195,6 +3273,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
     for (const currentStaffId of candidateStaffIds) {
       const staffWindows = await getStaffAvailabilityWindows({
         tenant_id: tenant.id,
+        branch_id: resolvedBranchId,
         staff_id: currentStaffId,
         date,
       });
@@ -3203,6 +3282,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 
       finalWindows = await subtractAppointmentsFromWindows({
         tenant_id: tenant.id,
+        branch_id: resolvedBranchId,
         staff_id: currentStaffId,
         date,
         windows: finalWindows,
@@ -3234,7 +3314,9 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
     const uniqueMap = new Map();
 
     for (const slot of mergedSlots) {
-      const key = slot.slot_start;
+      const key = slot.staff_id
+        ? `${slot.slot_start}_${slot.staff_id}`
+        : slot.slot_start;
 
       if (!uniqueMap.has(key)) {
         uniqueMap.set(key, slot);
@@ -3253,6 +3335,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
         name: tenant.name,
         slug: tenant.slug,
       },
+      branch,
       calendar_id: calendar.id,
       service,
       date,
@@ -3263,7 +3346,6 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 /* ======================================================
    🔔 RECORDATORIOS 24H
