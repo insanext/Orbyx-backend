@@ -103,6 +103,56 @@ const oAuth2Client = new google.auth.OAuth2(
   REDIRECT_URI
 );
 
+async function getMainBranchByTenantId(tenant_id) {
+  const { data, error } = await supabase
+    .from("branches")
+    .select("id, tenant_id, name, slug, is_active, created_at")
+    .eq("tenant_id", tenant_id)
+    .eq("is_active", true)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .single();
+
+  if (error || !data) {
+    throw new Error(`No se encontró sucursal activa para tenant_id=${tenant_id}`);
+  }
+
+  return data;
+}
+
+async function getBranchById(branch_id) {
+  const { data, error } = await supabase
+    .from("branches")
+    .select("id, tenant_id, name, slug, address, phone, is_active, created_at")
+    .eq("id", branch_id)
+    .single();
+
+  if (error || !data) {
+    throw new Error(`Sucursal no encontrada para branch_id=${branch_id}`);
+  }
+
+  return data;
+}
+
+async function resolveBranchId({ tenant_id, branch_id }) {
+  if (branch_id) {
+    const branch = await getBranchById(branch_id);
+
+    if (branch.tenant_id !== tenant_id) {
+      throw new Error("La sucursal no pertenece al tenant enviado");
+    }
+
+    if (!branch.is_active) {
+      throw new Error("La sucursal está inactiva");
+    }
+
+    return branch.id;
+  }
+
+  const mainBranch = await getMainBranchByTenantId(tenant_id);
+  return mainBranch.id;
+}
+
 console.log("✅ Iniciado sin token.json. Tokens se leerán desde Supabase.");
 console.log("🔥 VERSION: SAAS_TOKEN_BY_CALENDAR_ID + OAUTH REDIRECT TO FRONTEND");
 
@@ -1022,16 +1072,22 @@ function normalizeColor(value) {
 ====================================================== */
 app.get("/staff", async (req, res) => {
   try {
-    const { tenant_id, active } = req.query;
+    const { tenant_id, branch_id, active } = req.query;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
     }
 
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id,
+      branch_id: branch_id || null,
+    });
+
     let query = supabase
       .from("staff")
       .select("*")
       .eq("tenant_id", tenant_id)
+      .eq("branch_id", resolvedBranchId)
       .order("sort_order", { ascending: true })
       .order("created_at", { ascending: true });
 
@@ -1044,21 +1100,24 @@ app.get("/staff", async (req, res) => {
 
     return res.json({
       total: data?.length || 0,
+      branch_id: resolvedBranchId,
       staff: data || [],
     });
   } catch (err) {
     console.error("GET /staff error:", err.message);
-    return res.status(500).json({ error: "Error obteniendo staff" });
+    return res.status(500).json({ error: err.message || "Error obteniendo staff" });
   }
 });
 
 /* ======================================================
    ✅ POST /staff
 ====================================================== */
+
 app.post("/staff", async (req, res) => {
   try {
     const {
       tenant_id,
+      branch_id,
       name,
       role,
       email,
@@ -1077,6 +1136,11 @@ app.post("/staff", async (req, res) => {
       return res.status(400).json({ error: "name es obligatorio" });
     }
 
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id,
+      branch_id: branch_id || null,
+    });
+
     const plan = await getPlan(tenant_id);
     const caps = getPlanCapabilities(plan);
     const staffCount = await getStaffCount(tenant_id);
@@ -1090,6 +1154,7 @@ app.post("/staff", async (req, res) => {
 
     const payload = {
       tenant_id,
+      branch_id: resolvedBranchId,
       name: String(name).trim(),
       role: normalizeNullableText(role),
       email: normalizeNullableText(email),
@@ -1114,18 +1179,20 @@ app.post("/staff", async (req, res) => {
     });
   } catch (err) {
     console.error("POST /staff error:", err.message);
-    return res.status(500).json({ error: "Error creando staff" });
+    return res.status(500).json({ error: err.message || "Error creando staff" });
   }
 });
-
 
 /* ======================================================
    ✅ PUT /staff/:id
 ====================================================== */
+
 app.put("/staff/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const {
+      tenant_id,
+      branch_id,
       name,
       role,
       email,
@@ -1140,7 +1207,28 @@ app.put("/staff/:id", async (req, res) => {
       return res.status(400).json({ error: "id es obligatorio" });
     }
 
+    const { data: existingStaff, error: existingError } = await supabase
+      .from("staff")
+      .select("id, tenant_id, branch_id")
+      .eq("id", id)
+      .single();
+
+    if (existingError || !existingStaff) {
+      return res.status(404).json({ error: "Staff no encontrado" });
+    }
+
+    const effectiveTenantId = tenant_id || existingStaff.tenant_id;
+
     const updateData = {};
+
+    if (branch_id !== undefined) {
+      const resolvedBranchId = await resolveBranchId({
+        tenant_id: effectiveTenantId,
+        branch_id: branch_id || null,
+      });
+
+      updateData.branch_id = resolvedBranchId;
+    }
 
     if (name !== undefined) {
       if (!String(name).trim()) {
@@ -1174,7 +1262,7 @@ app.put("/staff/:id", async (req, res) => {
     });
   } catch (err) {
     console.error("PUT /staff/:id error:", err.message);
-    return res.status(500).json({ error: "Error actualizando staff" });
+    return res.status(500).json({ error: err.message || "Error actualizando staff" });
   }
 });
 
