@@ -2569,18 +2569,25 @@ app.patch("/tenants/:id", async (req, res) => {
 /* ======================================================
    ✅ GET /services
 ====================================================== */
+
 app.get("/services", async (req, res) => {
   try {
-    const { tenant_id, active } = req.query;
+    const { tenant_id, branch_id, active } = req.query;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
     }
 
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id,
+      branch_id: branch_id || null,
+    });
+
     let query = supabase
       .from("services")
       .select("*")
       .eq("tenant_id", tenant_id)
+      .eq("branch_id", resolvedBranchId)
       .is("deleted_at", null)
       .order("created_at", { ascending: true });
 
@@ -2600,6 +2607,7 @@ app.get("/services", async (req, res) => {
 
     return res.json({
       total: data?.length || 0,
+      branch_id: resolvedBranchId,
       services: data || [],
     });
   } catch (err) {
@@ -2610,10 +2618,12 @@ app.get("/services", async (req, res) => {
 /* ======================================================
    ✅ POST /services
 ====================================================== */
+
 app.post("/services", async (req, res) => {
   try {
     const {
       tenant_id,
+      branch_id,
       name,
       description,
       duration_minutes,
@@ -2629,21 +2639,27 @@ app.post("/services", async (req, res) => {
       });
     }
 
-const plan = await getPlan(tenant_id);
-const caps = getPlanCapabilities(plan);
-const servicesCount = await getServicesCount(tenant_id);
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id,
+      branch_id: branch_id || null,
+    });
 
-if (servicesCount >= (caps.max_services || 3)) {
-  return res.status(403).json({
-    error: "Límite de servicios alcanzado",
-    upgrade_required: true,
-  });
-}
+    const plan = await getPlan(tenant_id);
+    const caps = getPlanCapabilities(plan);
+    const servicesCount = await getServicesCount(tenant_id);
+
+    if (servicesCount >= (caps.max_services || 3)) {
+      return res.status(403).json({
+        error: "Límite de servicios alcanzado",
+        upgrade_required: true,
+      });
+    }
 
     const { data, error } = await supabase
       .from("services")
       .insert({
         tenant_id,
+        branch_id: resolvedBranchId,
         name: String(name).trim(),
         description: description ? String(description).trim() : null,
         duration_minutes: Number(duration_minutes),
@@ -2668,14 +2684,18 @@ if (servicesCount >= (caps.max_services || 3)) {
   }
 });
 
+
 /* ======================================================
    ✏️ PATCH /services/:id
 ====================================================== */
+
 app.patch("/services/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
     const {
+      tenant_id,
+      branch_id,
       name,
       description,
       duration_minutes,
@@ -2689,7 +2709,28 @@ app.patch("/services/:id", async (req, res) => {
       return res.status(400).json({ error: "id es obligatorio" });
     }
 
+    const { data: existingService, error: existingError } = await supabase
+      .from("services")
+      .select("id, tenant_id, branch_id")
+      .eq("id", id)
+      .single();
+
+    if (existingError || !existingService) {
+      return res.status(404).json({ error: "Servicio no encontrado" });
+    }
+
+    const effectiveTenantId = tenant_id || existingService.tenant_id;
+
     const updateData = {};
+
+    if (branch_id !== undefined) {
+      const resolvedBranchId = await resolveBranchId({
+        tenant_id: effectiveTenantId,
+        branch_id: branch_id || null,
+      });
+
+      updateData.branch_id = resolvedBranchId;
+    }
 
     if (name !== undefined) updateData.name = String(name).trim();
     if (description !== undefined)
@@ -2723,6 +2764,7 @@ app.patch("/services/:id", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
 
 /* ======================================================
    🗑️ DELETE /services/:id
