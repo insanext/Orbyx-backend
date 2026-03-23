@@ -254,13 +254,19 @@ function buildSlotsFromWindows(windows, date, slotMinutes) {
   return slots;
 }
 
-async function getStaffAvailabilityWindows({ tenant_id, staff_id, date }) {
+async function getStaffAvailabilityWindows({
+  tenant_id,
+  branch_id,
+  staff_id,
+  date,
+}) {
   const weekday = parseDateToWeekday(date);
 
   const { data: staffRow, error: staffError } = await supabase
     .from("staff")
-    .select("id, tenant_id, use_business_hours, is_active")
+    .select("id, tenant_id, branch_id, use_business_hours, is_active")
     .eq("tenant_id", tenant_id)
+    .eq("branch_id", branch_id)
     .eq("id", staff_id)
     .single();
 
@@ -275,6 +281,7 @@ async function getStaffAvailabilityWindows({ tenant_id, staff_id, date }) {
   if (staffRow.use_business_hours) {
     const businessWindows = await getBusinessAvailabilityWindows({
       tenant_id,
+      branch_id,
       date,
     });
 
@@ -284,6 +291,7 @@ async function getStaffAvailabilityWindows({ tenant_id, staff_id, date }) {
       .from("staff_hours")
       .select("*")
       .eq("tenant_id", tenant_id)
+      .eq("branch_id", branch_id)
       .eq("staff_id", staff_id)
       .eq("day_of_week", weekday);
 
@@ -309,6 +317,7 @@ async function getStaffAvailabilityWindows({ tenant_id, staff_id, date }) {
     .from("staff_special_dates")
     .select("*")
     .eq("tenant_id", tenant_id)
+    .eq("branch_id", branch_id)
     .eq("staff_id", staff_id)
     .eq("date", date)
     .order("created_at", { ascending: true });
@@ -358,6 +367,7 @@ async function getStaffAvailabilityWindows({ tenant_id, staff_id, date }) {
 
 async function subtractAppointmentsFromWindows({
   tenant_id,
+  branch_id,
   staff_id,
   date,
   windows,
@@ -369,6 +379,7 @@ async function subtractAppointmentsFromWindows({
     .from("appointments")
     .select("id, start_at, end_at, staff_id, status")
     .eq("tenant_id", tenant_id)
+    .eq("branch_id", branch_id)
     .eq("status", "booked")
     .gte("start_at", start)
     .lte("start_at", end)
@@ -396,11 +407,12 @@ async function subtractAppointmentsFromWindows({
   return result;
 }
 
-async function getServiceStaffIds({ tenant_id, service_id }) {
+async function getServiceStaffIds({ tenant_id, branch_id, service_id }) {
   const { data, error } = await supabase
     .from("staff_services")
     .select("staff_id")
     .eq("tenant_id", tenant_id)
+    .eq("branch_id", branch_id)
     .eq("service_id", service_id);
 
   if (error) throw error;
@@ -408,13 +420,14 @@ async function getServiceStaffIds({ tenant_id, service_id }) {
   return [...new Set((data || []).map((row) => row.staff_id).filter(Boolean))];
 }
 
-async function getBusinessAvailabilityWindows({ tenant_id, date }) {
+async function getBusinessAvailabilityWindows({ tenant_id, branch_id, date }) {
   const weekday = parseDateToWeekday(date);
 
   const { data: weeklyRows, error: weeklyError } = await supabase
     .from("business_hours")
     .select("*")
     .eq("tenant_id", tenant_id)
+    .eq("branch_id", branch_id)
     .eq("day_of_week", weekday);
 
   if (weeklyError) throw weeklyError;
@@ -440,6 +453,7 @@ async function getBusinessAvailabilityWindows({ tenant_id, date }) {
     .from("business_special_dates")
     .select("*")
     .eq("tenant_id", tenant_id)
+    .eq("branch_id", branch_id)
     .eq("date", date)
     .order("created_at", { ascending: true });
 
@@ -461,7 +475,9 @@ async function getBusinessAvailabilityWindows({ tenant_id, date }) {
       start: timeToMinutes(row.start_time),
       end: timeToMinutes(row.end_time),
     }))
-    .filter((row) => row.start !== null && row.end !== null && row.end > row.start);
+    .filter(
+      (row) => row.start !== null && row.end !== null && row.end > row.start
+    );
 
   if (openWindows.length > 0) {
     windows = openWindows;
@@ -473,54 +489,15 @@ async function getBusinessAvailabilityWindows({ tenant_id, date }) {
       start: timeToMinutes(row.start_time),
       end: timeToMinutes(row.end_time),
     }))
-    .filter((row) => row.start !== null && row.end !== null && row.end > row.start);
+    .filter(
+      (row) => row.start !== null && row.end !== null && row.end > row.start
+    );
 
   for (const blocked of partialClosedWindows) {
     windows = subtractRange(windows, blocked.start, blocked.end);
   }
 
   return windows.sort((a, b) => a.start - b.start);
-}
-
-function filterSlotsByWindows(slots, windows, date) {
-  if (!Array.isArray(slots) || slots.length === 0) return [];
-  if (!Array.isArray(windows) || windows.length === 0) return [];
-
-  return slots.filter((slot) => {
-    const startMinutes = isoToMinutesInDate(slot.slot_start, date);
-    const endMinutes = isoToMinutesInDate(slot.slot_end, date);
-
-    if (startMinutes === null || endMinutes === null) return false;
-
-    return windows.some(
-      (window) => startMinutes >= window.start && endMinutes <= window.end
-    );
-  });
-}
-
-function filterSlotsForServiceDuration(slots, totalMinutes, baseSlotMinutes) {
-  if (!Array.isArray(slots) || slots.length === 0) return [];
-  if (!totalMinutes || totalMinutes <= 0) return slots;
-
-  const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
-
-  if (neededBlocks <= 1) return slots;
-
-  return slots.filter((slot, index) => {
-    for (let i = 1; i < neededBlocks; i++) {
-      const current = slots[index + i - 1];
-      const next = slots[index + i];
-
-      if (!current || !next) return false;
-
-      const currentEnd = new Date(current.slot_end).toISOString();
-      const nextStart = new Date(next.slot_start).toISOString();
-
-      if (currentEnd !== nextStart) return false;
-    }
-
-    return true;
-  });
 }
 
 function filterPastSlots(slots, minNoticeMinutes = 0) {
@@ -1662,31 +1639,15 @@ app.delete("/staff-special-dates/:id", async (req, res) => {
 /* ======================================================
    🔹 ENDPOINT: /slots
 ====================================================== */
+
 app.get("/slots", async (req, res) => {
   try {
-    const { calendar_id, service_id, date } = req.query;
+    const { calendar_id, branch_id, service_id, date } = req.query;
 
     if (!calendar_id || !date) {
       return res.status(400).json({
         error: "Faltan parámetros: calendar_id y date (YYYY-MM-DD)",
       });
-    }
-
-    let service = null;
-
-    if (service_id) {
-      const { data: serviceData, error: serviceError } = await supabase
-        .from("services")
-        .select("*")
-        .eq("id", service_id)
-        .is("deleted_at", null)
-        .single();
-
-      if (serviceError || !serviceData) {
-        return res.status(404).json({ error: "Servicio no encontrado" });
-      }
-
-      service = serviceData;
     }
 
     const { data: cal, error: calErr } = await supabase
@@ -1703,6 +1664,30 @@ app.get("/slots", async (req, res) => {
       return res.status(400).json({ error: "Calendario inactivo" });
     }
 
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id: cal.tenant_id,
+      branch_id: branch_id || null,
+    });
+
+    let service = null;
+
+    if (service_id) {
+      const { data: serviceData, error: serviceError } = await supabase
+        .from("services")
+        .select("*")
+        .eq("id", service_id)
+        .eq("tenant_id", cal.tenant_id)
+        .eq("branch_id", resolvedBranchId)
+        .is("deleted_at", null)
+        .single();
+
+      if (serviceError || !serviceData) {
+        return res.status(404).json({ error: "Servicio no encontrado" });
+      }
+
+      service = serviceData;
+    }
+
     const { data, error } = await supabase.rpc("get_available_slots", {
       _calendar_id: calendar_id,
       _day: date,
@@ -1714,10 +1699,25 @@ app.get("/slots", async (req, res) => {
 
     const windows = await getBusinessAvailabilityWindows({
       tenant_id: cal.tenant_id,
+      branch_id: resolvedBranchId,
       date,
     });
 
     let slots = filterSlotsByWindows(data || [], windows, date);
+
+    const windowsWithoutAppointments = await subtractAppointmentsFromWindows({
+      tenant_id: cal.tenant_id,
+      branch_id: resolvedBranchId,
+      staff_id: null,
+      date,
+      windows: windows,
+    });
+
+    slots = buildSlotsFromWindows(
+      windowsWithoutAppointments,
+      date,
+      cal.slot_minutes || 30
+    );
 
     if (service && slots.length > 0) {
       const totalMinutes =
@@ -1736,6 +1736,7 @@ app.get("/slots", async (req, res) => {
 
     return res.json({
       calendar_id,
+      branch_id: resolvedBranchId,
       service_id: service_id || null,
       service,
       date,
@@ -1743,6 +1744,7 @@ app.get("/slots", async (req, res) => {
       slots,
     });
   } catch (err) {
+    console.error("GET /slots error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
