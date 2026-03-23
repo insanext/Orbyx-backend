@@ -500,6 +500,48 @@ async function getBusinessAvailabilityWindows({ tenant_id, branch_id, date }) {
   return windows.sort((a, b) => a.start - b.start);
 }
 
+function filterSlotsByWindows(slots, windows, date) {
+  if (!Array.isArray(slots) || slots.length === 0) return [];
+  if (!Array.isArray(windows) || windows.length === 0) return [];
+
+  return slots.filter((slot) => {
+    const startMinutes = isoToMinutesInDate(slot.slot_start, date);
+    const endMinutes = isoToMinutesInDate(slot.slot_end, date);
+
+    if (startMinutes === null || endMinutes === null) return false;
+
+    return windows.some(
+      (window) => startMinutes >= window.start && endMinutes <= window.end
+    );
+  });
+}
+
+function filterSlotsForServiceDuration(slots, totalMinutes, baseSlotMinutes) {
+  if (!Array.isArray(slots) || slots.length === 0) return [];
+  if (!totalMinutes || totalMinutes <= 0) return slots;
+
+  const neededBlocks = Math.ceil(totalMinutes / baseSlotMinutes);
+
+  if (neededBlocks <= 1) return slots;
+
+  return slots.filter((slot, index) => {
+    for (let i = 1; i < neededBlocks; i++) {
+      const current = slots[index + i - 1];
+      const next = slots[index + i];
+
+      if (!current || !next) return false;
+
+      const currentEnd = new Date(current.slot_end).toISOString();
+      const nextStart = new Date(next.slot_start).toISOString();
+
+      if (currentEnd !== nextStart) return false;
+    }
+
+    return true;
+  });
+}
+
+
 function filterPastSlots(slots, minNoticeMinutes = 0) {
   if (!Array.isArray(slots) || slots.length === 0) return [];
 
