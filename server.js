@@ -728,16 +728,11 @@ app.get("/oauth2callback", async (req, res) => {
     if (state?.calendar_id) {
       const calendar_id = state.calendar_id;
 
-      const { data: cal, error: calErr } = await supabase
-        .from("calendars")
-        .select("tenant_id")
-        .eq("id", calendar_id)
-        .single();
-
-const resolvedBranchId = await resolveBranchId({
-  tenant_id: cal.tenant_id,
-  branch_id: branch_id || null,
-});
+const { data: cal, error: calErr } = await supabase
+  .from("calendars")
+  .select("tenant_id")
+  .eq("id", calendar_id)
+  .single();
 
       if (calErr || !cal) {
         return res
@@ -1840,11 +1835,6 @@ const { data: cal, error: calErr } = await supabase
   .eq("id", calendar_id)
   .single();
 
-const resolvedBranchId = await resolveBranchId({
-  tenant_id: cal.tenant_id,
-  branch_id: branch_id || null,
-});
-
 if (calErr || !cal) {
   return res.status(404).json({ error: "Calendario no encontrado" });
 }
@@ -1852,6 +1842,11 @@ if (calErr || !cal) {
 if (!cal.is_active) {
   return res.status(400).json({ error: "Calendario inactivo" });
 }
+
+const resolvedBranchId = await resolveBranchId({
+  tenant_id: cal.tenant_id,
+  branch_id: branch_id || null,
+});
 
 const { data: tenantConfig, error: tenantConfigError } = await supabase
   .from("tenants")
