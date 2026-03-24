@@ -2616,6 +2616,34 @@ app.patch("/tenants/:id", async (req, res) => {
   }
 });
 
+/* ======================================================
+   ✅ GET /branches
+====================================================== */
+app.get("/branches", async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    const { data, error } = await supabase
+      .from("branches")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: true });
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      branches: data || [],
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 
 /* ======================================================
    ✅ GET /services
