@@ -2619,31 +2619,40 @@ app.patch("/tenants/:id", async (req, res) => {
 /* ======================================================
    ✅ GET /branches
 ====================================================== */
-app.get("/branches", async (req, res) => {
+app.post("/branches", async (req, res) => {
   try {
-    const { tenant_id } = req.query;
+    const { tenant_id, name } = req.body;
 
-    if (!tenant_id) {
-      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    if (!tenant_id || !name) {
+      return res.status(400).json({
+        error: "tenant_id y name son obligatorios",
+      });
     }
 
     const { data, error } = await supabase
       .from("branches")
-      .select("*")
-      .eq("tenant_id", tenant_id)
-      .order("created_at", { ascending: true });
+      .insert({
+        tenant_id,
+        name: String(name).trim(),
+        is_active: true,
+      })
+      .select()
+      .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error("ERROR SUPABASE:", error);
+      return res.status(500).json({ error: error.message });
+    }
 
-    return res.json({
-      total: data?.length || 0,
-      branches: data || [],
+    return res.status(201).json({
+      ok: true,
+      branch: data,
     });
   } catch (err) {
+    console.error("ERROR SERVER:", err);
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 /* ======================================================
    ✅ GET /services
