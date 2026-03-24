@@ -2619,6 +2619,35 @@ app.patch("/tenants/:id", async (req, res) => {
 /* ======================================================
    ✅ GET /branches
 ====================================================== */
+app.get("/branches", async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    const { data, error } = await supabase
+      .from("branches")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: true });
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      branches: data || [],
+    });
+  } catch (err) {
+    console.error("GET /branches error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /branches
+====================================================== */
 app.post("/branches", async (req, res) => {
   try {
     const { tenant_id, name } = req.body;
@@ -2640,7 +2669,7 @@ app.post("/branches", async (req, res) => {
       .single();
 
     if (error) {
-      console.error("ERROR SUPABASE:", error);
+      console.error("POST /branches supabase error:", error);
       return res.status(500).json({ error: error.message });
     }
 
@@ -2649,7 +2678,7 @@ app.post("/branches", async (req, res) => {
       branch: data,
     });
   } catch (err) {
-    console.error("ERROR SERVER:", err);
+    console.error("POST /branches server error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
