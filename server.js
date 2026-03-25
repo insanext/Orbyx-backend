@@ -11,10 +11,15 @@ const app = express();
 
 function getPlanCapabilities(plan) {
   const plans = {
-    starter: { max_staff: 1, max_services: 3 },
-    pro: { max_staff: 3, max_services: 10 },
-    premium: { max_staff: 10, max_services: 999 },
-    vip: { max_staff: 999, max_services: 999 },
+    starter: { max_staff: 1, max_services: 3, max_branches: 1 },
+
+    pro: { max_staff: 3, max_services: 10, max_branches: 1 },
+
+    premium: { max_staff: 10, max_services: 25, max_branches: 2 },
+
+    vip: { max_staff: 20, max_services: 50, max_branches: 3 },
+
+    platinum: { max_staff: 50, max_services: 100, max_branches: 10 },
   };
 
   return plans[plan] || plans.starter;
@@ -48,6 +53,18 @@ async function getServicesCount(tenant_id) {
     .from("services")
     .select("*", { count: "exact", head: true })
     .eq("tenant_id", tenant_id);
+
+  if (error) throw error;
+
+  return count || 0;
+}
+
+async function getBranchesCount(tenant_id) {
+  const { count, error } = await supabase
+    .from("branches")
+    .select("*", { count: "exact", head: true })
+    .eq("tenant_id", tenant_id)
+    .eq("is_active", true);
 
   if (error) throw error;
 
@@ -2648,6 +2665,7 @@ app.get("/branches", async (req, res) => {
 /* ======================================================
    ✅ POST /branches
 ====================================================== */
+
 app.post("/branches", async (req, res) => {
   try {
     const { tenant_id, name } = req.body;
@@ -2655,6 +2673,18 @@ app.post("/branches", async (req, res) => {
     if (!tenant_id || !name) {
       return res.status(400).json({
         error: "tenant_id y name son obligatorios",
+      });
+    }
+
+    // 🔥 VALIDACIÓN PLAN (AQUÍ ESTÁ LO NUEVO)
+    const plan = await getPlan(tenant_id);
+    const caps = getPlanCapabilities(plan);
+    const branchesCount = await getBranchesCount(tenant_id);
+
+    if (branchesCount >= caps.max_branches) {
+      return res.status(403).json({
+        error: "Límite de sucursales alcanzado",
+        upgrade_required: true,
       });
     }
 
@@ -3621,6 +3651,94 @@ app.post("/onboarding/setup", async (req, res) => {
     });
   }
 });
+
+/* ======================================================
+   ✅ BOOKING FIELDS CONFIG (NUEVO)
+====================================================== */
+
+/* ======================================================
+   🔹 GET /booking-fields/:slug
+   Obtener configuración de campos dinámicos
+====================================================== */
+app.get("/booking-fields/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const { data, error } = await supabase
+      .from("tenants")
+      .select("id, booking_fields_config")
+      .eq("slug", slug)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    return res.json({
+      booking_fields_config: data.booking_fields_config || [],
+    });
+  } catch (err) {
+    console.error("GET /booking-fields/:slug error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   🔹 PUT /booking-fields/:slug
+   Guardar configuración de campos dinámicos
+====================================================== */
+app.put("/booking-fields/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { booking_fields_config } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    if (!Array.isArray(booking_fields_config)) {
+      return res.status(400).json({
+        error: "booking_fields_config debe ser un arreglo",
+      });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data, error } = await supabase
+      .from("tenants")
+      .update({
+        booking_fields_config,
+      })
+      .eq("id", tenant.id)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({
+      ok: true,
+      booking_fields_config: data.booking_fields_config,
+    });
+  } catch (err) {
+    console.error("PUT /booking-fields/:slug error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 
 /* ======================================================
    🚀 START
