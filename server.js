@@ -2237,15 +2237,24 @@ app.post("/appointments/slot", async (req, res) => {
       `https://www.orbyx.cl/cancel/${apptUpdated.id}?token=${cancelToken}` +
       `&redirect=${encodeURIComponent(bookingUrl)}`;
 
-    if (normalizedEmail) {
-      await sendBookingEmail({
-        email: normalizedEmail,
-        customerName: String(customer_name).trim(),
-        serviceName: serviceName || "Reserva",
-        startAt: start.toISOString(),
-        cancelUrl,
-      });
-    }
+if (normalizedEmail) {
+  const { data: tenantInfo } = await supabase
+    .from("tenants")
+    .select("name, address, phone")
+    .eq("id", cal.tenant_id)
+    .single();
+
+  await sendBookingEmail({
+    email: normalizedEmail,
+    customerName: String(customer_name).trim(),
+    businessName: tenantInfo?.name || "Tu negocio",
+    serviceName: serviceName || "Reserva",
+    startAt: start.toISOString(),
+    cancelUrl,
+    address: tenantInfo?.address || null,
+    phone: tenantInfo?.phone || null,
+  });
+}
 
     return res.status(201).json({
       ok: true,
