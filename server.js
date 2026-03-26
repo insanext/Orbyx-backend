@@ -1,4 +1,4 @@
-// force deploy backend v2
+console.log("BACKEND VERSION 26-03-EMAIL-CANCEL");
 
 // server.js
 require("dotenv").config();
