@@ -28,9 +28,9 @@ async function sendBookingEmail({
     const formattedDate = formatDate(startAt);
 
     const locationHtml = locationText
-      ? `<strong>${
+      ? `<p style="margin:4px 0;"><strong>${
           locationType === "online" ? "Modalidad" : "Ubicación"
-        }:</strong> ${locationText}<br/>`
+        }:</strong> ${locationText}</p>`
       : "";
 
     await resend.emails.send({
@@ -38,26 +38,55 @@ async function sendBookingEmail({
       to: email,
       subject: "Reserva confirmada",
       html: `
-        <h2>Reserva confirmada</h2>
+        <div style="font-family: Arial, sans-serif; background:#f8fafc; padding:30px;">
+          <div style="max-width:520px; margin:0 auto; background:white; border-radius:16px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,0.08);">
 
-        <p>Hola ${customerName}</p>
+            <div style="background:linear-gradient(135deg,#0f172a,#312e81); padding:20px; text-align:center;">
+              <h1 style="color:white; margin:0; font-size:20px;">Orbyx</h1>
+            </div>
 
-        <p>Tu reserva fue agendada:</p>
+            <div style="padding:24px;">
+              <h2 style="margin-top:0; color:#0f172a;">Reserva confirmada ✅</h2>
 
-        <p>
-        <strong>Servicio:</strong> ${serviceName}<br/>
-        <strong>Fecha:</strong> ${formattedDate}<br/>
-        ${locationHtml}
-        </p>
+              <p style="color:#334155;">Hola <strong>${customerName}</strong>,</p>
 
-        <p style="margin-top:20px;">
-          <a href="${cancelUrl}" 
-          style="background:black;color:white;padding:10px 16px;border-radius:6px;text-decoration:none;">
-          Cancelar reserva
-          </a>
-        </p>
+              <p style="color:#334155;">
+                Tu hora fue agendada correctamente.
+              </p>
 
-        <p>Equipo Orbyx</p>
+              <div style="margin-top:16px; padding:16px; border-radius:12px; background:#f1f5f9;">
+                <p style="margin:4px 0;"><strong>Servicio:</strong> ${serviceName}</p>
+                <p style="margin:4px 0;"><strong>Fecha:</strong> ${formattedDate}</p>
+                ${locationHtml}
+              </div>
+
+              <div style="margin-top:24px; text-align:center;">
+                <a
+                  href="${cancelUrl}"
+                  style="
+                    display:inline-block;
+                    background:#0f172a;
+                    color:white;
+                    padding:12px 20px;
+                    border-radius:10px;
+                    text-decoration:none;
+                    font-weight:bold;
+                  "
+                >
+                  Cancelar reserva
+                </a>
+              </div>
+
+              <p style="margin-top:24px; font-size:13px; color:#64748b;">
+                Si necesitas reagendar, puedes cancelar tu reserva y elegir un nuevo horario.
+              </p>
+            </div>
+
+            <div style="padding:16px; text-align:center; font-size:12px; color:#94a3b8;">
+              © Orbyx · Sistema de reservas inteligentes
+            </div>
+          </div>
+        </div>
       `,
     });
   } catch (error) {
