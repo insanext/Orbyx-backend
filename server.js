@@ -2465,9 +2465,13 @@ async function cancelById(id, token, res) {
 
   const st = String(appt.status).toLowerCase();
 
-  if (st === "canceled" || st === "cancelled") {
-    return res.json({ ok: true, canceled: true, appointment: appt });
-  }
+if (st === "canceled" || st === "cancelled") {
+  return res.status(409).json({
+    error: "Esta reserva ya fue cancelada previamente.",
+    already_canceled: true,
+    appointment: appt,
+  });
+}
 
   if (appt.event_id) {
     try {
