@@ -189,18 +189,32 @@ function timeToMinutes(value) {
 }
 
 function isoToMinutesInDate(iso, dateStr) {
+  if (!iso || !dateStr) return null;
+
   const d = new Date(iso);
 
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  const localDate = `${yyyy}-${mm}-${dd}`;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Santiago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(d);
+
+  const map = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value])
+  );
+
+  const localDate = `${map.year}-${map.month}-${map.day}`;
 
   if (localDate !== dateStr) return null;
 
-  return d.getHours() * 60 + d.getMinutes();
+  return Number(map.hour) * 60 + Number(map.minute);
 }
-
 function subtractRange(windows, blockStart, blockEnd) {
   const result = [];
 
