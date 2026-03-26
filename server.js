@@ -1811,6 +1811,7 @@ app.get("/slots", async (req, res) => {
 /* ======================================================
    ✅ POST /appointments/slot
 ====================================================== */
+
 app.post("/appointments/slot", async (req, res) => {
   let apptCreated = null;
 
@@ -1957,6 +1958,7 @@ app.post("/appointments/slot", async (req, res) => {
       .from("appointments")
       .select("id")
       .eq("tenant_id", cal.tenant_id)
+      .eq("branch_id", resolvedBranchId)
       .eq("start_at", startIso)
       .eq("status", "booked");
 
@@ -2008,6 +2010,8 @@ app.post("/appointments/slot", async (req, res) => {
         .from("services")
         .select("*")
         .eq("id", service_id)
+        .eq("tenant_id", cal.tenant_id)
+        .eq("branch_id", resolvedBranchId)
         .is("deleted_at", null)
         .single();
 
@@ -2031,11 +2035,13 @@ app.post("/appointments/slot", async (req, res) => {
     if (staff_id) {
       const businessWindows = await getBusinessAvailabilityWindows({
         tenant_id: cal.tenant_id,
+        branch_id: resolvedBranchId,
         date: slotDateStr,
       });
 
       const staffWindows = await getStaffAvailabilityWindows({
         tenant_id: cal.tenant_id,
+        branch_id: resolvedBranchId,
         staff_id,
         date: slotDateStr,
       });
@@ -2044,12 +2050,17 @@ app.post("/appointments/slot", async (req, res) => {
 
       finalWindows = await subtractAppointmentsFromWindows({
         tenant_id: cal.tenant_id,
+        branch_id: resolvedBranchId,
         staff_id,
         date: slotDateStr,
         windows: finalWindows,
       });
 
-      validSlots = buildSlotsFromWindows(finalWindows, slotDateStr, slotMinutes);
+      validSlots = buildSlotsFromWindows(
+        finalWindows,
+        slotDateStr,
+        slotMinutes
+      );
 
       validSlots = filterSlotsForServiceDuration(
         validSlots,
@@ -2074,6 +2085,7 @@ app.post("/appointments/slot", async (req, res) => {
 
       const windows = await getBusinessAvailabilityWindows({
         tenant_id: cal.tenant_id,
+        branch_id: resolvedBranchId,
         date,
       });
 
@@ -2244,13 +2256,6 @@ app.post("/appointments/slot", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
-function formatDateForServer(date) {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
 
 /* ======================================================
    ✅ GET /appointments/by-day/:slug/:date
