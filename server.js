@@ -1815,18 +1815,18 @@ app.post("/appointments/slot", async (req, res) => {
   let apptCreated = null;
 
   try {
-const {
-  calendar_id,
-  branch_id,
-  service_id,
-  staff_id,
-  date,
-  slot_start,
-  customer_name,
-  customer_phone,
-  customer_email,
-  source = "whatsapp",
-} = req.body;
+    const {
+      calendar_id,
+      branch_id,
+      service_id,
+      staff_id,
+      date,
+      slot_start,
+      customer_name,
+      customer_phone,
+      customer_email,
+      source = "whatsapp",
+    } = req.body;
 
     function normalizeChileanPhone(rawPhone) {
       if (!rawPhone) return null;
@@ -1853,7 +1853,8 @@ const {
 
       const domain = normalized.split("@")[1];
       if (!domain) return false;
-      if (domain.startsWith(".") || domain.endsWith(".")) return false;
+      if (domain.startsWith(".")) return false;
+      if (domain.endsWith(".")) return false;
       if (domain.includes("..")) return false;
 
       return true;
@@ -1889,89 +1890,87 @@ const {
       });
     }
 
-    
-const { data: cal, error: calErr } = await supabase
-  .from("calendars")
-  .select("tenant_id, slot_minutes, buffer_minutes, timezone, is_active")
-  .eq("id", calendar_id)
-  .single();
+    const { data: cal, error: calErr } = await supabase
+      .from("calendars")
+      .select("tenant_id, slot_minutes, buffer_minutes, timezone, is_active")
+      .eq("id", calendar_id)
+      .single();
 
-if (calErr || !cal) {
-  return res.status(404).json({ error: "Calendario no encontrado" });
-}
+    if (calErr || !cal) {
+      return res.status(404).json({ error: "Calendario no encontrado" });
+    }
 
-if (!cal.is_active) {
-  return res.status(400).json({ error: "Calendario inactivo" });
-}
+    if (!cal.is_active) {
+      return res.status(400).json({ error: "Calendario inactivo" });
+    }
 
-const resolvedBranchId = await resolveBranchId({
-  tenant_id: cal.tenant_id,
-  branch_id: branch_id || null,
-});
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id: cal.tenant_id,
+      branch_id: branch_id || null,
+    });
 
-const { data: tenantConfig, error: tenantConfigError } = await supabase
-  .from("tenants")
-  .select("min_booking_notice_minutes, max_booking_days_ahead")
-  .eq("id", cal.tenant_id)
-  .single();
+    const { data: tenantConfig, error: tenantConfigError } = await supabase
+      .from("tenants")
+      .select("min_booking_notice_minutes, max_booking_days_ahead")
+      .eq("id", cal.tenant_id)
+      .single();
 
-if (tenantConfigError || !tenantConfig) {
-  return res.status(404).json({ error: "Negocio no encontrado" });
-}
+    if (tenantConfigError || !tenantConfig) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
 
-const minBookingNoticeMinutes = Number(
-  tenantConfig.min_booking_notice_minutes || 0
-);
+    const minBookingNoticeMinutes = Number(
+      tenantConfig.min_booking_notice_minutes || 0
+    );
 
-const maxBookingDaysAhead = Number(
-  tenantConfig.max_booking_days_ahead || 60
-);
+    const maxBookingDaysAhead = Number(
+      tenantConfig.max_booking_days_ahead || 60
+    );
 
-const start = new Date(slot_start);
+    const start = new Date(slot_start);
 
-const minAllowedStart = new Date(
-  Date.now() + minBookingNoticeMinutes * 60 * 1000
-);
+    const minAllowedStart = new Date(
+      Date.now() + minBookingNoticeMinutes * 60 * 1000
+    );
 
-if (start.getTime() < minAllowedStart.getTime()) {
-  return res.status(409).json({
-    error: `Este negocio permite reservas con al menos ${minBookingNoticeMinutes} minutos de anticipación.`,
-  });
-}
+    if (start.getTime() < minAllowedStart.getTime()) {
+      return res.status(409).json({
+        error: `Este negocio permite reservas con al menos ${minBookingNoticeMinutes} minutos de anticipación.`,
+      });
+    }
 
-const maxAllowedBookingStart = new Date();
-maxAllowedBookingStart.setHours(23, 59, 59, 999);
-maxAllowedBookingStart.setDate(
-  maxAllowedBookingStart.getDate() + maxBookingDaysAhead
-);
+    const maxAllowedBookingStart = new Date();
+    maxAllowedBookingStart.setHours(23, 59, 59, 999);
+    maxAllowedBookingStart.setDate(
+      maxAllowedBookingStart.getDate() + maxBookingDaysAhead
+    );
 
-if (start.getTime() > maxAllowedBookingStart.getTime()) {
-  return res.status(409).json({
-    error: `Este negocio permite reservas con hasta ${maxBookingDaysAhead} días de anticipación.`,
-  });
-}
+    if (start.getTime() > maxAllowedBookingStart.getTime()) {
+      return res.status(409).json({
+        error: `Este negocio permite reservas con hasta ${maxBookingDaysAhead} días de anticipación.`,
+      });
+    }
 
-// 🔒 Anti doble reserva
-const startIso = start.toISOString();
+    const startIso = start.toISOString();
 
-let doubleBookingQuery = supabase
-  .from("appointments")
-  .select("id")
-  .eq("tenant_id", cal.tenant_id)
-  .eq("start_at", startIso)
-  .eq("status", "booked");
+    let doubleBookingQuery = supabase
+      .from("appointments")
+      .select("id")
+      .eq("tenant_id", cal.tenant_id)
+      .eq("start_at", startIso)
+      .eq("status", "booked");
 
-if (staff_id) {
-  doubleBookingQuery = doubleBookingQuery.eq("staff_id", staff_id);
-}
+    if (staff_id) {
+      doubleBookingQuery = doubleBookingQuery.eq("staff_id", staff_id);
+    }
 
-const { data: existingSlot } = await doubleBookingQuery.limit(1);
+    const { data: existingSlot } = await doubleBookingQuery.limit(1);
 
-if (existingSlot && existingSlot.length > 0) {
-  return res.status(409).json({
-    error: "Este horario acaba de ser reservado por otro cliente.",
-  });
-}
+    if (existingSlot && existingSlot.length > 0) {
+      return res.status(409).json({
+        error: "Este horario acaba de ser reservado por otro cliente.",
+      });
+    }
 
     const { data: existingAppointments, error: existingErr } = await supabase
       .from("appointments")
@@ -2061,10 +2060,13 @@ if (existingSlot && existingSlot.length > 0) {
         staff_id,
       }));
     } else {
-      const { data: rawSlots, error: slotsErr } = await supabase.rpc("get_available_slots", {
-        _calendar_id: calendar_id,
-        _day: date,
-      });
+      const { data: rawSlots, error: slotsErr } = await supabase.rpc(
+        "get_available_slots",
+        {
+          _calendar_id: calendar_id,
+          _day: date,
+        }
+      );
 
       if (slotsErr) {
         return res.status(500).json({ error: slotsErr.message });
@@ -2091,7 +2093,9 @@ if (existingSlot && existingSlot.length > 0) {
     );
 
     if (!ok) {
-      return res.status(409).json({ error: "Ese horario ya no está disponible." });
+      return res.status(409).json({
+        error: "Ese horario ya no está disponible.",
+      });
     }
 
     const end = new Date(
@@ -2102,11 +2106,11 @@ if (existingSlot && existingSlot.length > 0) {
     const { data: apptRows, error: insErr } = await supabase
       .from("appointments")
       .insert({
-  tenant_id: cal.tenant_id,
-  branch_id: resolvedBranchId,
-  calendar_id,
-  service_id,
-  staff_id: staff_id || null,
+        tenant_id: cal.tenant_id,
+        branch_id: resolvedBranchId,
+        calendar_id,
+        service_id,
+        staff_id: staff_id || null,
         service_name_snapshot: serviceName,
         duration_minutes_snapshot: duration,
         customer_name: String(customer_name).trim(),
@@ -2121,6 +2125,21 @@ if (existingSlot && existingSlot.length > 0) {
       .select("*");
 
     if (insErr) {
+      const normalizedInsertError = String(
+        insErr.message || insErr.details || ""
+      ).toLowerCase();
+
+      if (
+        insErr.code === "23505" ||
+        normalizedInsertError.includes("duplicate key") ||
+        normalizedInsertError.includes("unique constraint") ||
+        normalizedInsertError.includes("appointments_unique_slot")
+      ) {
+        return res.status(409).json({
+          error: "Este horario acaba de ser reservado por otro cliente.",
+        });
+      }
+
       return res.status(500).json({ error: insErr.message });
     }
 
@@ -2161,7 +2180,10 @@ if (existingSlot && existingSlot.length > 0) {
     if (updErr) {
       try {
         if (eventId) {
-          await calendar.events.delete({ calendarId: googleCalendarId, eventId });
+          await calendar.events.delete({
+            calendarId: googleCalendarId,
+            eventId,
+          });
         }
       } catch (_) {}
 
