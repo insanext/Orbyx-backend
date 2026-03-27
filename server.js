@@ -2583,17 +2583,17 @@ app.get("/appointments/search/:slug", async (req, res) => {
     }
 
     // 🔹 buscar en múltiples campos
-    const { data, error } = await supabase
-      .from("appointments")
-      .select("*")
-      .eq("tenant_id", tenant.id)
-      .or(`
-        customer_name.ilike.%${search}%,
-        customer_email.ilike.%${search}%,
-        customer_phone.ilike.%${search}%
-      `)
-      .order("start_at", { ascending: false })
-      .limit(20);
+    const escapedSearch = search.replace(/[%(),]/g, "");
+
+const { data, error } = await supabase
+  .from("appointments")
+  .select("*")
+  .eq("tenant_id", tenant.id)
+  .or(
+    `customer_name.ilike.%${escapedSearch}%,customer_email.ilike.%${escapedSearch}%,customer_phone.ilike.%${escapedSearch}%`
+  )
+  .order("start_at", { ascending: false })
+  .limit(20);
 
     if (error) throw error;
 
