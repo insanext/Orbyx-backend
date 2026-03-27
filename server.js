@@ -12,19 +12,20 @@ const { sendBookingEmail } = require("./email");
 const app = express();
 
 function getPlanCapabilities(plan) {
+  const normalizedPlan = String(plan || "pro").toLowerCase();
+
   const plans = {
-    starter: { max_staff: 1, max_services: 3, max_branches: 1 },
-
-    pro: { max_staff: 3, max_services: 10, max_branches: 1 },
-
-    premium: { max_staff: 10, max_services: 25, max_branches: 2 },
-
-    vip: { max_staff: 20, max_services: 50, max_branches: 3 },
-
-    platinum: { max_staff: 50, max_services: 100, max_branches: 10 },
+    pro: { max_staff: 2, max_services: 10, max_branches: 1 },
+    premium: { max_staff: 5, max_services: 25, max_branches: 2 },
+    vip: { max_staff: 10, max_services: 50, max_branches: 3 },
+    platinum: { max_staff: 20, max_services: 100, max_branches: 10 },
   };
 
-  return plans[plan] || plans.starter;
+  if (normalizedPlan === "starter") {
+    return plans.pro;
+  }
+
+  return plans[normalizedPlan] || plans.pro;
 }
 
 async function getStaffCount(tenant_id) {
@@ -47,7 +48,13 @@ async function getPlan(tenant_id) {
 
   if (error) throw error;
 
-  return (data?.plan_slug || data?.plan || "starter").toLowerCase();
+  const rawPlan = String(data?.plan_slug || data?.plan || "pro").toLowerCase();
+
+  if (rawPlan === "starter") {
+    return "pro";
+  }
+
+  return rawPlan;
 }
 
 async function getServicesCount(tenant_id) {
