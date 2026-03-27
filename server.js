@@ -2552,6 +2552,115 @@ app.get("/appointments/:id", async (req, res) => {
 });
 
 /* ======================================================
+   🔎 SEARCH APPOINTMENTS (nuevo)
+====================================================== */
+app.get("/appointments/search/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { q } = req.query;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug requerido" });
+    }
+
+    if (!q || String(q).trim().length < 2) {
+      return res.status(400).json({
+        error: "Debes ingresar al menos 2 caracteres para buscar",
+      });
+    }
+
+    const search = String(q).trim().toLowerCase();
+
+    // 🔹 obtener tenant
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    // 🔹 buscar en múltiples campos
+    const { data, error } = await supabase
+      .from("appointments")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .or(`
+        customer_name.ilike.%${search}%,
+        customer_email.ilike.%${search}%,
+        customer_phone.ilike.%${search}%
+      `)
+      .order("start_at", { ascending: false })
+      .limit(20);
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      appointments: data || [],
+    });
+  } catch (err) {
+    console.error("SEARCH appointments error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+
+/* ======================================================
+   ✏️ UPDATE APPOINTMENT (editar cliente)
+====================================================== */
+app.patch("/appointments/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const {
+      customer_name,
+      customer_email,
+      customer_phone,
+    } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: "id es obligatorio" });
+    }
+
+    const updateData = {};
+
+    if (customer_name !== undefined) {
+      updateData.customer_name = String(customer_name).trim();
+    }
+
+    if (customer_email !== undefined) {
+      updateData.customer_email = String(customer_email)
+        .trim()
+        .toLowerCase();
+    }
+
+    if (customer_phone !== undefined) {
+      updateData.customer_phone = String(customer_phone).trim();
+    }
+
+    const { data, error } = await supabase
+      .from("appointments")
+      .update(updateData)
+      .eq("id", id)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      appointment: data,
+    });
+  } catch (err) {
+    console.error("UPDATE appointment error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    🔹 HEALTHCHECK
 ====================================================== */
 app.get("/_ping", (req, res) => {
