@@ -73,6 +73,20 @@ function addDays(date, days) {
   return next;
 }
 
+function addOneMonth(date) {
+  const d = new Date(date);
+  const day = d.getDate();
+
+  d.setMonth(d.getMonth() + 1);
+
+  // Si el mes siguiente no tiene ese día (ej: 31 → febrero)
+  if (d.getDate() < day) {
+    d.setDate(0); // último día del mes anterior
+  }
+
+  return d;
+}
+
 function ensureBillingDates(row) {
   const now = new Date();
 
@@ -80,9 +94,9 @@ function ensureBillingDates(row) {
     ? new Date(row.billing_cycle_start)
     : now;
 
-  const billingEnd = row?.billing_cycle_end
-    ? new Date(row.billing_cycle_end)
-    : addDays(billingStart, BILLING_CYCLE_DAYS);
+const billingEnd = row?.billing_cycle_end
+  ? new Date(row.billing_cycle_end)
+  : addOneMonth(billingStart);
 
   return {
     billingStart,
@@ -2891,7 +2905,7 @@ app.post("/tenants/provision", async (req, res) => {
     const slug = `${cleanBase}-${suffix}`;
 
 const billing_cycle_start = new Date().toISOString();
-const billing_cycle_end = addDays(new Date(), BILLING_CYCLE_DAYS).toISOString();
+const billing_cycle_end = addOneMonth(new Date()).toISOString();
 
 const { data: tenant, error: tenantError } = await supabase
   .from("tenants")
@@ -3146,7 +3160,7 @@ app.post("/billing/apply-scheduled-changes", async (req, res) => {
 
     for (const tenant of tenantsToApply || []) {
       const newStart = new Date();
-      const newEnd = addDays(newStart, BILLING_CYCLE_DAYS);
+      const newEnd = addOneMonth(newStart);
 
       const { error: updateError } = await supabase
         .from("tenants")
