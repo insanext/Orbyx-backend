@@ -28,6 +28,128 @@ function getPlanCapabilities(plan) {
   return plans[normalizedPlan] || plans.pro;
 }
 
+const PLAN_PRICES = {
+  pro: 24990,
+  premium: 44990,
+  vip: 79990,
+  platinum: 229990,
+};
+
+const PLAN_ORDER = {
+  pro: 1,
+  premium: 2,
+  vip: 3,
+  platinum: 4,
+};
+
+const BILLING_CYCLE_DAYS = 30;
+
+function normalizePlanSlug(plan) {
+  const normalized = String(plan || "pro").toLowerCase();
+  if (normalized === "starter") return "pro";
+  if (PLAN_ORDER[normalized]) return normalized;
+  return "pro";
+}
+
+function getPlanPrice(plan) {
+  return PLAN_PRICES[normalizePlanSlug(plan)] || PLAN_PRICES.pro;
+}
+
+function getPlanLevel(plan) {
+  return PLAN_ORDER[normalizePlanSlug(plan)] || PLAN_ORDER.pro;
+}
+
+function isUpgradePlanChange(currentPlan, newPlan) {
+  return getPlanLevel(newPlan) > getPlanLevel(currentPlan);
+}
+
+function isDowngradePlanChange(currentPlan, newPlan) {
+  return getPlanLevel(newPlan) < getPlanLevel(currentPlan);
+}
+
+function addDays(date, days) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function ensureBillingDates(row) {
+  const now = new Date();
+
+  const billingStart = row?.billing_cycle_start
+    ? new Date(row.billing_cycle_start)
+    : now;
+
+  const billingEnd = row?.billing_cycle_end
+    ? new Date(row.billing_cycle_end)
+    : addDays(billingStart, BILLING_CYCLE_DAYS);
+
+  return {
+    billingStart,
+    billingEnd,
+  };
+}
+
+function calculateProration({
+  currentPlan,
+  newPlan,
+  billingEnd,
+  now = new Date(),
+}) {
+  const currentPrice = getPlanPrice(currentPlan);
+  const newPrice = getPlanPrice(newPlan);
+
+  const msRemaining = Math.max(0, billingEnd.getTime() - now.getTime());
+  const daysRemainingExact = msRemaining / (1000 * 60 * 60 * 24);
+
+  const currentDaily = currentPrice / BILLING_CYCLE_DAYS;
+  const newDaily = newPrice / BILLING_CYCLE_DAYS;
+
+  const credit = Math.round(currentDaily * daysRemainingExact);
+  const charge = Math.round(newDaily * daysRemainingExact);
+  const amountToday = Math.max(0, charge - credit);
+
+  return {
+    days_remaining: Number(daysRemainingExact.toFixed(2)),
+    current_price: currentPrice,
+    new_price: newPrice,
+    credit,
+    charge,
+    amount_today: amountToday,
+  };
+}
+
+async function getTenantSubscriptionRow(tenant_id) {
+  const { data, error } = await supabase
+    .from("tenants")
+    .select(`
+      id,
+      plan_slug,
+      plan,
+      billing_cycle_start,
+      billing_cycle_end,
+      scheduled_plan_slug,
+      scheduled_change_at,
+      pending_change_type,
+      proration_credit,
+      proration_charge
+    `)
+    .eq("id", tenant_id)
+    .single();
+
+  if (error) throw error;
+
+  const currentPlan = normalizePlanSlug(data?.plan_slug || data?.plan || "pro");
+  const { billingStart, billingEnd } = ensureBillingDates(data);
+
+  return {
+    ...data,
+    currentPlan,
+    billingStart,
+    billingEnd,
+  };
+}
+
 async function getStaffCount(tenant_id) {
   const { count, error } = await supabase
     .from("staff")
@@ -48,13 +170,7 @@ async function getPlan(tenant_id) {
 
   if (error) throw error;
 
-  const rawPlan = String(data?.plan_slug || data?.plan || "pro").toLowerCase();
-
-  if (rawPlan === "starter") {
-    return "pro";
-  }
-
-  return rawPlan;
+  return normalizePlanSlug(data?.plan_slug || data?.plan || "pro");
 }
 
 async function getServicesCount(tenant_id) {
@@ -2774,15 +2890,25 @@ app.post("/tenants/provision", async (req, res) => {
     const suffix = Math.random().toString(16).slice(2, 8);
     const slug = `${cleanBase}-${suffix}`;
 
-    const { data: tenant, error: tenantError } = await supabase
-      .from("tenants")
-      .insert({
-        name: email,
-        slug,
-        plan,
-      })
-      .select()
-      .single();
+const billing_cycle_start = new Date().toISOString();
+const billing_cycle_end = addDays(new Date(), BILLING_CYCLE_DAYS).toISOString();
+
+const { data: tenant, error: tenantError } = await supabase
+  .from("tenants")
+  .insert({
+    name: email,
+    slug,
+    plan_slug: normalizePlanSlug(plan),
+    billing_cycle_start,
+    billing_cycle_end,
+    scheduled_plan_slug: null,
+    scheduled_change_at: null,
+    pending_change_type: null,
+    proration_credit: 0,
+    proration_charge: 0,
+  })
+  .select()
+  .single();
 
     if (tenantError) throw tenantError;
 
@@ -2817,6 +2943,237 @@ app.post("/tenants/provision", async (req, res) => {
   } catch (err) {
     console.error("Provision failed:", err);
     return res.status(500).json({ error: "Provision failed", detail: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ GET /billing/preview-change
+====================================================== */
+app.get("/billing/preview-change", async (req, res) => {
+  try {
+    const { tenant_id, new_plan } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!new_plan) {
+      return res.status(400).json({ error: "new_plan es obligatorio" });
+    }
+
+    const subscription = await getTenantSubscriptionRow(tenant_id);
+    const targetPlan = normalizePlanSlug(new_plan);
+
+    if (subscription.currentPlan === targetPlan) {
+      return res.json({
+        ok: true,
+        change_type: "same_plan",
+        current_plan: subscription.currentPlan,
+        new_plan: targetPlan,
+        amount_today: 0,
+        message: "Ya estás en este plan",
+        billing_cycle_end: subscription.billingEnd.toISOString(),
+      });
+    }
+
+    if (isUpgradePlanChange(subscription.currentPlan, targetPlan)) {
+      const proration = calculateProration({
+        currentPlan: subscription.currentPlan,
+        newPlan: targetPlan,
+        billingEnd: subscription.billingEnd,
+      });
+
+      return res.json({
+        ok: true,
+        change_type: "upgrade",
+        current_plan: subscription.currentPlan,
+        new_plan: targetPlan,
+        amount_today: proration.amount_today,
+        credit: proration.credit,
+        charge: proration.charge,
+        days_remaining: proration.days_remaining,
+        billing_cycle_end: subscription.billingEnd.toISOString(),
+        message: "El upgrade se aplicará de inmediato con prorrateo",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      change_type: "downgrade",
+      current_plan: subscription.currentPlan,
+      new_plan: targetPlan,
+      amount_today: 0,
+      billing_cycle_end: subscription.billingEnd.toISOString(),
+      scheduled_change_at: subscription.billingEnd.toISOString(),
+      message: "El downgrade quedará programado para el siguiente ciclo",
+    });
+  } catch (err) {
+    console.error("GET /billing/preview-change error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /billing/change-plan
+====================================================== */
+app.post("/billing/change-plan", async (req, res) => {
+  try {
+    const { tenant_id, new_plan } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!new_plan) {
+      return res.status(400).json({ error: "new_plan es obligatorio" });
+    }
+
+    const subscription = await getTenantSubscriptionRow(tenant_id);
+    const targetPlan = normalizePlanSlug(new_plan);
+
+    if (subscription.currentPlan === targetPlan) {
+      return res.status(400).json({
+        error: "El negocio ya está en ese plan",
+      });
+    }
+
+    if (isUpgradePlanChange(subscription.currentPlan, targetPlan)) {
+      const proration = calculateProration({
+        currentPlan: subscription.currentPlan,
+        newPlan: targetPlan,
+        billingEnd: subscription.billingEnd,
+      });
+
+      const { data, error } = await supabase
+        .from("tenants")
+        .update({
+          plan_slug: targetPlan,
+          scheduled_plan_slug: null,
+          scheduled_change_at: null,
+          pending_change_type: null,
+          proration_credit: proration.credit,
+          proration_charge: proration.charge,
+        })
+        .eq("id", tenant_id)
+        .select(`
+          id,
+          plan_slug,
+          billing_cycle_start,
+          billing_cycle_end,
+          scheduled_plan_slug,
+          scheduled_change_at,
+          pending_change_type,
+          proration_credit,
+          proration_charge
+        `)
+        .single();
+
+      if (error) throw error;
+
+      return res.json({
+        ok: true,
+        applied: true,
+        change_type: "upgrade",
+        amount_today: proration.amount_today,
+        credit: proration.credit,
+        charge: proration.charge,
+        tenant: data,
+        message: "Upgrade aplicado de inmediato con prorrateo",
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("tenants")
+      .update({
+        scheduled_plan_slug: targetPlan,
+        scheduled_change_at: subscription.billingEnd.toISOString(),
+        pending_change_type: "downgrade",
+      })
+      .eq("id", tenant_id)
+      .select(`
+        id,
+        plan_slug,
+        billing_cycle_start,
+        billing_cycle_end,
+        scheduled_plan_slug,
+        scheduled_change_at,
+        pending_change_type
+      `)
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      applied: false,
+      change_type: "downgrade",
+      amount_today: 0,
+      tenant: data,
+      message: "Downgrade programado para el siguiente ciclo",
+    });
+  } catch (err) {
+    console.error("POST /billing/change-plan error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /billing/apply-scheduled-changes
+   Lo puedes disparar manualmente o desde cron
+====================================================== */
+app.post("/billing/apply-scheduled-changes", async (req, res) => {
+  try {
+    const nowIso = new Date().toISOString();
+
+    const { data: tenantsToApply, error: fetchError } = await supabase
+      .from("tenants")
+      .select(`
+        id,
+        plan_slug,
+        billing_cycle_start,
+        billing_cycle_end,
+        scheduled_plan_slug,
+        scheduled_change_at,
+        pending_change_type
+      `)
+      .not("scheduled_plan_slug", "is", null)
+      .not("scheduled_change_at", "is", null)
+      .lte("scheduled_change_at", nowIso);
+
+    if (fetchError) throw fetchError;
+
+    let applied = 0;
+
+    for (const tenant of tenantsToApply || []) {
+      const newStart = new Date();
+      const newEnd = addDays(newStart, BILLING_CYCLE_DAYS);
+
+      const { error: updateError } = await supabase
+        .from("tenants")
+        .update({
+          plan_slug: normalizePlanSlug(tenant.scheduled_plan_slug),
+          billing_cycle_start: newStart.toISOString(),
+          billing_cycle_end: newEnd.toISOString(),
+          scheduled_plan_slug: null,
+          scheduled_change_at: null,
+          pending_change_type: null,
+          proration_credit: 0,
+          proration_charge: 0,
+        })
+        .eq("id", tenant.id);
+
+      if (updateError) throw updateError;
+
+      applied++;
+    }
+
+    return res.json({
+      ok: true,
+      applied,
+    });
+  } catch (err) {
+    console.error("POST /billing/apply-scheduled-changes error:", err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -3285,6 +3642,7 @@ app.get("/public/services/:slug", async (req, res) => {
 /* ======================================================
    🌐 PUBLIC: negocio por slug
 ====================================================== */
+
 app.get("/public/business/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
@@ -3309,8 +3667,16 @@ app.get("/public/business/:slug", async (req, res) => {
   min_booking_notice_minutes,
   max_booking_days_ahead,
   is_active,
-  plan_slug
+  plan_slug,
+  billing_cycle_start,
+  billing_cycle_end,
+  scheduled_plan_slug,
+  scheduled_change_at,
+  pending_change_type,
+  proration_credit,
+  proration_charge
 `)
+
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -3340,6 +3706,9 @@ app.get("/public/business/:slug", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+
+
 /* ======================================================
    🌐 PUBLIC: staff por slug + service_id
 ====================================================== */
