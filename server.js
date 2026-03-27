@@ -1589,10 +1589,12 @@ app.get("/staff-special-dates", async (req, res) => {
 /* ======================================================
    ✅ POST /staff-special-dates
 ====================================================== */
+
 app.post("/staff-special-dates", async (req, res) => {
   try {
     const {
       tenant_id,
+      branch_id,
       staff_id,
       date,
       label,
@@ -1605,6 +1607,10 @@ app.post("/staff-special-dates", async (req, res) => {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
     }
 
+    if (!branch_id) {
+      return res.status(400).json({ error: "branch_id es obligatorio" });
+    }
+
     if (!staff_id) {
       return res.status(400).json({ error: "staff_id es obligatorio" });
     }
@@ -1613,14 +1619,29 @@ app.post("/staff-special-dates", async (req, res) => {
       return res.status(400).json({ error: "date es obligatorio" });
     }
 
+    const { data: existingStaff, error: staffError } = await supabase
+      .from("staff")
+      .select("id, tenant_id, branch_id")
+      .eq("id", staff_id)
+      .eq("tenant_id", tenant_id)
+      .eq("branch_id", branch_id)
+      .single();
+
+    if (staffError || !existingStaff) {
+      return res.status(404).json({
+        error: "El staff no existe o no pertenece a la sucursal seleccionada",
+      });
+    }
+
     const payload = {
       tenant_id,
+      branch_id,
       staff_id,
       date,
       label: normalizeNullableText(label),
       is_closed: Boolean(is_closed),
-      start_time: start_time || null,
-      end_time: end_time || null,
+      start_time: is_closed ? null : start_time || null,
+      end_time: is_closed ? null : end_time || null,
       updated_at: new Date().toISOString(),
     };
 
@@ -1638,17 +1659,20 @@ app.post("/staff-special-dates", async (req, res) => {
     });
   } catch (err) {
     console.error("POST /staff-special-dates error:", err.message);
-    return res.status(500).json({ error: "Error creando staff_special_date" });
+    return res.status(500).json({ error: err.message || "Error creando staff_special_date" });
   }
 });
 
 /* ======================================================
    ✅ PUT /staff-special-dates/:id
 ====================================================== */
+
 app.put("/staff-special-dates/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const {
+      tenant_id,
+      branch_id,
       staff_id,
       date,
       label,
@@ -1657,16 +1681,52 @@ app.put("/staff-special-dates/:id", async (req, res) => {
       end_time,
     } = req.body;
 
+    const { data: existingRow, error: existingRowError } = await supabase
+      .from("staff_special_dates")
+      .select("id, tenant_id, branch_id, staff_id")
+      .eq("id", id)
+      .single();
+
+    if (existingRowError || !existingRow) {
+      return res.status(404).json({ error: "Excepción no encontrada" });
+    }
+
+    const effectiveTenantId = tenant_id || existingRow.tenant_id;
+    const effectiveBranchId = branch_id || existingRow.branch_id;
+    const effectiveStaffId = staff_id || existingRow.staff_id;
+
+    const { data: existingStaff, error: staffError } = await supabase
+      .from("staff")
+      .select("id, tenant_id, branch_id")
+      .eq("id", effectiveStaffId)
+      .eq("tenant_id", effectiveTenantId)
+      .eq("branch_id", effectiveBranchId)
+      .single();
+
+    if (staffError || !existingStaff) {
+      return res.status(404).json({
+        error: "El staff no existe o no pertenece a la sucursal seleccionada",
+      });
+    }
+
     const payload = {
       updated_at: new Date().toISOString(),
     };
 
+    if (tenant_id !== undefined) payload.tenant_id = tenant_id;
+    if (branch_id !== undefined) payload.branch_id = branch_id;
     if (staff_id !== undefined) payload.staff_id = staff_id;
     if (date !== undefined) payload.date = date;
     if (label !== undefined) payload.label = normalizeNullableText(label);
     if (is_closed !== undefined) payload.is_closed = Boolean(is_closed);
-    if (start_time !== undefined) payload.start_time = start_time || null;
-    if (end_time !== undefined) payload.end_time = end_time || null;
+
+    if (is_closed !== undefined) {
+      payload.start_time = Boolean(is_closed) ? null : start_time || null;
+      payload.end_time = Boolean(is_closed) ? null : end_time || null;
+    } else {
+      if (start_time !== undefined) payload.start_time = start_time || null;
+      if (end_time !== undefined) payload.end_time = end_time || null;
+    }
 
     const { data, error } = await supabase
       .from("staff_special_dates")
@@ -1683,7 +1743,7 @@ app.put("/staff-special-dates/:id", async (req, res) => {
     });
   } catch (err) {
     console.error("PUT /staff-special-dates/:id error:", err.message);
-    return res.status(500).json({ error: "Error actualizando staff_special_date" });
+    return res.status(500).json({ error: err.message || "Error actualizando staff_special_date" });
   }
 });
 
