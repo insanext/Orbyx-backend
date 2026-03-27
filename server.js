@@ -2330,7 +2330,7 @@ const { data: tenant, error: tenantError } = await supabase
 app.get("/appointments/by-range/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
-    const { from, to } = req.query;
+    const { from, to, branch_id, staff_id } = req.query;
 
     if (!from || !to) {
       return res.status(400).json({
@@ -2351,13 +2351,23 @@ app.get("/appointments/by-range/:slug", async (req, res) => {
     const start = `${from}T00:00:00`;
     const end = `${to}T23:59:59`;
 
-    const { data: appointments, error: appointmentsError } = await supabase
+    let query = supabase
       .from("appointments")
       .select("*")
       .eq("tenant_id", tenant.id)
       .gte("start_at", start)
       .lte("start_at", end)
       .order("start_at", { ascending: true });
+
+    if (branch_id) {
+      query = query.eq("branch_id", branch_id);
+    }
+
+    if (staff_id) {
+      query = query.eq("staff_id", staff_id);
+    }
+
+    const { data: appointments, error: appointmentsError } = await query;
 
     if (appointmentsError) {
       return res.status(500).json({ error: appointmentsError.message });
@@ -2554,10 +2564,11 @@ app.get("/appointments/:id", async (req, res) => {
 /* ======================================================
    🔎 SEARCH APPOINTMENTS (nuevo)
 ====================================================== */
+
 app.get("/appointments/search/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
-    const { q } = req.query;
+    const { q, branch_id, staff_id } = req.query;
 
     if (!slug) {
       return res.status(400).json({ error: "slug requerido" });
@@ -2571,7 +2582,6 @@ app.get("/appointments/search/:slug", async (req, res) => {
 
     const search = String(q).trim().toLowerCase();
 
-    // 🔹 obtener tenant
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .select("id")
@@ -2582,18 +2592,27 @@ app.get("/appointments/search/:slug", async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    // 🔹 buscar en múltiples campos
     const escapedSearch = search.replace(/[%(),]/g, "");
 
-const { data, error } = await supabase
-  .from("appointments")
-  .select("*")
-  .eq("tenant_id", tenant.id)
-  .or(
-    `customer_name.ilike.%${escapedSearch}%,customer_email.ilike.%${escapedSearch}%,customer_phone.ilike.%${escapedSearch}%`
-  )
-  .order("start_at", { ascending: false })
-  .limit(20);
+    let query = supabase
+      .from("appointments")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .or(
+        `customer_name.ilike.%${escapedSearch}%,customer_email.ilike.%${escapedSearch}%,customer_phone.ilike.%${escapedSearch}%`
+      )
+      .order("start_at", { ascending: false })
+      .limit(20);
+
+    if (branch_id) {
+      query = query.eq("branch_id", branch_id);
+    }
+
+    if (staff_id) {
+      query = query.eq("staff_id", staff_id);
+    }
+
+    const { data, error } = await query;
 
     if (error) throw error;
 
@@ -2606,7 +2625,6 @@ const { data, error } = await supabase
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 /* ======================================================
    ✏️ UPDATE APPOINTMENT (editar cliente)
