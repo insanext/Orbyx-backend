@@ -3342,6 +3342,78 @@ app.post("/branches", async (req, res) => {
 });
 
 /* ======================================================
+   ✅ PATCH /branches/:id
+====================================================== */
+app.patch("/branches/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tenant_id, name, is_active } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: "id es obligatorio" });
+    }
+
+    const { data: existingBranch, error: existingError } = await supabase
+      .from("branches")
+      .select("id, tenant_id, name, is_active")
+      .eq("id", id)
+      .single();
+
+    if (existingError || !existingBranch) {
+      return res.status(404).json({ error: "Sucursal no encontrada" });
+    }
+
+    const effectiveTenantId = tenant_id || existingBranch.tenant_id;
+
+    const updateData = {};
+
+    if (name !== undefined) {
+      if (!String(name).trim()) {
+        return res.status(400).json({ error: "name no puede estar vacío" });
+      }
+
+      updateData.name = String(name).trim();
+    }
+
+    if (is_active !== undefined) {
+      if (Boolean(is_active) === true && existingBranch.is_active === false) {
+        const plan = await getPlan(effectiveTenantId);
+        const caps = getPlanCapabilities(plan);
+        const activeBranchesCount = await getBranchesCount(effectiveTenantId);
+
+        if (activeBranchesCount >= caps.max_branches) {
+          return res.status(403).json({
+            error: "Límite de sucursales alcanzado",
+            upgrade_required: true,
+          });
+        }
+      }
+
+      updateData.is_active = Boolean(is_active);
+    }
+
+    const { data, error } = await supabase
+      .from("branches")
+      .update(updateData)
+      .eq("id", id)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      branch: data,
+    });
+  } catch (err) {
+    console.error("PATCH /branches/:id error:", err.message);
+    return res.status(500).json({
+      error: err.message || "Error actualizando sucursal",
+    });
+  }
+});
+
+/* ======================================================
    ✅ GET /services
 ====================================================== */
 
