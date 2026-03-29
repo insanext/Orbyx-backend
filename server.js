@@ -817,6 +817,111 @@ async function upsertCustomerFromAppointment({
   return createdCustomer;
 }
 
+async function sendCampaignEmail({
+  to,
+  subject,
+  html,
+  text,
+}) {
+  const resendApiKey = process.env.RESEND_API_KEY;
+  const fromEmail =
+    process.env.RESEND_FROM_EMAIL ||
+    process.env.FROM_EMAIL ||
+    "Orbyx <onboarding@resend.dev>";
+
+  if (!resendApiKey) {
+    throw new Error("Falta RESEND_API_KEY en variables de entorno");
+  }
+
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${resendApiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: fromEmail,
+      to: [to],
+      subject,
+      html,
+      text,
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data?.message || "Error enviando email de campaña");
+  }
+
+  return data;
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildCampaignEmailTemplate({
+  businessName,
+  subject,
+  message,
+}) {
+  const safeBusinessName = escapeHtml(businessName || "Orbyx");
+  const safeSubject = escapeHtml(subject || "Campaña");
+  const safeMessage = escapeHtml(message || "").replace(/\n/g, "<br />");
+
+  const html = `
+  <div style="margin:0;padding:0;background:#f8fafc;font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;padding:32px 16px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;background:#ffffff;border:1px solid #e2e8f0;border-radius:24px;overflow:hidden;">
+            <tr>
+              <td style="padding:32px 32px 20px 32px;background:linear-gradient(135deg,#0f172a,#334155);color:#ffffff;">
+                <div style="font-size:12px;letter-spacing:0.18em;text-transform:uppercase;opacity:0.75;font-weight:700;">
+                  Campaña Orbyx
+                </div>
+                <h1 style="margin:12px 0 0 0;font-size:28px;line-height:1.2;font-weight:700;">
+                  ${safeBusinessName}
+                </h1>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:32px;">
+                <div style="font-size:12px;letter-spacing:0.18em;text-transform:uppercase;color:#64748b;font-weight:700;">
+                  Mensaje
+                </div>
+                <h2 style="margin:12px 0 16px 0;font-size:24px;line-height:1.3;color:#0f172a;">
+                  ${safeSubject}
+                </h2>
+
+                <div style="font-size:16px;line-height:1.8;color:#334155;">
+                  ${safeMessage}
+                </div>
+
+                <div style="margin-top:32px;padding-top:24px;border-top:1px solid #e2e8f0;font-size:13px;line-height:1.7;color:#64748b;">
+                  Este correo fue enviado por ${safeBusinessName} a través de Orbyx.
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </div>
+  `;
+
+  const text = `${businessName}\n\n${subject}\n\n${message}`;
+
+  return { html, text };
+}
+
+
 /* ======================================================
    ✅ Helper: obtener Google Calendar desde calendar_tokens usando calendar_id
 ====================================================== */
@@ -3123,6 +3228,157 @@ app.get("/customers/:slug", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+/* ======================================================
+   ✅ POST /campaigns/send-email
+   Envío real básico por email según segmento
+====================================================== */
+app.post("/campaigns/send-email", async (req, res) => {
+  try {
+    const {
+      slug,
+      segment,
+      inactive_days = 60,
+      subject,
+      message,
+      campaign_name,
+    } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    if (!segment) {
+      return res.status(400).json({ error: "segment es obligatorio" });
+    }
+
+    if (!subject || !String(subject).trim()) {
+      return res.status(400).json({ error: "subject es obligatorio" });
+    }
+
+    if (!message || !String(message).trim()) {
+      return res.status(400).json({ error: "message es obligatorio" });
+    }
+
+    const normalizedSegment = String(segment).trim().toLowerCase();
+    const inactiveDays = Math.max(1, Number(inactive_days || 60));
+
+    if (!["new", "recurrent", "frequent", "inactive"].includes(normalizedSegment)) {
+      return res.status(400).json({
+        error: "segment inválido. Usa: new, recurrent, frequent o inactive",
+      });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, name, slug, is_active")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data: customers, error: customersError } = await supabase
+      .from("customers")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .order("updated_at", { ascending: false })
+      .limit(1000);
+
+    if (customersError) {
+      throw customersError;
+    }
+
+    const rows = Array.isArray(customers) ? customers : [];
+    const now = new Date();
+    const inactiveCutoff = new Date(
+      now.getTime() - inactiveDays * 24 * 60 * 60 * 1000
+    );
+
+    function getCustomerSegment(customer) {
+      const totalVisits = Number(customer.total_visits || 0);
+      const lastVisitAt = customer.last_visit_at
+        ? new Date(customer.last_visit_at)
+        : null;
+
+      const isInactive =
+        !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
+          ? true
+          : lastVisitAt.getTime() < inactiveCutoff.getTime();
+
+      if (isInactive) return "inactive";
+      if (totalVisits >= 5) return "frequent";
+      if (totalVisits >= 2) return "recurrent";
+      return "new";
+    }
+
+    const audience = rows.filter((customer) => {
+      const customerSegment = getCustomerSegment(customer);
+      return customerSegment === normalizedSegment;
+    });
+
+    const emailAudience = audience.filter(
+      (customer) => customer.email && String(customer.email).trim()
+    );
+
+    if (emailAudience.length === 0) {
+      return res.status(400).json({
+        error: "No hay clientes con email disponible para este segmento",
+      });
+    }
+
+    let sent = 0;
+    const errors = [];
+
+    for (const customer of emailAudience) {
+      try {
+        const personalizedMessage = String(message)
+          .replace(/\{\{\s*nombre\s*\}\}/gi, customer.name || "cliente");
+
+        const template = buildCampaignEmailTemplate({
+          businessName: tenant.name || "Orbyx",
+          subject: String(subject).trim(),
+          message: personalizedMessage,
+        });
+
+        await sendCampaignEmail({
+          to: String(customer.email).trim().toLowerCase(),
+          subject: String(subject).trim(),
+          html: template.html,
+          text: template.text,
+        });
+
+        sent++;
+      } catch (error) {
+        errors.push({
+          customer_id: customer.id,
+          email: customer.email,
+          error: error.message,
+        });
+      }
+    }
+
+    return res.json({
+      ok: true,
+      campaign_name: campaign_name ? String(campaign_name).trim() : null,
+      channel: "email",
+      slug,
+      segment: normalizedSegment,
+      inactive_days: inactiveDays,
+      audience_total: audience.length,
+      recipients_with_email: emailAudience.length,
+      sent,
+      failed: errors.length,
+      errors,
+    });
+  } catch (err) {
+    console.error("POST /campaigns/send-email error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 
 /* ======================================================
    ✅ PATCH /appointments/:id/status
