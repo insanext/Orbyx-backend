@@ -889,43 +889,136 @@ function buildCampaignEmailTemplate({
   businessName,
   subject,
   message,
+  brandColor = "#0f766e",
+  heroImageUrl = "",
+  ctaText = "Agendar visita",
+  ctaUrl = "",
+  showCta = true,
+  footerNote = "",
 }) {
   const safeBusinessName = escapeHtml(businessName || "Orbyx");
   const safeSubject = escapeHtml(subject || "Campaña");
   const safeMessage = escapeHtml(message || "").replace(/\n/g, "<br />");
+  const safeBrandColor = String(brandColor || "#0f766e").trim();
+  const safeHeroImageUrl = String(heroImageUrl || "").trim();
+  const safeCtaText = escapeHtml(ctaText || "Agendar visita");
+  const safeCtaUrl = String(ctaUrl || "").trim();
+  const safeFooterNote = escapeHtml(
+    footerNote || `Este correo fue enviado por ${businessName || "Orbyx"} a través de Orbyx.`
+  ).replace(/\n/g, "<br />");
+
+  const heroBlock = safeHeroImageUrl
+    ? `
+      <tr>
+        <td style="background:#e2e8f0;">
+          <img
+            src="${safeHeroImageUrl}"
+            alt="Banner campaña"
+            style="display:block;width:100%;height:auto;max-height:260px;object-fit:cover;border:0;"
+          />
+        </td>
+      </tr>
+    `
+    : "";
+
+  const ctaBlock =
+    showCta && safeCtaUrl
+      ? `
+        <div style="margin-top:28px;">
+          <a
+            href="${safeCtaUrl}"
+            target="_blank"
+            rel="noreferrer"
+            style="
+              display:inline-block;
+              padding:14px 22px;
+              border-radius:16px;
+              background:${safeBrandColor};
+              color:#ffffff;
+              font-size:14px;
+              font-weight:700;
+              text-decoration:none;
+            "
+          >
+            ${safeCtaText}
+          </a>
+        </div>
+      `
+      : "";
 
   const html = `
   <div style="margin:0;padding:0;background:#f8fafc;font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;padding:32px 16px;">
       <tr>
         <td align="center">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;background:#ffffff;border:1px solid #e2e8f0;border-radius:24px;overflow:hidden;">
+          <table
+            role="presentation"
+            width="100%"
+            cellspacing="0"
+            cellpadding="0"
+            style="
+              max-width:680px;
+              background:#ffffff;
+              border:1px solid #e2e8f0;
+              border-radius:28px;
+              overflow:hidden;
+            "
+          >
             <tr>
-              <td style="padding:32px 32px 20px 32px;background:linear-gradient(135deg,#0f172a,#334155);color:#ffffff;">
-                <div style="font-size:12px;letter-spacing:0.18em;text-transform:uppercase;opacity:0.75;font-weight:700;">
-                  Campaña Orbyx
-                </div>
-                <h1 style="margin:12px 0 0 0;font-size:28px;line-height:1.2;font-weight:700;">
+              <td
+                style="
+                  padding:32px 32px 24px 32px;
+                  background:${safeBrandColor};
+                  color:#ffffff;
+                "
+              >
+                <div style="font-size:11px;letter-spacing:0.22em;text-transform:uppercase;opacity:0.78;font-weight:700;">
                   ${safeBusinessName}
+                </div>
+
+                <h1 style="margin:12px 0 0 0;font-size:28px;line-height:1.2;font-weight:700;">
+                  ${safeSubject}
                 </h1>
               </td>
             </tr>
 
+            ${heroBlock}
+
             <tr>
               <td style="padding:32px;">
-                <div style="font-size:12px;letter-spacing:0.18em;text-transform:uppercase;color:#64748b;font-weight:700;">
-                  Mensaje
-                </div>
-                <h2 style="margin:12px 0 16px 0;font-size:24px;line-height:1.3;color:#0f172a;">
-                  ${safeSubject}
-                </h2>
+                <div
+                  style="
+                    border:1px solid #e2e8f0;
+                    border-radius:20px;
+                    background:#f8fafc;
+                    padding:24px;
+                    font-size:16px;
+                    line-height:1.8;
+                    color:#334155;
+                  "
+                >
+                  <div style="font-weight:700;color:#0f172a;">
+                    Hola {{nombre}},
+                  </div>
 
-                <div style="font-size:16px;line-height:1.8;color:#334155;">
-                  ${safeMessage}
+                  <div style="margin-top:14px;">
+                    ${safeMessage}
+                  </div>
+
+                  ${ctaBlock}
                 </div>
 
-                <div style="margin-top:32px;padding-top:24px;border-top:1px solid #e2e8f0;font-size:13px;line-height:1.7;color:#64748b;">
-                  Este correo fue enviado por ${safeBusinessName} a través de Orbyx.
+                <div
+                  style="
+                    margin-top:24px;
+                    padding-top:20px;
+                    border-top:1px solid #e2e8f0;
+                    font-size:13px;
+                    line-height:1.7;
+                    color:#64748b;
+                  "
+                >
+                  ${safeFooterNote}
                 </div>
               </td>
             </tr>
@@ -936,11 +1029,23 @@ function buildCampaignEmailTemplate({
   </div>
   `;
 
-  const text = `${businessName}\n\n${subject}\n\n${message}`;
+  const textParts = [
+    businessName || "Orbyx",
+    "",
+    subject || "Campaña",
+    "",
+    String(message || ""),
+    "",
+    showCta && safeCtaUrl ? `${ctaText || "Agendar visita"}: ${safeCtaUrl}` : "",
+    "",
+    footerNote || `Este correo fue enviado por ${businessName || "Orbyx"} a través de Orbyx.`,
+  ].filter(Boolean);
 
-  return { html, text };
+  return {
+    html,
+    text: textParts.join("\n"),
+  };
 }
-
 
 /* ======================================================
    ✅ Helper: obtener Google Calendar desde calendar_tokens usando calendar_id
@@ -3257,6 +3362,7 @@ app.post("/campaigns/send-email", async (req, res) => {
   try {
     const {
       slug,
+      channel = "email",
       segment,
       inactive_days = 60,
       subject,
@@ -3264,10 +3370,22 @@ app.post("/campaigns/send-email", async (req, res) => {
       campaign_name,
       limit = 50,
       sort = "oldest",
+
+      // 🔥 nuevos campos visuales
+      brand_color = "#0f766e",
+      hero_image_url = "",
+      cta_text = "Agendar visita",
+      cta_url = "",
+      show_cta = true,
+      footer_note = "",
     } = req.body;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    if (!channel) {
+      return res.status(400).json({ error: "channel es obligatorio" });
     }
 
     if (!segment) {
@@ -3282,10 +3400,17 @@ app.post("/campaigns/send-email", async (req, res) => {
       return res.status(400).json({ error: "message es obligatorio" });
     }
 
+    const normalizedChannel = String(channel).trim().toLowerCase();
     const normalizedSegment = String(segment).trim().toLowerCase();
     const inactiveDays = Math.max(1, Number(inactive_days || 60));
     const requestedLimit = Math.max(1, Number(limit || 50));
     const normalizedSort = String(sort || "oldest").trim().toLowerCase();
+
+    if (!["email", "whatsapp"].includes(normalizedChannel)) {
+      return res.status(400).json({
+        error: "channel inválido. Usa: email o whatsapp",
+      });
+    }
 
     if (!["new", "recurrent", "frequent", "inactive"].includes(normalizedSegment)) {
       return res.status(400).json({
@@ -3298,6 +3423,12 @@ app.post("/campaigns/send-email", async (req, res) => {
     ) {
       return res.status(400).json({
         error: "sort inválido. Usa: oldest, recent, most_visits o least_visits",
+      });
+    }
+
+    if (normalizedChannel !== "email") {
+      return res.status(400).json({
+        error: "WhatsApp aún no está habilitado para envío real desde backend",
       });
     }
 
@@ -3389,7 +3520,6 @@ app.post("/campaigns/send-email", async (req, res) => {
     });
 
     const sortedAudience = sortCustomers([...audience]);
-
     const limitedAudience = sortedAudience.slice(0, appliedLimit);
 
     const emailAudience = limitedAudience.filter(
@@ -3410,10 +3540,21 @@ app.post("/campaigns/send-email", async (req, res) => {
         const personalizedMessage = String(message)
           .replace(/\{\{\s*nombre\s*\}\}/gi, customer.name || "cliente");
 
+        const personalizedFooter = String(
+          footer_note ||
+            `Este correo fue enviado por ${tenant.name || "Orbyx"} a través de Orbyx.`
+        ).replace(/\{\{\s*nombre\s*\}\}/gi, customer.name || "cliente");
+
         const template = buildCampaignEmailTemplate({
           businessName: tenant.name || "Orbyx",
           subject: String(subject).trim(),
           message: personalizedMessage,
+          brandColor: String(brand_color || "#0f766e").trim(),
+          heroImageUrl: String(hero_image_url || "").trim(),
+          ctaText: String(cta_text || "Agendar visita").trim(),
+          ctaUrl: String(cta_url || "").trim(),
+          showCta: Boolean(show_cta),
+          footerNote: personalizedFooter,
         });
 
         await sendCampaignEmail({
@@ -3433,34 +3574,28 @@ app.post("/campaigns/send-email", async (req, res) => {
       }
     }
 
-// 🔥 GUARDAR HISTORIAL DE CAMPAÑA
-try {
-  await supabase.from("campaign_history").insert({
-    tenant_id: tenant.id,
-    campaign_name: campaign_name ? String(campaign_name).trim() : null,
-
-    channel: "email",
-    segment: normalizedSegment,
-    inactive_days: inactiveDays,
-
-    subject: String(subject).trim(),
-    message: String(message).trim(),
-
-    sort: normalizedSort,
-
-    plan_slug: currentPlan,
-    plan_limit: planLimit,
-    requested_limit: requestedLimit,
-    applied_limit: appliedLimit,
-
-    audience_total: audience.length,
-    recipients_with_contact: emailAudience.length,
-    sent_count: sent,
-    failed_count: errors.length,
-  });
-} catch (e) {
-  console.error("❌ Error guardando historial campaña:", e.message);
-}
+    try {
+      await supabase.from("campaign_history").insert({
+        tenant_id: tenant.id,
+        campaign_name: campaign_name ? String(campaign_name).trim() : null,
+        channel: "email",
+        segment: normalizedSegment,
+        inactive_days: inactiveDays,
+        subject: String(subject).trim(),
+        message: String(message).trim(),
+        sort: normalizedSort,
+        plan_slug: currentPlan,
+        plan_limit: planLimit,
+        requested_limit: requestedLimit,
+        applied_limit: appliedLimit,
+        audience_total: audience.length,
+        recipients_with_contact: emailAudience.length,
+        sent_count: sent,
+        failed_count: errors.length,
+      });
+    } catch (e) {
+      console.error("❌ Error guardando historial campaña:", e.message);
+    }
 
     return res.json({
       ok: true,
