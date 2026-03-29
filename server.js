@@ -2472,13 +2472,20 @@ if (!appt) {
 
 apptCreated = appt;
 
-await upsertCustomerFromAppointment({
+const customer = await upsertCustomerFromAppointment({
   tenant_id: cal.tenant_id,
   customer_name: String(customer_name).trim(),
   customer_email: normalizedEmail,
   customer_phone: normalizedPhone,
   start_at: start.toISOString(),
 });
+
+await supabase
+  .from("appointments")
+  .update({
+    customer_id: customer.id,
+  })
+  .eq("id", apptCreated.id);
 
     const { calendar, googleCalendarId } =
       await getGoogleCalendarClientByCalendarId(calendar_id);
