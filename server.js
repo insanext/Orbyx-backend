@@ -15,6 +15,41 @@ function getPlanCapabilities(plan) {
   const normalizedPlan = String(plan || "pro").toLowerCase();
 
   const plans = {
+    pro: {
+      max_staff: 2,
+      max_services: 10,
+      max_branches: 1,
+      max_campaign_emails_per_send: 50,
+    },
+    premium: {
+      max_staff: 5,
+      max_services: 25,
+      max_branches: 2,
+      max_campaign_emails_per_send: 150,
+    },
+    vip: {
+      max_staff: 10,
+      max_services: 50,
+      max_branches: 3,
+      max_campaign_emails_per_send: 400,
+    },
+    platinum: {
+      max_staff: 20,
+      max_services: 100,
+      max_branches: 10,
+      max_campaign_emails_per_send: 1000,
+    },
+  };
+
+  if (normalizedPlan === "starter") {
+    return plans.pro;
+  }
+
+  return plans[normalizedPlan] || plans.pro;
+}
+  const normalizedPlan = String(plan || "pro").toLowerCase();
+
+  const plans = {
     pro: { max_staff: 2, max_services: 10, max_branches: 1 },
     premium: { max_staff: 5, max_services: 25, max_branches: 2 },
     vip: { max_staff: 10, max_services: 50, max_branches: 3 },
@@ -3231,7 +3266,7 @@ app.get("/customers/:slug", async (req, res) => {
 
 /* ======================================================
    ✅ POST /campaigns/send-email
-   Envío real básico por email según segmento
+   Envío real básico por email según segmento + límite por plan
 ====================================================== */
 app.post("/campaigns/send-email", async (req, res) => {
   try {
@@ -3242,6 +3277,8 @@ app.post("/campaigns/send-email", async (req, res) => {
       subject,
       message,
       campaign_name,
+      limit = 50,
+      sort = "oldest",
     } = req.body;
 
     if (!slug) {
@@ -3262,6 +3299,8 @@ app.post("/campaigns/send-email", async (req, res) => {
 
     const normalizedSegment = String(segment).trim().toLowerCase();
     const inactiveDays = Math.max(1, Number(inactive_days || 60));
+    const requestedLimit = Math.max(1, Number(limit || 50));
+    const normalizedSort = String(sort || "oldest").trim().toLowerCase();
 
     if (!["new", "recurrent", "frequent", "inactive"].includes(normalizedSegment)) {
       return res.status(400).json({
@@ -3269,9 +3308,17 @@ app.post("/campaigns/send-email", async (req, res) => {
       });
     }
 
+    if (
+      !["oldest", "recent", "most_visits", "least_visits"].includes(normalizedSort)
+    ) {
+      return res.status(400).json({
+        error: "sort inválido. Usa: oldest, recent, most_visits o least_visits",
+      });
+    }
+
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, name, slug, is_active")
+      .select("id, name, slug, is_active, plan_slug, plan")
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -3279,6 +3326,11 @@ app.post("/campaigns/send-email", async (req, res) => {
     if (tenantError || !tenant) {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
+
+    const currentPlan = normalizePlanSlug(tenant.plan_slug || tenant.plan || "pro");
+    const caps = getPlanCapabilities(currentPlan);
+    const planLimit = Number(caps.max_campaign_emails_per_send || 50);
+    const appliedLimit = Math.min(requestedLimit, planLimit);
 
     const { data: customers, error: customersError } = await supabase
       .from("customers")
@@ -3314,12 +3366,48 @@ app.post("/campaigns/send-email", async (req, res) => {
       return "new";
     }
 
+    function sortCustomers(list) {
+      if (normalizedSort === "oldest") {
+        return list.sort((a, b) => {
+          const aDate = new Date(a.last_visit_at || 0).getTime();
+          const bDate = new Date(b.last_visit_at || 0).getTime();
+          return aDate - bDate;
+        });
+      }
+
+      if (normalizedSort === "recent") {
+        return list.sort((a, b) => {
+          const aDate = new Date(a.last_visit_at || 0).getTime();
+          const bDate = new Date(b.last_visit_at || 0).getTime();
+          return bDate - aDate;
+        });
+      }
+
+      if (normalizedSort === "most_visits") {
+        return list.sort(
+          (a, b) => Number(b.total_visits || 0) - Number(a.total_visits || 0)
+        );
+      }
+
+      if (normalizedSort === "least_visits") {
+        return list.sort(
+          (a, b) => Number(a.total_visits || 0) - Number(b.total_visits || 0)
+        );
+      }
+
+      return list;
+    }
+
     const audience = rows.filter((customer) => {
       const customerSegment = getCustomerSegment(customer);
       return customerSegment === normalizedSegment;
     });
 
-    const emailAudience = audience.filter(
+    const sortedAudience = sortCustomers([...audience]);
+
+    const limitedAudience = sortedAudience.slice(0, appliedLimit);
+
+    const emailAudience = limitedAudience.filter(
       (customer) => customer.email && String(customer.email).trim()
     );
 
@@ -3365,6 +3453,11 @@ app.post("/campaigns/send-email", async (req, res) => {
       campaign_name: campaign_name ? String(campaign_name).trim() : null,
       channel: "email",
       slug,
+      plan: currentPlan,
+      plan_limit: planLimit,
+      requested_limit: requestedLimit,
+      applied_limit: appliedLimit,
+      sort: normalizedSort,
       segment: normalizedSegment,
       inactive_days: inactiveDays,
       audience_total: audience.length,
@@ -3378,7 +3471,6 @@ app.post("/campaigns/send-email", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 /* ======================================================
    ✅ PATCH /appointments/:id/status
