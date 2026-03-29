@@ -2587,6 +2587,88 @@ function formatDateForServer(date) {
 }
 
 /* ======================================================
+   ✅ GET /dashboard/metrics/:slug
+====================================================== */
+app.get("/dashboard/metrics/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, name, slug")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const now = new Date();
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+
+    const todayEnd = new Date();
+    todayEnd.setHours(23, 59, 59, 999);
+
+    const weekStart = new Date();
+    weekStart.setHours(0, 0, 0, 0);
+    const day = weekStart.getDay();
+    const diffToMonday = day === 0 ? -6 : 1 - day;
+    weekStart.setDate(weekStart.getDate() + diffToMonday);
+
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekEnd.getDate() + 6);
+    weekEnd.setHours(23, 59, 59, 999);
+
+    const { data: appointments, error: appointmentsError } = await supabase
+      .from("appointments")
+      .select("id, start_at, end_at, status")
+      .eq("tenant_id", tenant.id)
+      .gte("start_at", weekStart.toISOString())
+      .lte("start_at", weekEnd.toISOString());
+
+    if (appointmentsError) {
+      return res.status(500).json({ error: appointmentsError.message });
+    }
+
+    const rows = appointments || [];
+
+    const reservasHoy = rows.filter((appt) => {
+      const start = new Date(appt.start_at);
+      return start >= todayStart && start <= todayEnd;
+    }).length;
+
+    const reservasSemana = rows.length;
+
+    const proximasReservas = rows.filter((appt) => {
+      const start = new Date(appt.start_at);
+      return start > now && appt.status === "booked";
+    }).length;
+
+    const atendidas = rows.filter((appt) => appt.status === "completed").length;
+    const canceladas = rows.filter((appt) => appt.status === "canceled").length;
+    const noShow = rows.filter((appt) => appt.status === "no_show").length;
+
+    return res.json({
+      ok: true,
+      metrics: {
+        reservas_hoy: reservasHoy,
+        reservas_semana: reservasSemana,
+        proximas_reservas: proximasReservas,
+        atendidas,
+        canceladas,
+        no_show: noShow,
+      },
+    });
+  } catch (err) {
+    console.error("GET /dashboard/metrics/:slug error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    ✅ GET /appointments
 ====================================================== */
 app.get("/appointments", async (req, res) => {
