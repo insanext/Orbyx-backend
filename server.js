@@ -723,6 +723,100 @@ function filterPastSlots(slots, minNoticeMinutes = 0) {
     return start.getTime() >= limit.getTime();
   });
 }
+
+async function upsertCustomerFromAppointment({
+  tenant_id,
+  customer_name,
+  customer_email,
+  customer_phone,
+  start_at,
+}) {
+  const normalizedEmail = customer_email
+    ? String(customer_email).trim().toLowerCase()
+    : null;
+
+  const normalizedPhone = customer_phone
+    ? String(customer_phone).trim()
+    : null;
+
+  let existingCustomer = null;
+
+  if (normalizedEmail) {
+    const { data } = await supabase
+      .from("customers")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .eq("email", normalizedEmail)
+      .maybeSingle();
+
+    if (data) {
+      existingCustomer = data;
+    }
+  }
+
+  if (!existingCustomer && normalizedPhone) {
+    const { data } = await supabase
+      .from("customers")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .eq("phone", normalizedPhone)
+      .maybeSingle();
+
+    if (data) {
+      existingCustomer = data;
+    }
+  }
+
+  if (existingCustomer) {
+    const currentLastVisit = existingCustomer.last_visit_at
+      ? new Date(existingCustomer.last_visit_at)
+      : null;
+
+    const nextVisitDate = start_at ? new Date(start_at) : null;
+
+    const shouldUpdateLastVisit =
+      nextVisitDate &&
+      (!currentLastVisit || nextVisitDate.getTime() > currentLastVisit.getTime());
+
+    const { data: updatedCustomer, error: updateError } = await supabase
+      .from("customers")
+      .update({
+        name: String(customer_name || existingCustomer.name || "").trim(),
+        email: normalizedEmail || existingCustomer.email || null,
+        phone: normalizedPhone || existingCustomer.phone || null,
+        last_visit_at: shouldUpdateLastVisit
+          ? nextVisitDate.toISOString()
+          : existingCustomer.last_visit_at,
+        total_visits: Number(existingCustomer.total_visits || 0) + 1,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", existingCustomer.id)
+      .select("*")
+      .single();
+
+    if (updateError) throw updateError;
+
+    return updatedCustomer;
+  }
+
+  const { data: createdCustomer, error: insertError } = await supabase
+    .from("customers")
+    .insert({
+      tenant_id,
+      name: String(customer_name || "").trim(),
+      email: normalizedEmail,
+      phone: normalizedPhone,
+      last_visit_at: start_at ? new Date(start_at).toISOString() : null,
+      total_visits: 1,
+    })
+    .select("*")
+    .single();
+
+  if (insertError) throw insertError;
+
+  return createdCustomer;
+}
+
 /* ======================================================
    ✅ Helper: obtener Google Calendar desde calendar_tokens usando calendar_id
 ====================================================== */
@@ -2368,15 +2462,23 @@ app.post("/appointments/slot", async (req, res) => {
       return res.status(500).json({ error: insErr.message });
     }
 
-    const appt = apptRows?.[0] || null;
+const appt = apptRows?.[0] || null;
 
-    if (!appt) {
-      return res.status(500).json({
-        error: "No se pudo crear la reserva.",
-      });
-    }
+if (!appt) {
+  return res.status(500).json({
+    error: "No se pudo crear la reserva.",
+  });
+}
 
-    apptCreated = appt;
+apptCreated = appt;
+
+await upsertCustomerFromAppointment({
+  tenant_id: cal.tenant_id,
+  customer_name: String(customer_name).trim(),
+  customer_email: normalizedEmail,
+  customer_phone: normalizedPhone,
+  start_at: start.toISOString(),
+});
 
     const { calendar, googleCalendarId } =
       await getGoogleCalendarClientByCalendarId(calendar_id);
@@ -2904,6 +3006,59 @@ app.get("/appointments", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+/* ======================================================
+   ✅ GET /customers/:slug
+====================================================== */
+app.get("/customers/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { q } = req.query;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, slug")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    let query = supabase
+      .from("customers")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .order("updated_at", { ascending: false })
+      .limit(100);
+
+    if (q && String(q).trim().length >= 2) {
+      const search = String(q).trim().replace(/[%(),]/g, "");
+
+      query = query.or(
+        `name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`
+      );
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      customers: data || [],
+    });
+  } catch (err) {
+    console.error("GET /customers/:slug error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 
 /* ======================================================
    ✅ PATCH /appointments/:id/status
