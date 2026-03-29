@@ -47,21 +47,6 @@ function getPlanCapabilities(plan) {
 
   return plans[normalizedPlan] || plans.pro;
 }
-  const normalizedPlan = String(plan || "pro").toLowerCase();
-
-  const plans = {
-    pro: { max_staff: 2, max_services: 10, max_branches: 1 },
-    premium: { max_staff: 5, max_services: 25, max_branches: 2 },
-    vip: { max_staff: 10, max_services: 50, max_branches: 3 },
-    platinum: { max_staff: 20, max_services: 100, max_branches: 10 },
-  };
-
-  if (normalizedPlan === "starter") {
-    return plans.pro;
-  }
-
-  return plans[normalizedPlan] || plans.pro;
-}
 
 const PLAN_PRICES = {
   pro: 24990,
