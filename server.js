@@ -3433,6 +3433,35 @@ app.post("/campaigns/send-email", async (req, res) => {
       }
     }
 
+// 🔥 GUARDAR HISTORIAL DE CAMPAÑA
+try {
+  await supabase.from("campaign_history").insert({
+    tenant_id: tenant.id,
+    campaign_name: campaign_name ? String(campaign_name).trim() : null,
+
+    channel: "email",
+    segment: normalizedSegment,
+    inactive_days: inactiveDays,
+
+    subject: String(subject).trim(),
+    message: String(message).trim(),
+
+    sort: normalizedSort,
+
+    plan_slug: currentPlan,
+    plan_limit: planLimit,
+    requested_limit: requestedLimit,
+    applied_limit: appliedLimit,
+
+    audience_total: audience.length,
+    recipients_with_contact: emailAudience.length,
+    sent_count: sent,
+    failed_count: errors.length,
+  });
+} catch (e) {
+  console.error("❌ Error guardando historial campaña:", e.message);
+}
+
     return res.json({
       ok: true,
       campaign_name: campaign_name ? String(campaign_name).trim() : null,
@@ -3453,6 +3482,46 @@ app.post("/campaigns/send-email", async (req, res) => {
     });
   } catch (err) {
     console.error("POST /campaigns/send-email error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   📊 GET /campaigns/history/:slug
+====================================================== */
+app.get("/campaigns/history/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data, error } = await supabase
+      .from("campaign_history")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      campaigns: data || [],
+    });
+  } catch (err) {
+    console.error("GET /campaigns/history error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
