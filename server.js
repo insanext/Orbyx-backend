@@ -2604,62 +2604,269 @@ app.get("/dashboard/metrics/:slug", async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
+    function getSantiagoParts(date) {
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "America/Santiago",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        weekday: "short",
+      }).formatToParts(date);
+
+      const map = Object.fromEntries(
+        parts
+          .filter((part) => part.type !== "literal")
+          .map((part) => [part.type, part.value])
+      );
+
+      return {
+        year: Number(map.year),
+        month: Number(map.month),
+        day: Number(map.day),
+        weekday: map.weekday, // Mon, Tue, Wed...
+        dateKey: `${map.year}-${map.month}-${map.day}`,
+        monthKey: `${map.year}-${map.month}`,
+      };
+    }
+
+    function parseDateKey(dateKey) {
+      const [year, month, day] = String(dateKey).split("-").map(Number);
+      return new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+    }
+
+    function toDateKey(date) {
+      const y = date.getUTCFullYear();
+      const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+      const d = String(date.getUTCDate()).padStart(2, "0");
+      return `${y}-${m}-${d}`;
+    }
+
+    function addDays(dateKey, days) {
+      const date = parseDateKey(dateKey);
+      date.setUTCDate(date.getUTCDate() + days);
+      return toDateKey(date);
+    }
+
+    function getWeekStart(dateKey) {
+      const base = parseDateKey(dateKey);
+      const weekday = base.getUTCDay(); // 0=Sun, 1=Mon...
+      const diffToMonday = weekday === 0 ? -6 : 1 - weekday;
+      base.setUTCDate(base.getUTCDate() + diffToMonday);
+      return toDateKey(base);
+    }
+
+    function getWeekKeys(weekStartKey) {
+      return Array.from({ length: 7 }, (_, index) => addDays(weekStartKey, index));
+    }
+
+    function getMonthStartKey(year, month) {
+      return `${year}-${String(month).padStart(2, "0")}-01`;
+    }
+
+    function getMonthEndKey(year, month) {
+      const nextMonth =
+        month === 12
+          ? new Date(Date.UTC(year + 1, 0, 1, 12, 0, 0))
+          : new Date(Date.UTC(year, month, 1, 12, 0, 0));
+
+      nextMonth.setUTCDate(nextMonth.getUTCDate() - 1);
+      return toDateKey(nextMonth);
+    }
+
+    function calcComparison(current, previous) {
+      const diff = current - previous;
+
+      if (previous <= 0) {
+        return {
+          current,
+          previous,
+          diff,
+          diff_pct: null,
+        };
+      }
+
+      return {
+        current,
+        previous,
+        diff,
+        diff_pct: Number(((diff / previous) * 100).toFixed(1)),
+      };
+    }
+
     const now = new Date();
+    const nowIso = now.toISOString();
 
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    const todayParts = getSantiagoParts(now);
+    const todayKey = todayParts.dateKey;
+    const currentMonthKey = todayParts.monthKey;
 
-    const todayEnd = new Date();
-    todayEnd.setHours(23, 59, 59, 999);
+    const currentWeekStartKey = getWeekStart(todayKey);
+    const currentWeekEndKey = addDays(currentWeekStartKey, 6);
 
-    const weekStart = new Date();
-    weekStart.setHours(0, 0, 0, 0);
-    const day = weekStart.getDay();
-    const diffToMonday = day === 0 ? -6 : 1 - day;
-    weekStart.setDate(weekStart.getDate() + diffToMonday);
+    const previousWeekStartKey = addDays(currentWeekStartKey, -7);
+    const previousWeekEndKey = addDays(currentWeekStartKey, -1);
 
-    const weekEnd = new Date(weekStart);
-    weekEnd.setDate(weekEnd.getDate() + 6);
-    weekEnd.setHours(23, 59, 59, 999);
+    const currentMonthStartKey = getMonthStartKey(
+      todayParts.year,
+      todayParts.month
+    );
+    const currentMonthEndKey = getMonthEndKey(todayParts.year, todayParts.month);
+
+    const previousMonthYear =
+      todayParts.month === 1 ? todayParts.year - 1 : todayParts.year;
+    const previousMonth =
+      todayParts.month === 1 ? 12 : todayParts.month - 1;
+
+    const previousMonthKey = `${previousMonthYear}-${String(previousMonth).padStart(
+      2,
+      "0"
+    )}`;
+    const previousMonthStartKey = getMonthStartKey(
+      previousMonthYear,
+      previousMonth
+    );
+    const previousMonthEndKey = getMonthEndKey(
+      previousMonthYear,
+      previousMonth
+    );
+
+    const rangeStartKey =
+      previousMonthStartKey < previousWeekStartKey
+        ? previousMonthStartKey
+        : previousWeekStartKey;
+
+    const rangeEndKey =
+      currentMonthEndKey > currentWeekEndKey
+        ? currentMonthEndKey
+        : currentWeekEndKey;
+
+    const rangeStartIso = `${rangeStartKey}T00:00:00`;
+    const rangeEndIso = `${rangeEndKey}T23:59:59`;
 
     const { data: appointments, error: appointmentsError } = await supabase
       .from("appointments")
-      .select("id, start_at, end_at, status")
+      .select("id, start_at, status")
       .eq("tenant_id", tenant.id)
-      .gte("start_at", weekStart.toISOString())
-      .lte("start_at", weekEnd.toISOString());
+      .gte("start_at", rangeStartIso)
+      .lte("start_at", rangeEndIso);
 
     if (appointmentsError) {
       return res.status(500).json({ error: appointmentsError.message });
     }
 
+    const { count: upcomingCount, error: upcomingError } = await supabase
+      .from("appointments")
+      .select("*", { count: "exact", head: true })
+      .eq("tenant_id", tenant.id)
+      .eq("status", "booked")
+      .gte("start_at", nowIso);
+
+    if (upcomingError) {
+      return res.status(500).json({ error: upcomingError.message });
+    }
+
+    const currentWeekKeys = new Set(getWeekKeys(currentWeekStartKey));
+    const previousWeekKeys = new Set(getWeekKeys(previousWeekStartKey));
+
     const rows = appointments || [];
 
-    const reservasHoy = rows.filter((appt) => {
-      const start = new Date(appt.start_at);
-      return start >= todayStart && start <= todayEnd;
-    }).length;
+    let reservasHoy = 0;
+    let reservasSemana = 0;
+    let reservasSemanaPasada = 0;
+    let reservasMes = 0;
+    let reservasMesPasado = 0;
 
-    const reservasSemana = rows.length;
+    let atendidasSemana = 0;
+    let atendidasMes = 0;
 
-    const proximasReservas = rows.filter((appt) => {
-      const start = new Date(appt.start_at);
-      return start > now && appt.status === "booked";
-    }).length;
+    let canceladasSemana = 0;
+    let canceladasMes = 0;
 
-    const atendidas = rows.filter((appt) => appt.status === "completed").length;
-    const canceladas = rows.filter((appt) => appt.status === "canceled").length;
-    const noShow = rows.filter((appt) => appt.status === "no_show").length;
+    let noShowSemana = 0;
+    let noShowMes = 0;
+
+    for (const appt of rows) {
+      const apptDate = new Date(appt.start_at);
+      const apptParts = getSantiagoParts(apptDate);
+      const apptDateKey = apptParts.dateKey;
+      const apptMonthKey = apptParts.monthKey;
+      const status = String(appt.status || "").toLowerCase();
+
+      if (apptDateKey === todayKey) {
+        reservasHoy++;
+      }
+
+      if (currentWeekKeys.has(apptDateKey)) {
+        reservasSemana++;
+
+        if (status === "completed") atendidasSemana++;
+        if (status === "canceled") canceladasSemana++;
+        if (status === "no_show") noShowSemana++;
+      }
+
+      if (previousWeekKeys.has(apptDateKey)) {
+        reservasSemanaPasada++;
+      }
+
+      if (apptMonthKey === currentMonthKey) {
+        reservasMes++;
+
+        if (status === "completed") atendidasMes++;
+        if (status === "canceled") canceladasMes++;
+        if (status === "no_show") noShowMes++;
+      }
+
+      if (apptMonthKey === previousMonthKey) {
+        reservasMesPasado++;
+      }
+    }
 
     return res.json({
       ok: true,
       metrics: {
         reservas_hoy: reservasHoy,
         reservas_semana: reservasSemana,
-        proximas_reservas: proximasReservas,
-        atendidas,
-        canceladas,
-        no_show: noShow,
+        reservas_semana_pasada: reservasSemanaPasada,
+        reservas_mes: reservasMes,
+        reservas_mes_pasado: reservasMesPasado,
+        proximas_reservas: upcomingCount || 0,
+
+        atendidas_semana: atendidasSemana,
+        atendidas_mes: atendidasMes,
+
+        canceladas_semana: canceladasSemana,
+        canceladas_mes: canceladasMes,
+
+        no_show_semana: noShowSemana,
+        no_show_mes: noShowMes,
+
+        comparacion_semanal: calcComparison(
+          reservasSemana,
+          reservasSemanaPasada
+        ),
+        comparacion_mensual: calcComparison(
+          reservasMes,
+          reservasMesPasado
+        ),
+      },
+      periods: {
+        hoy: todayKey,
+        semana_actual: {
+          start: currentWeekStartKey,
+          end: currentWeekEndKey,
+        },
+        semana_pasada: {
+          start: previousWeekStartKey,
+          end: previousWeekEndKey,
+        },
+        mes_actual: {
+          start: currentMonthStartKey,
+          end: currentMonthEndKey,
+        },
+        mes_pasado: {
+          start: previousMonthStartKey,
+          end: previousMonthEndKey,
+        },
       },
     });
   } catch (err) {
