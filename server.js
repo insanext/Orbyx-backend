@@ -3016,11 +3016,12 @@ app.get("/appointments", async (req, res) => {
 
 /* ======================================================
    ✅ GET /customers/:slug
+   Soporta búsqueda + segmentación + inactivos
 ====================================================== */
 app.get("/customers/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
-    const { q } = req.query;
+    const { q, segment, inactive_days } = req.query;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
@@ -3037,12 +3038,15 @@ app.get("/customers/:slug", async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
+    const normalizedSegment = String(segment || "").trim().toLowerCase();
+    const inactiveDays = Math.max(1, Number(inactive_days || 60));
+
     let query = supabase
       .from("customers")
       .select("*")
       .eq("tenant_id", tenant.id)
       .order("updated_at", { ascending: false })
-      .limit(100);
+      .limit(300);
 
     if (q && String(q).trim().length >= 2) {
       const search = String(q).trim().replace(/[%(),]/g, "");
@@ -3056,16 +3060,69 @@ app.get("/customers/:slug", async (req, res) => {
 
     if (error) throw error;
 
+    const rows = Array.isArray(data) ? data : [];
+    const now = new Date();
+    const inactiveCutoff = new Date(
+      now.getTime() - inactiveDays * 24 * 60 * 60 * 1000
+    );
+
+    function getCustomerSegment(customer) {
+      const totalVisits = Number(customer.total_visits || 0);
+      const lastVisitAt = customer.last_visit_at
+        ? new Date(customer.last_visit_at)
+        : null;
+
+      const isInactive =
+        !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
+          ? true
+          : lastVisitAt.getTime() < inactiveCutoff.getTime();
+
+      if (isInactive) return "inactive";
+      if (totalVisits >= 5) return "frequent";
+      if (totalVisits >= 2) return "recurrent";
+      return "new";
+    }
+
+    const enrichedCustomers = rows.map((customer) => {
+      const customerSegment = getCustomerSegment(customer);
+
+      return {
+        ...customer,
+        segment: customerSegment,
+        is_inactive: customerSegment === "inactive",
+      };
+    });
+
+    const filteredCustomers =
+      normalizedSegment && ["new", "recurrent", "frequent", "inactive"].includes(normalizedSegment)
+        ? enrichedCustomers.filter(
+            (customer) => customer.segment === normalizedSegment
+          )
+        : enrichedCustomers;
+
+    const summary = {
+      total: enrichedCustomers.length,
+      nuevos: enrichedCustomers.filter((c) => c.segment === "new").length,
+      recurrentes: enrichedCustomers.filter((c) => c.segment === "recurrent").length,
+      frecuentes: enrichedCustomers.filter((c) => c.segment === "frequent").length,
+      inactivos: enrichedCustomers.filter((c) => c.segment === "inactive").length,
+    };
+
     return res.json({
-      total: data?.length || 0,
-      customers: data || [],
+      total: filteredCustomers.length,
+      customers: filteredCustomers,
+      summary,
+      filters: {
+        q: q ? String(q) : "",
+        segment: normalizedSegment || null,
+        inactive_days: inactiveDays,
+      },
     });
   } catch (err) {
     console.error("GET /customers/:slug error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 /* ======================================================
    ✅ PATCH /appointments/:id/status
