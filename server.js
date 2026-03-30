@@ -3617,55 +3617,60 @@ const isInactive =
     let sent = 0;
     const errors = [];
 
-const customerName = customer.name || "cliente";
+let sent = 0;
+const errors = [];
 
-const personalizedMessage = String(message || "")
-  .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+for (const customer of emailAudience) {
+  try {
+    const customerName = customer.name || "cliente";
 
-const personalizedMessageHtml = String(message_html || "")
-  .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+    const personalizedMessage = String(message || "")
+      .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
-const personalizedFooter = String(
-  footer_note ||
-    `Este correo fue enviado por ${tenant.name || "Orbyx"} a través de Orbyx.`
-).replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+    const personalizedMessageHtml = String(message_html || "")
+      .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
-const personalizedFooterHtml = String(footer_note_html || "")
-  .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+    const personalizedFooter = String(
+      footer_note ||
+        `Este correo fue enviado por ${tenant.name || "Orbyx"} a través de Orbyx.`
+    ).replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
-const template = buildCampaignEmailTemplate({
-  businessName: tenant.name || "Orbyx",
-  subject: String(subject).trim(),
-  message: personalizedMessage,
-  messageHtml: personalizedMessageHtml,
-  brandColor: String(brand_color || "#0f766e").trim(),
-  heroImageUrl: String(hero_image_url || "").trim(),
-  heroImageHeight: Number(hero_image_height || 260),
-  heroImagePositionY: Number(hero_image_position_y || 50),
-  heroImageFit: String(hero_image_fit || "cover").trim(),
-  ctaText: String(cta_text || "Agendar visita").trim(),
-  ctaUrl: String(cta_url || "").trim(),
-  showCta: Boolean(show_cta),
-  footerNote: personalizedFooter,
-  footerNoteHtml: personalizedFooterHtml,
-});
+    const personalizedFooterHtml = String(footer_note_html || "")
+      .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
-        await sendCampaignEmail({
-          to: String(customer.email).trim().toLowerCase(),
-          subject: String(subject).trim(),
-          html: template.html,
-          text: template.text,
-        });
+    const template = buildCampaignEmailTemplate({
+      businessName: tenant.name || "Orbyx",
+      subject: String(subject).trim(),
+      message: personalizedMessage,
+      messageHtml: personalizedMessageHtml,
+      brandColor: String(brand_color || "#0f766e").trim(),
+      heroImageUrl: String(hero_image_url || "").trim(),
+      heroImageHeight: Number(hero_image_height || 260),
+      heroImagePositionY: Number(hero_image_position_y || 50),
+      heroImageFit: String(hero_image_fit || "cover").trim(),
+      ctaText: String(cta_text || "Agendar visita").trim(),
+      ctaUrl: String(cta_url || "").trim(),
+      showCta: Boolean(show_cta),
+      footerNote: personalizedFooter,
+      footerNoteHtml: personalizedFooterHtml,
+    });
 
-        sent++;
-      } catch (error) {
-        errors.push({
-          customer_id: customer.id,
-          email: customer.email,
-          error: error.message,
-        });
-      }
-    }
+    await sendCampaignEmail({
+      to: String(customer.email).trim().toLowerCase(),
+      subject: String(subject).trim(),
+      html: template.html,
+      text: template.text,
+    });
+
+    sent++;
+  } catch (error) {
+    errors.push({
+      customer_id: customer.id,
+      email: customer.email,
+      error: error.message,
+    });
+  }
+}
 
     try {
       await supabase.from("campaign_history").insert({
