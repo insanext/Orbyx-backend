@@ -8,7 +8,6 @@ const { createClient } = require("@supabase/supabase-js");
 const cors = require("cors");
 const { google } = require("googleapis");
 const crypto = require("crypto");
-const { supabase } = require("./supabaseClient");
 const { sendBookingEmail } = require("./email");
 
 const app = express();
