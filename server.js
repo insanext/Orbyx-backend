@@ -5612,9 +5612,9 @@ app.post("/upload/campaign-image", upload.single("file"), async (req, res) => {
       .single();
 
     return res.json({ image });
-  } catch (err) {
-    return res.status(500).json({ error: "Error subiendo imagen" });
-  }
+} catch (err) {
+  return res.status(500).json({ error: err.message || "Error subiendo imagen" });
+}
 });
 
 // =======================
@@ -5626,7 +5626,7 @@ app.get("/campaign-images/:slug", async (req, res) => {
 
     const { data: business } = await supabase
       .from("tenants")
-      .select("id")
+      .select("id, plan_slug")
       .eq("slug", slug)
       .single();
 
