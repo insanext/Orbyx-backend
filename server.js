@@ -3,6 +3,8 @@ console.log("BACKEND VERSION 26-03-EMAIL-CANCEL");
 // server.js
 require("dotenv").config();
 const express = require("express");
+const multer = require("multer");
+const { createClient } = require("@supabase/supabase-js");
 const cors = require("cors");
 const { google } = require("googleapis");
 const crypto = require("crypto");
@@ -10,6 +12,49 @@ const { supabase } = require("./supabaseClient");
 const { sendBookingEmail } = require("./email");
 
 const app = express();
+
+// =======================
+// SUPABASE
+// =======================
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+const BUCKET = process.env.SUPABASE_CAMPAIGN_IMAGES_BUCKET || "campaign-images";
+
+// =======================
+// MULTER
+// =======================
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 2 * 1024 * 1024, // 2MB
+  },
+});
+
+// =======================
+// HELPERS
+// =======================
+const PLAN_LIMITS = {
+  pro: 7,
+  premium: 15,
+  vip: 30,
+  platinum: 100,
+};
+
+function normalizePlan(plan) {
+  if (!plan) return "pro";
+  const p = plan.toLowerCase();
+  if (p === "premium") return "premium";
+  if (p === "vip") return "vip";
+  if (p === "platinum") return "platinum";
+  return "pro";
+}
+
+function isValidMime(mime) {
+  return ["image/jpeg", "image/png", "image/webp"].includes(mime);
+}
 
 function getPlanCapabilities(plan) {
   const normalizedPlan = String(plan || "pro").toLowerCase();
@@ -5493,6 +5538,135 @@ app.put("/booking-fields/:slug", async (req, res) => {
   } catch (err) {
     console.error("PUT /booking-fields/:slug error:", err.message);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// =======================
+// UPLOAD IMAGE
+// =======================
+app.post("/upload/campaign-image", upload.single("file"), async (req, res) => {
+  try {
+    const { slug } = req.body;
+
+    if (!slug) return res.status(400).json({ error: "Falta slug" });
+    if (!req.file) return res.status(400).json({ error: "No file" });
+
+    if (!isValidMime(req.file.mimetype)) {
+      return res.status(400).json({ error: "Formato inválido" });
+    }
+
+    // 1. Obtener tenant
+    const { data: business, error: bErr } = await supabase
+      .from("tenants")
+      .select("id, plan_slug")
+      .eq("slug", slug)
+      .single();
+
+    if (bErr || !business) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const plan = normalizePlan(business.plan_slug);
+    const limit = PLAN_LIMITS[plan] || 7;
+
+    // 2. Contar imágenes actuales
+    const { count } = await supabase
+      .from("campaign_images")
+      .select("*", { count: "exact", head: true })
+      .eq("tenant_id", business.id);
+
+    if ((count || 0) >= limit) {
+      return res.status(400).json({ error: "Límite de imágenes alcanzado" });
+    }
+
+    // 3. Subir a storage
+    const fileExt = req.file.mimetype.split("/")[1];
+    const filePath = `${business.id}/${Date.now()}.${fileExt}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from(BUCKET)
+      .upload(filePath, req.file.buffer, {
+        contentType: req.file.mimetype,
+      });
+
+    if (uploadError) {
+      return res.status(500).json({ error: uploadError.message });
+    }
+
+    const { data: publicUrlData } = supabase.storage
+      .from(BUCKET)
+      .getPublicUrl(filePath);
+
+    const publicUrl = publicUrlData.publicUrl;
+
+    // 4. Guardar en DB
+    const { data: image } = await supabase
+      .from("campaign_images")
+      .insert({
+        tenant_id: business.id,
+        file_path: filePath,
+        public_url: publicUrl,
+        mime_type: req.file.mimetype,
+        size_bytes: req.file.size,
+      })
+      .select()
+      .single();
+
+    return res.json({ image });
+  } catch (err) {
+    return res.status(500).json({ error: "Error subiendo imagen" });
+  }
+});
+
+// =======================
+// LISTAR IMÁGENES
+// =======================
+app.get("/campaign-images/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    const { data: business } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    const { data } = await supabase
+      .from("campaign_images")
+      .select("*")
+      .eq("tenant_id", business.id)
+      .order("created_at", { ascending: false });
+
+    res.json({ images: data });
+  } catch {
+    res.status(500).json({ error: "Error listando imágenes" });
+  }
+});
+
+// =======================
+// DELETE IMAGE
+// =======================
+app.delete("/campaign-images/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: image } = await supabase
+      .from("campaign_images")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (!image) {
+      return res.status(404).json({ error: "Imagen no encontrada" });
+    }
+
+    await supabase.storage.from(BUCKET).remove([image.file_path]);
+
+    await supabase.from("campaign_images").delete().eq("id", id);
+
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error eliminando" });
   }
 });
 
