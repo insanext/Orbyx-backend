@@ -3302,10 +3302,10 @@ app.get("/customers/:slug", async (req, res) => {
         ? new Date(customer.last_visit_at)
         : null;
 
-      const isInactive =
-        !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
-          ? true
-          : lastVisitAt.getTime() < inactiveCutoff.getTime();
+const isInactive =
+  !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
+    ? true
+    : lastVisitAt.getTime() <= inactiveCutoff.getTime();
 
       if (isInactive) return "inactive";
       if (totalVisits >= 5) return "frequent";
@@ -3471,10 +3471,10 @@ app.post("/campaigns/send-email", async (req, res) => {
         ? new Date(customer.last_visit_at)
         : null;
 
-      const isInactive =
-        !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
-          ? true
-          : lastVisitAt.getTime() < inactiveCutoff.getTime();
+const isInactive =
+  !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
+    ? true
+    : lastVisitAt.getTime() <= inactiveCutoff.getTime();
 
       if (isInactive) return "inactive";
       if (totalVisits >= 5) return "frequent";
