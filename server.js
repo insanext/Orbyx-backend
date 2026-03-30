@@ -3614,9 +3614,6 @@ const isInactive =
       });
     }
 
-    let sent = 0;
-    const errors = [];
-
 let sent = 0;
 const errors = [];
 
