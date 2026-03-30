@@ -929,17 +929,233 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 
+function sanitizeRichHtml(value) {
+  let html = String(value || "");
+
+  html = html.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "");
+  html = html.replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "");
+  html = html.replace(/\son\w+="[^"]*"/gi, "");
+  html = html.replace(/\son\w+='[^']*'/gi, "");
+  html = html.replace(/javascript:/gi, "");
+
+  return html.trim();
+}
+
+function htmlToPlainText(value) {
+  return String(value || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<li>/gi, "• ")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function buildCampaignEmailTemplate({
   businessName,
   subject,
   message,
+  messageHtml = "",
   brandColor = "#0f766e",
   heroImageUrl = "",
+  heroImageHeight = 260,
+  heroImagePositionY = 50,
+  heroImageFit = "cover",
   ctaText = "Agendar visita",
   ctaUrl = "",
   showCta = true,
   footerNote = "",
+  footerNoteHtml = "",
 }) {
+  const safeBusinessName = escapeHtml(businessName || "Orbyx");
+  const safeSubject = escapeHtml(subject || "Campaña");
+  const safeBrandColor = String(brandColor || "#0f766e").trim();
+  const safeHeroImageUrl = String(heroImageUrl || "").trim();
+  const safeCtaText = escapeHtml(ctaText || "Agendar visita");
+  const safeCtaUrl = String(ctaUrl || "").trim();
+
+  const normalizedHeroImageHeight = Math.min(
+    420,
+    Math.max(160, Number(heroImageHeight || 260))
+  );
+
+  const normalizedHeroImagePositionY = Math.min(
+    100,
+    Math.max(0, Number(heroImagePositionY || 50))
+  );
+
+  const normalizedHeroImageFit =
+    String(heroImageFit || "cover").toLowerCase() === "contain"
+      ? "contain"
+      : "cover";
+
+  const normalizedMessageHtml = sanitizeRichHtml(messageHtml);
+  const normalizedFooterHtml = sanitizeRichHtml(footerNoteHtml);
+
+  const fallbackMessageHtml = escapeHtml(message || "").replace(/\n/g, "<br />");
+  const fallbackFooterHtml = escapeHtml(
+    footerNote ||
+      `Este correo fue enviado por ${businessName || "Orbyx"} a través de Orbyx.`
+  ).replace(/\n/g, "<br />");
+
+  const finalMessageHtml =
+    normalizedMessageHtml || `<p>${fallbackMessageHtml}</p>`;
+
+  const finalFooterHtml =
+    normalizedFooterHtml || `<p>${fallbackFooterHtml}</p>`;
+
+  const heroBlock = safeHeroImageUrl
+    ? `
+      <tr>
+        <td style="background:#e2e8f0;">
+          <img
+            src="${safeHeroImageUrl}"
+            alt="Banner campaña"
+            style="
+              display:block;
+              width:100%;
+              height:${normalizedHeroImageHeight}px;
+              object-fit:${normalizedHeroImageFit};
+              object-position:center ${normalizedHeroImagePositionY}%;
+              border:0;
+              background:#e2e8f0;
+            "
+          />
+        </td>
+      </tr>
+    `
+    : "";
+
+  const ctaBlock =
+    showCta && safeCtaUrl
+      ? `
+        <div style="margin-top:28px;">
+          <a
+            href="${safeCtaUrl}"
+            target="_blank"
+            rel="noreferrer"
+            style="
+              display:inline-block;
+              padding:14px 22px;
+              border-radius:16px;
+              background:${safeBrandColor};
+              color:#ffffff;
+              font-size:14px;
+              font-weight:700;
+              text-decoration:none;
+            "
+          >
+            ${safeCtaText}
+          </a>
+        </div>
+      `
+      : "";
+
+  const html = `
+  <div style="margin:0;padding:0;background:#f8fafc;font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;padding:32px 16px;">
+      <tr>
+        <td align="center">
+          <table
+            role="presentation"
+            width="100%"
+            cellspacing="0"
+            cellpadding="0"
+            style="
+              max-width:680px;
+              background:#ffffff;
+              border:1px solid #e2e8f0;
+              border-radius:28px;
+              overflow:hidden;
+            "
+          >
+            <tr>
+              <td
+                style="
+                  padding:32px 32px 24px 32px;
+                  background:${safeBrandColor};
+                  color:#ffffff;
+                "
+              >
+                <div style="font-size:11px;letter-spacing:0.22em;text-transform:uppercase;opacity:0.78;font-weight:700;">
+                  ${safeBusinessName}
+                </div>
+
+                <h1 style="margin:12px 0 0 0;font-size:28px;line-height:1.2;font-weight:700;">
+                  ${safeSubject}
+                </h1>
+              </td>
+            </tr>
+
+            ${heroBlock}
+
+            <tr>
+              <td style="padding:32px;">
+                <div
+                  style="
+                    border:1px solid #e2e8f0;
+                    border-radius:20px;
+                    background:#f8fafc;
+                    padding:24px;
+                    font-size:16px;
+                    line-height:1.8;
+                    color:#334155;
+                  "
+                >
+                  <div style="font-weight:700;color:#0f172a;">
+                    Hola {{nombre}},
+                  </div>
+
+                  <div style="margin-top:14px;">
+                    ${finalMessageHtml}
+                  </div>
+
+                  ${ctaBlock}
+                </div>
+
+                <div
+                  style="
+                    margin-top:24px;
+                    padding-top:20px;
+                    border-top:1px solid #e2e8f0;
+                    font-size:13px;
+                    line-height:1.7;
+                    color:#64748b;
+                  "
+                >
+                  ${finalFooterHtml}
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </div>
+  `;
+
+  const textParts = [
+    businessName || "Orbyx",
+    "",
+    subject || "Campaña",
+    "",
+    htmlToPlainText(finalMessageHtml) || String(message || ""),
+    "",
+    showCta && safeCtaUrl ? `${ctaText || "Agendar visita"}: ${safeCtaUrl}` : "",
+    "",
+    htmlToPlainText(finalFooterHtml) ||
+      footerNote ||
+      `Este correo fue enviado por ${businessName || "Orbyx"} a través de Orbyx.`,
+  ].filter(Boolean);
+
+  return {
+    html,
+    text: textParts.join("\n"),
+  };
+}
+
   const safeBusinessName = escapeHtml(businessName || "Orbyx");
   const safeSubject = escapeHtml(subject || "Campaña");
   const safeMessage = escapeHtml(message || "").replace(/\n/g, "<br />");
@@ -3404,25 +3620,30 @@ const isInactive =
 ====================================================== */
 app.post("/campaigns/send-email", async (req, res) => {
   try {
-    const {
-      slug,
-      channel = "email",
-      segment,
-      inactive_days = 60,
-      subject,
-      message,
-      campaign_name,
-      limit = 50,
-      sort = "oldest",
+const {
+  slug,
+  channel = "email",
+  segment,
+  inactive_days = 60,
+  subject,
+  message,
+  message_html = "",
+  campaign_name,
+  limit = 50,
+  sort = "oldest",
 
-      // 🔥 nuevos campos visuales
-      brand_color = "#0f766e",
-      hero_image_url = "",
-      cta_text = "Agendar visita",
-      cta_url = "",
-      show_cta = true,
-      footer_note = "",
-    } = req.body;
+  // visuales
+  brand_color = "#0f766e",
+  hero_image_url = "",
+  hero_image_height = 260,
+  hero_image_position_y = 50,
+  hero_image_fit = "cover",
+  cta_text = "Agendar visita",
+  cta_url = "",
+  show_cta = true,
+  footer_note = "",
+  footer_note_html = "",
+} = req.body;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
@@ -3440,9 +3661,12 @@ app.post("/campaigns/send-email", async (req, res) => {
       return res.status(400).json({ error: "subject es obligatorio" });
     }
 
-    if (!message || !String(message).trim()) {
-      return res.status(400).json({ error: "message es obligatorio" });
-    }
+if (
+  (!message || !String(message).trim()) &&
+  (!message_html || !String(message_html).trim())
+) {
+  return res.status(400).json({ error: "message es obligatorio" });
+}
 
     const normalizedChannel = String(channel).trim().toLowerCase();
     const normalizedSegment = String(segment).trim().toLowerCase();
@@ -3579,27 +3803,38 @@ const isInactive =
     let sent = 0;
     const errors = [];
 
-    for (const customer of emailAudience) {
-      try {
-        const personalizedMessage = String(message)
-          .replace(/\{\{\s*nombre\s*\}\}/gi, customer.name || "cliente");
+const customerName = customer.name || "cliente";
 
-        const personalizedFooter = String(
-          footer_note ||
-            `Este correo fue enviado por ${tenant.name || "Orbyx"} a través de Orbyx.`
-        ).replace(/\{\{\s*nombre\s*\}\}/gi, customer.name || "cliente");
+const personalizedMessage = String(message || "")
+  .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
-        const template = buildCampaignEmailTemplate({
-          businessName: tenant.name || "Orbyx",
-          subject: String(subject).trim(),
-          message: personalizedMessage,
-          brandColor: String(brand_color || "#0f766e").trim(),
-          heroImageUrl: String(hero_image_url || "").trim(),
-          ctaText: String(cta_text || "Agendar visita").trim(),
-          ctaUrl: String(cta_url || "").trim(),
-          showCta: Boolean(show_cta),
-          footerNote: personalizedFooter,
-        });
+const personalizedMessageHtml = String(message_html || "")
+  .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+
+const personalizedFooter = String(
+  footer_note ||
+    `Este correo fue enviado por ${tenant.name || "Orbyx"} a través de Orbyx.`
+).replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+
+const personalizedFooterHtml = String(footer_note_html || "")
+  .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+
+const template = buildCampaignEmailTemplate({
+  businessName: tenant.name || "Orbyx",
+  subject: String(subject).trim(),
+  message: personalizedMessage,
+  messageHtml: personalizedMessageHtml,
+  brandColor: String(brand_color || "#0f766e").trim(),
+  heroImageUrl: String(hero_image_url || "").trim(),
+  heroImageHeight: Number(hero_image_height || 260),
+  heroImagePositionY: Number(hero_image_position_y || 50),
+  heroImageFit: String(hero_image_fit || "cover").trim(),
+  ctaText: String(cta_text || "Agendar visita").trim(),
+  ctaUrl: String(cta_url || "").trim(),
+  showCta: Boolean(show_cta),
+  footerNote: personalizedFooter,
+  footerNoteHtml: personalizedFooterHtml,
+});
 
         await sendCampaignEmail({
           to: String(customer.email).trim().toLowerCase(),
