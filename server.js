@@ -3709,22 +3709,33 @@ app.post("/campaigns/send-email", async (req, res) => {
       now.getTime() - inactiveDays * 24 * 60 * 60 * 1000
     );
 
-    function getCustomerSegment(customer) {
-      const totalVisits = Number(customer.total_visits || 0);
-      const lastVisitAt = customer.last_visit_at
-        ? new Date(customer.last_visit_at)
-        : null;
+    
+function getCustomerSegment(customer) {
+  const totalVisits = Number(customer.total_visits || 0);
+  const lastVisitAt = customer.last_visit_at
+    ? new Date(customer.last_visit_at)
+    : null;
 
-      const isInactive =
-        !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
-          ? true
-          : lastVisitAt.getTime() <= inactiveCutoff.getTime();
+  // 🔥 SOLO aplicar inactividad si el segmento seleccionado es "inactive"
+  if (normalizedSegment === "inactive") {
+    const inactiveCutoff = new Date(
+      Date.now() - inactiveDays * 24 * 60 * 60 * 1000
+    );
 
-      if (isInactive) return "inactive";
-      if (totalVisits >= 5) return "frequent";
-      if (totalVisits >= 2) return "recurrent";
-      return "new";
-    }
+    const isInactive =
+      !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
+        ? true
+        : lastVisitAt.getTime() <= inactiveCutoff.getTime();
+
+    if (isInactive) return "inactive";
+    return null; // 👈 clave: si no es inactivo, no entra
+  }
+
+  // 🔥 resto de segmentos SIN usar inactividad
+  if (totalVisits >= 5) return "frequent";
+  if (totalVisits >= 2) return "recurrent";
+  return "new";
+}
 
     function sortCustomers(list) {
       if (normalizedSort === "oldest") {
@@ -3757,6 +3768,13 @@ app.post("/campaigns/send-email", async (req, res) => {
 
       return list;
     }
+
+
+
+
+
+
+
 
     const audience = rows.filter((customer) => {
       const customerSegment = getCustomerSegment(customer);
