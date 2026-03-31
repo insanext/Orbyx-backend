@@ -3430,34 +3430,39 @@ const isInactive =
 
 /* ======================================================
    ✅ POST /campaigns/send-email
-   Envío real básico por email según segmento + límite por plan
+   Envío real por email usando audiencia curada desde frontend
 ====================================================== */
 app.post("/campaigns/send-email", async (req, res) => {
   try {
-const {
-  slug,
-  channel = "email",
-  segment,
-  inactive_days = 60,
-  subject,
-  message,
-  message_html = "",
-  campaign_name,
-  limit = 50,
-  sort = "oldest",
+    const {
+      slug,
+      channel = "email",
+      segment,
+      inactive_days = 60,
+      subject,
+      message,
+      message_html = "",
+      campaign_name,
+      limit = 50,
+      sort = "oldest",
 
-  // visuales
-  brand_color = "#0f766e",
-  hero_image_url = "",
-  hero_image_height = 260,
-  hero_image_position_y = 50,
-  hero_image_fit = "cover",
-  cta_text = "Agendar visita",
-  cta_url = "",
-  show_cta = true,
-  footer_note = "",
-  footer_note_html = "",
-} = req.body;
+      // visuales
+      brand_color = "#0f766e",
+      hero_image_url = "",
+      hero_image_height = 260,
+      hero_image_position_y = 50,
+      hero_image_fit = "cover",
+      cta_text = "Agendar visita",
+      cta_url = "",
+      show_cta = true,
+      footer_note = "",
+      footer_note_html = "",
+
+      // NUEVO: audiencia curada
+      final_recipients = [],
+      excluded_recipient_ids = [],
+      manual_recipients = [],
+    } = req.body;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
@@ -3475,12 +3480,12 @@ const {
       return res.status(400).json({ error: "subject es obligatorio" });
     }
 
-if (
-  (!message || !String(message).trim()) &&
-  (!message_html || !String(message_html).trim())
-) {
-  return res.status(400).json({ error: "message es obligatorio" });
-}
+    if (
+      (!message || !String(message).trim()) &&
+      (!message_html || !String(message_html).trim())
+    ) {
+      return res.status(400).json({ error: "message es obligatorio" });
+    }
 
     const normalizedChannel = String(channel).trim().toLowerCase();
     const normalizedSegment = String(segment).trim().toLowerCase();
@@ -3528,6 +3533,163 @@ if (
     const currentPlan = normalizePlanSlug(tenant.plan_slug || tenant.plan || "pro");
     const caps = getPlanCapabilities(currentPlan);
     const planLimit = Number(caps.max_campaign_emails_per_send || 50);
+
+    function normalizeEmail(value) {
+      return String(value || "").trim().toLowerCase();
+    }
+
+    function isValidEmail(value) {
+      const email = normalizeEmail(value);
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    }
+
+    const hasCuratedAudience =
+      Array.isArray(final_recipients) && final_recipients.length > 0;
+
+    let audienceTotal = 0;
+    let emailAudience = [];
+
+    if (hasCuratedAudience) {
+      const excludedIds = new Set(
+        Array.isArray(excluded_recipient_ids)
+          ? excluded_recipient_ids.map((id) => String(id))
+          : []
+      );
+
+      const dedupeMap = new Map();
+
+      for (const recipient of final_recipients) {
+        const recipientId = String(recipient?.id || "");
+        const email = normalizeEmail(recipient?.email || "");
+
+        if (!email || !isValidEmail(email)) continue;
+        if (recipientId && excludedIds.has(recipientId)) continue;
+
+        if (!dedupeMap.has(email)) {
+          dedupeMap.set(email, {
+            id: recipientId || null,
+            customer_id:
+              recipient?.source === "segment" && recipientId.startsWith("segment:")
+                ? recipientId.replace("segment:", "")
+                : null,
+            source: recipient?.source || "segment",
+            name: String(recipient?.name || "cliente").trim(),
+            email,
+          });
+        }
+      }
+
+      audienceTotal = Array.isArray(final_recipients) ? final_recipients.length : 0;
+
+      const appliedLimit = Math.min(requestedLimit, planLimit);
+      emailAudience = Array.from(dedupeMap.values()).slice(0, appliedLimit);
+
+      if (emailAudience.length === 0) {
+        return res.status(400).json({
+          error: "No hay destinatarios con email válido en la audiencia curada",
+        });
+      }
+
+      let sent = 0;
+      const errors = [];
+
+      for (const customer of emailAudience) {
+        try {
+          const customerName = customer.name || "cliente";
+
+          const personalizedMessage = String(message || "")
+            .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+
+          const personalizedMessageHtml = String(message_html || "")
+            .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+
+          const personalizedFooter = String(
+            footer_note ||
+              `Este correo fue enviado por ${tenant.name || "Orbyx"} a través de Orbyx.`
+          ).replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+
+          const personalizedFooterHtml = String(footer_note_html || "")
+            .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+
+          const template = buildCampaignEmailTemplate({
+            businessName: tenant.name || "Orbyx",
+            subject: String(subject).trim(),
+            message: personalizedMessage,
+            messageHtml: personalizedMessageHtml,
+            brandColor: String(brand_color || "#0f766e").trim(),
+            heroImageUrl: String(hero_image_url || "").trim(),
+            heroImageHeight: Number(hero_image_height || 260),
+            heroImagePositionY: Number(hero_image_position_y || 50),
+            heroImageFit: String(hero_image_fit || "cover").trim(),
+            ctaText: String(cta_text || "Agendar visita").trim(),
+            ctaUrl: String(cta_url || "").trim(),
+            showCta: Boolean(show_cta),
+            footerNote: personalizedFooter,
+            footerNoteHtml: personalizedFooterHtml,
+          });
+
+          await sendCampaignEmail({
+            to: customer.email,
+            subject: String(subject).trim(),
+            html: template.html,
+            text: template.text,
+          });
+
+          sent++;
+        } catch (error) {
+          errors.push({
+            customer_id: customer.customer_id,
+            email: customer.email,
+            error: error.message,
+          });
+        }
+      }
+
+      try {
+        await supabase.from("campaign_history").insert({
+          tenant_id: tenant.id,
+          campaign_name: campaign_name ? String(campaign_name).trim() : null,
+          channel: "email",
+          segment: normalizedSegment,
+          inactive_days: inactiveDays,
+          subject: String(subject).trim(),
+          message: String(message || "").trim(),
+          sort: normalizedSort,
+          plan_slug: currentPlan,
+          plan_limit: planLimit,
+          requested_limit: requestedLimit,
+          applied_limit: emailAudience.length,
+          audience_total: audienceTotal,
+          recipients_with_contact: emailAudience.length,
+          sent_count: sent,
+          failed_count: errors.length,
+        });
+      } catch (e) {
+        console.error("❌ Error guardando historial campaña:", e.message);
+      }
+
+      return res.json({
+        ok: true,
+        campaign_name: campaign_name ? String(campaign_name).trim() : null,
+        channel: "email",
+        slug,
+        plan: currentPlan,
+        plan_limit: planLimit,
+        requested_limit: requestedLimit,
+        applied_limit: emailAudience.length,
+        sort: normalizedSort,
+        segment: normalizedSegment,
+        inactive_days: inactiveDays,
+        audience_total: audienceTotal,
+        recipients_with_email: emailAudience.length,
+        sent,
+        failed: errors.length,
+        errors,
+        used_curated_audience: true,
+      });
+    }
+
+    // FALLBACK ANTIGUO: si no viene final_recipients, sigue usando segmento bruto
     const appliedLimit = Math.min(requestedLimit, planLimit);
 
     const { data: customers, error: customersError } = await supabase
@@ -3553,10 +3715,10 @@ if (
         ? new Date(customer.last_visit_at)
         : null;
 
-const isInactive =
-  !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
-    ? true
-    : lastVisitAt.getTime() <= inactiveCutoff.getTime();
+      const isInactive =
+        !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
+          ? true
+          : lastVisitAt.getTime() <= inactiveCutoff.getTime();
 
       if (isInactive) return "inactive";
       if (totalVisits >= 5) return "frequent";
@@ -3604,7 +3766,7 @@ const isInactive =
     const sortedAudience = sortCustomers([...audience]);
     const limitedAudience = sortedAudience.slice(0, appliedLimit);
 
-    const emailAudience = limitedAudience.filter(
+    emailAudience = limitedAudience.filter(
       (customer) => customer.email && String(customer.email).trim()
     );
 
@@ -3614,60 +3776,60 @@ const isInactive =
       });
     }
 
-let sent = 0;
-const errors = [];
+    let sent = 0;
+    const errors = [];
 
-for (const customer of emailAudience) {
-  try {
-    const customerName = customer.name || "cliente";
+    for (const customer of emailAudience) {
+      try {
+        const customerName = customer.name || "cliente";
 
-    const personalizedMessage = String(message || "")
-      .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+        const personalizedMessage = String(message || "")
+          .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
-    const personalizedMessageHtml = String(message_html || "")
-      .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+        const personalizedMessageHtml = String(message_html || "")
+          .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
-    const personalizedFooter = String(
-      footer_note ||
-        `Este correo fue enviado por ${tenant.name || "Orbyx"} a través de Orbyx.`
-    ).replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+        const personalizedFooter = String(
+          footer_note ||
+            `Este correo fue enviado por ${tenant.name || "Orbyx"} a través de Orbyx.`
+        ).replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
-    const personalizedFooterHtml = String(footer_note_html || "")
-      .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
+        const personalizedFooterHtml = String(footer_note_html || "")
+          .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
-    const template = buildCampaignEmailTemplate({
-      businessName: tenant.name || "Orbyx",
-      subject: String(subject).trim(),
-      message: personalizedMessage,
-      messageHtml: personalizedMessageHtml,
-      brandColor: String(brand_color || "#0f766e").trim(),
-      heroImageUrl: String(hero_image_url || "").trim(),
-      heroImageHeight: Number(hero_image_height || 260),
-      heroImagePositionY: Number(hero_image_position_y || 50),
-      heroImageFit: String(hero_image_fit || "cover").trim(),
-      ctaText: String(cta_text || "Agendar visita").trim(),
-      ctaUrl: String(cta_url || "").trim(),
-      showCta: Boolean(show_cta),
-      footerNote: personalizedFooter,
-      footerNoteHtml: personalizedFooterHtml,
-    });
+        const template = buildCampaignEmailTemplate({
+          businessName: tenant.name || "Orbyx",
+          subject: String(subject).trim(),
+          message: personalizedMessage,
+          messageHtml: personalizedMessageHtml,
+          brandColor: String(brand_color || "#0f766e").trim(),
+          heroImageUrl: String(hero_image_url || "").trim(),
+          heroImageHeight: Number(hero_image_height || 260),
+          heroImagePositionY: Number(hero_image_position_y || 50),
+          heroImageFit: String(hero_image_fit || "cover").trim(),
+          ctaText: String(cta_text || "Agendar visita").trim(),
+          ctaUrl: String(cta_url || "").trim(),
+          showCta: Boolean(show_cta),
+          footerNote: personalizedFooter,
+          footerNoteHtml: personalizedFooterHtml,
+        });
 
-    await sendCampaignEmail({
-      to: String(customer.email).trim().toLowerCase(),
-      subject: String(subject).trim(),
-      html: template.html,
-      text: template.text,
-    });
+        await sendCampaignEmail({
+          to: String(customer.email).trim().toLowerCase(),
+          subject: String(subject).trim(),
+          html: template.html,
+          text: template.text,
+        });
 
-    sent++;
-  } catch (error) {
-    errors.push({
-      customer_id: customer.id,
-      email: customer.email,
-      error: error.message,
-    });
-  }
-}
+        sent++;
+      } catch (error) {
+        errors.push({
+          customer_id: customer.id,
+          email: customer.email,
+          error: error.message,
+        });
+      }
+    }
 
     try {
       await supabase.from("campaign_history").insert({
@@ -3677,7 +3839,7 @@ for (const customer of emailAudience) {
         segment: normalizedSegment,
         inactive_days: inactiveDays,
         subject: String(subject).trim(),
-        message: String(message).trim(),
+        message: String(message || "").trim(),
         sort: normalizedSort,
         plan_slug: currentPlan,
         plan_limit: planLimit,
@@ -3709,6 +3871,7 @@ for (const customer of emailAudience) {
       sent,
       failed: errors.length,
       errors,
+      used_curated_audience: false,
     });
   } catch (err) {
     console.error("POST /campaigns/send-email error:", err.message);
