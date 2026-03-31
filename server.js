@@ -3318,6 +3318,49 @@ app.get("/appointments", async (req, res) => {
   }
 });
 
+async function insertCampaignDeliveryLog({
+  tenantId,
+  campaignHistoryId,
+  channel,
+  customerName = null,
+  customerEmail = null,
+  customerPhone = null,
+  status,
+  errorMessage = null,
+}) {
+  const payload = {
+    tenant_id: tenantId,
+    campaign_history_id: campaignHistoryId,
+    channel,
+    customer_name: customerName,
+    customer_email: customerEmail,
+    customer_phone: customerPhone,
+    status,
+    error_message: errorMessage,
+    sent_at: status === "sent" ? new Date().toISOString() : null,
+  };
+
+  const { error } = await supabase
+    .from("campaign_delivery_logs")
+    .insert(payload);
+
+  if (error) {
+    console.error("❌ Error guardando campaign_delivery_log:", error.message);
+  }
+}
+
+function normalizeCampaignError(error) {
+  if (!error) return "Unknown error";
+  if (typeof error === "string") return error;
+  if (error.message) return error.message;
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return "Unknown error";
+  }
+}
+
 /* ======================================================
    ✅ GET /customers/:slug
    Soporta búsqueda + segmentación + inactivos
@@ -3428,6 +3471,7 @@ const isInactive =
   }
 });
 
+
 /* ======================================================
    ✅ POST /campaigns/send-email
    Envío real por email usando audiencia curada desde frontend
@@ -3458,7 +3502,7 @@ app.post("/campaigns/send-email", async (req, res) => {
       footer_note = "",
       footer_note_html = "",
 
-      // NUEVO: audiencia curada
+      // audiencia curada
       final_recipients = [],
       excluded_recipient_ids = [],
       manual_recipients = [],
@@ -3543,11 +3587,66 @@ app.post("/campaigns/send-email", async (req, res) => {
       return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
     }
 
+    function getCustomerSegment(customer) {
+      const totalVisits = Number(customer.total_visits || 0);
+      const lastVisitAt = customer.last_visit_at
+        ? new Date(customer.last_visit_at)
+        : null;
+
+      const inactiveCutoff = new Date(
+        Date.now() - inactiveDays * 24 * 60 * 60 * 1000
+      );
+
+      const isInactive =
+        !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
+          ? true
+          : lastVisitAt.getTime() <= inactiveCutoff.getTime();
+
+      if (isInactive) return "inactive";
+      if (totalVisits >= 5) return "frequent";
+      if (totalVisits >= 2) return "recurrent";
+      return "new";
+    }
+
+    function sortCustomers(list) {
+      if (normalizedSort === "oldest") {
+        return list.sort((a, b) => {
+          const aDate = new Date(a.last_visit_at || 0).getTime();
+          const bDate = new Date(b.last_visit_at || 0).getTime();
+          return aDate - bDate;
+        });
+      }
+
+      if (normalizedSort === "recent") {
+        return list.sort((a, b) => {
+          const aDate = new Date(a.last_visit_at || 0).getTime();
+          const bDate = new Date(b.last_visit_at || 0).getTime();
+          return bDate - aDate;
+        });
+      }
+
+      if (normalizedSort === "most_visits") {
+        return list.sort(
+          (a, b) => Number(b.total_visits || 0) - Number(a.total_visits || 0)
+        );
+      }
+
+      if (normalizedSort === "least_visits") {
+        return list.sort(
+          (a, b) => Number(a.total_visits || 0) - Number(b.total_visits || 0)
+        );
+      }
+
+      return list;
+    }
+
     const hasCuratedAudience =
       Array.isArray(final_recipients) && final_recipients.length > 0;
 
     let audienceTotal = 0;
     let emailAudience = [];
+    let sent = 0;
+    const errors = [];
 
     if (hasCuratedAudience) {
       const excludedIds = new Set(
@@ -3575,6 +3674,7 @@ app.post("/campaigns/send-email", async (req, res) => {
             source: recipient?.source || "segment",
             name: String(recipient?.name || "cliente").trim(),
             email,
+            phone: recipient?.phone ? String(recipient.phone).trim() : null,
           });
         }
       }
@@ -3590,8 +3690,35 @@ app.post("/campaigns/send-email", async (req, res) => {
         });
       }
 
-      let sent = 0;
-      const errors = [];
+      const { data: historyRow, error: historyError } = await supabase
+        .from("campaign_history")
+        .insert({
+          tenant_id: tenant.id,
+          campaign_name: campaign_name ? String(campaign_name).trim() : null,
+          channel: "email",
+          segment: normalizedSegment,
+          inactive_days: inactiveDays,
+          subject: String(subject).trim(),
+          message: String(message || "").trim(),
+          sort: normalizedSort,
+          plan_slug: currentPlan,
+          plan_limit: planLimit,
+          requested_limit: requestedLimit,
+          applied_limit: emailAudience.length,
+          audience_total: audienceTotal,
+          recipients_with_contact: emailAudience.length,
+          sent_count: 0,
+          failed_count: 0,
+        })
+        .select("id")
+        .single();
+
+      if (historyError || !historyRow) {
+        console.error("❌ Error creando campaign_history:", historyError?.message);
+        return res.status(500).json({ error: "No se pudo crear el historial de campaña" });
+      }
+
+      const campaignHistoryId = historyRow.id;
 
       for (const customer of emailAudience) {
         try {
@@ -3636,40 +3763,49 @@ app.post("/campaigns/send-email", async (req, res) => {
           });
 
           sent++;
+
+          await insertCampaignDeliveryLog({
+            tenantId: tenant.id,
+            campaignHistoryId,
+            channel: "email",
+            customerName,
+            customerEmail: customer.email,
+            customerPhone: customer.phone || null,
+            status: "sent",
+          });
         } catch (error) {
+          const normalizedError = normalizeCampaignError(error);
+
           errors.push({
             customer_id: customer.customer_id,
             email: customer.email,
-            error: error.message,
+            error: normalizedError,
+          });
+
+          await insertCampaignDeliveryLog({
+            tenantId: tenant.id,
+            campaignHistoryId,
+            channel: "email",
+            customerName: customer.name || "cliente",
+            customerEmail: customer.email,
+            customerPhone: customer.phone || null,
+            status: "failed",
+            errorMessage: normalizedError,
           });
         }
       }
 
-      try {
-        await supabase.from("campaign_history").insert({
-          tenant_id: tenant.id,
-          campaign_name: campaign_name ? String(campaign_name).trim() : null,
-          channel: "email",
-          segment: normalizedSegment,
-          inactive_days: inactiveDays,
-          subject: String(subject).trim(),
-          message: String(message || "").trim(),
-          sort: normalizedSort,
-          plan_slug: currentPlan,
-          plan_limit: planLimit,
-          requested_limit: requestedLimit,
-          applied_limit: emailAudience.length,
-          audience_total: audienceTotal,
-          recipients_with_contact: emailAudience.length,
+      await supabase
+        .from("campaign_history")
+        .update({
           sent_count: sent,
           failed_count: errors.length,
-        });
-      } catch (e) {
-        console.error("❌ Error guardando historial campaña:", e.message);
-      }
+        })
+        .eq("id", campaignHistoryId);
 
       return res.json({
         ok: true,
+        campaign_history_id: campaignHistoryId,
         campaign_name: campaign_name ? String(campaign_name).trim() : null,
         channel: "email",
         slug,
@@ -3689,7 +3825,6 @@ app.post("/campaigns/send-email", async (req, res) => {
       });
     }
 
-    // FALLBACK ANTIGUO: si no viene final_recipients, sigue usando segmento bruto
     const appliedLimit = Math.min(requestedLimit, planLimit);
 
     const { data: customers, error: customersError } = await supabase
@@ -3704,70 +3839,6 @@ app.post("/campaigns/send-email", async (req, res) => {
     }
 
     const rows = Array.isArray(customers) ? customers : [];
-    const now = new Date();
-    const inactiveCutoff = new Date(
-      now.getTime() - inactiveDays * 24 * 60 * 60 * 1000
-    );
-
-function getCustomerSegment(customer) {
-  const totalVisits = Number(customer.total_visits || 0);
-  const lastVisitAt = customer.last_visit_at
-    ? new Date(customer.last_visit_at)
-    : null;
-
-  const inactiveCutoff = new Date(
-    Date.now() - inactiveDays * 24 * 60 * 60 * 1000
-  );
-
-  const isInactive =
-    !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
-      ? true
-      : lastVisitAt.getTime() <= inactiveCutoff.getTime();
-
-  if (isInactive) return "inactive";
-  if (totalVisits >= 5) return "frequent";
-  if (totalVisits >= 2) return "recurrent";
-  return "new";
-}    
-
-    function sortCustomers(list) {
-      if (normalizedSort === "oldest") {
-        return list.sort((a, b) => {
-          const aDate = new Date(a.last_visit_at || 0).getTime();
-          const bDate = new Date(b.last_visit_at || 0).getTime();
-          return aDate - bDate;
-        });
-      }
-
-      if (normalizedSort === "recent") {
-        return list.sort((a, b) => {
-          const aDate = new Date(a.last_visit_at || 0).getTime();
-          const bDate = new Date(b.last_visit_at || 0).getTime();
-          return bDate - aDate;
-        });
-      }
-
-      if (normalizedSort === "most_visits") {
-        return list.sort(
-          (a, b) => Number(b.total_visits || 0) - Number(a.total_visits || 0)
-        );
-      }
-
-      if (normalizedSort === "least_visits") {
-        return list.sort(
-          (a, b) => Number(a.total_visits || 0) - Number(b.total_visits || 0)
-        );
-      }
-
-      return list;
-    }
-
-
-
-
-
-
-
 
     const audience = rows.filter((customer) => {
       const customerSegment = getCustomerSegment(customer);
@@ -3778,7 +3849,7 @@ function getCustomerSegment(customer) {
     const limitedAudience = sortedAudience.slice(0, appliedLimit);
 
     emailAudience = limitedAudience.filter(
-      (customer) => customer.email && String(customer.email).trim()
+      (customer) => customer.email && isValidEmail(customer.email)
     );
 
     if (emailAudience.length === 0) {
@@ -3787,8 +3858,35 @@ function getCustomerSegment(customer) {
       });
     }
 
-    let sent = 0;
-    const errors = [];
+    const { data: historyRow, error: historyError } = await supabase
+      .from("campaign_history")
+      .insert({
+        tenant_id: tenant.id,
+        campaign_name: campaign_name ? String(campaign_name).trim() : null,
+        channel: "email",
+        segment: normalizedSegment,
+        inactive_days: inactiveDays,
+        subject: String(subject).trim(),
+        message: String(message || "").trim(),
+        sort: normalizedSort,
+        plan_slug: currentPlan,
+        plan_limit: planLimit,
+        requested_limit: requestedLimit,
+        applied_limit: appliedLimit,
+        audience_total: audience.length,
+        recipients_with_contact: emailAudience.length,
+        sent_count: 0,
+        failed_count: 0,
+      })
+      .select("id")
+      .single();
+
+    if (historyError || !historyRow) {
+      console.error("❌ Error creando campaign_history:", historyError?.message);
+      return res.status(500).json({ error: "No se pudo crear el historial de campaña" });
+    }
+
+    const campaignHistoryId = historyRow.id;
 
     for (const customer of emailAudience) {
       try {
@@ -3833,40 +3931,49 @@ function getCustomerSegment(customer) {
         });
 
         sent++;
+
+        await insertCampaignDeliveryLog({
+          tenantId: tenant.id,
+          campaignHistoryId,
+          channel: "email",
+          customerName,
+          customerEmail: String(customer.email).trim().toLowerCase(),
+          customerPhone: customer.phone ? String(customer.phone).trim() : null,
+          status: "sent",
+        });
       } catch (error) {
+        const normalizedError = normalizeCampaignError(error);
+
         errors.push({
           customer_id: customer.id,
           email: customer.email,
-          error: error.message,
+          error: normalizedError,
+        });
+
+        await insertCampaignDeliveryLog({
+          tenantId: tenant.id,
+          campaignHistoryId,
+          channel: "email",
+          customerName: customer.name || "cliente",
+          customerEmail: customer.email ? String(customer.email).trim().toLowerCase() : null,
+          customerPhone: customer.phone ? String(customer.phone).trim() : null,
+          status: "failed",
+          errorMessage: normalizedError,
         });
       }
     }
 
-    try {
-      await supabase.from("campaign_history").insert({
-        tenant_id: tenant.id,
-        campaign_name: campaign_name ? String(campaign_name).trim() : null,
-        channel: "email",
-        segment: normalizedSegment,
-        inactive_days: inactiveDays,
-        subject: String(subject).trim(),
-        message: String(message || "").trim(),
-        sort: normalizedSort,
-        plan_slug: currentPlan,
-        plan_limit: planLimit,
-        requested_limit: requestedLimit,
-        applied_limit: appliedLimit,
-        audience_total: audience.length,
-        recipients_with_contact: emailAudience.length,
+    await supabase
+      .from("campaign_history")
+      .update({
         sent_count: sent,
         failed_count: errors.length,
-      });
-    } catch (e) {
-      console.error("❌ Error guardando historial campaña:", e.message);
-    }
+      })
+      .eq("id", campaignHistoryId);
 
     return res.json({
       ok: true,
+      campaign_history_id: campaignHistoryId,
       campaign_name: campaign_name ? String(campaign_name).trim() : null,
       channel: "email",
       slug,
