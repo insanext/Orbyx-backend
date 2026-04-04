@@ -3998,6 +3998,159 @@ app.post("/campaigns/send-email", async (req, res) => {
 });
 
 /* ======================================================
+   ✅ POST /campaigns/save-whatsapp
+   Guarda campaña WhatsApp mock en historial
+====================================================== */
+app.post("/campaigns/save-whatsapp", async (req, res) => {
+  try {
+    const {
+      slug,
+      channel = "whatsapp",
+      campaign_name,
+      segment,
+      inactive_days = 60,
+      subject = null,
+      message,
+      sort = "oldest",
+      plan,
+      plan_limit,
+      requested_limit,
+      applied_limit,
+      audience_total,
+      recipients_with_contact,
+      sent_count = 0,
+      failed_count = 0,
+      final_recipients = [],
+    } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    if (!segment) {
+      return res.status(400).json({ error: "segment es obligatorio" });
+    }
+
+    if (!message || !String(message).trim()) {
+      return res.status(400).json({ error: "message es obligatorio" });
+    }
+
+    const normalizedChannel = String(channel || "whatsapp").trim().toLowerCase();
+    const normalizedSegment = String(segment).trim().toLowerCase();
+    const normalizedSort = String(sort || "oldest").trim().toLowerCase();
+    const normalizedPlan = normalizePlanSlug(plan || "pro");
+
+    if (normalizedChannel !== "whatsapp") {
+      return res.status(400).json({
+        error: "Este endpoint solo permite guardar campañas de WhatsApp",
+      });
+    }
+
+    if (!["new", "recurrent", "frequent", "inactive"].includes(normalizedSegment)) {
+      return res.status(400).json({
+        error: "segment inválido. Usa: new, recurrent, frequent o inactive",
+      });
+    }
+
+    if (
+      !["oldest", "recent", "most_visits", "least_visits"].includes(normalizedSort)
+    ) {
+      return res.status(400).json({
+        error: "sort inválido. Usa: oldest, recent, most_visits o least_visits",
+      });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, name, slug, is_active, plan_slug, plan")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const currentPlan = normalizePlanSlug(tenant.plan_slug || tenant.plan || normalizedPlan);
+
+    const { data: historyRow, error: historyError } = await supabase
+      .from("campaign_history")
+      .insert({
+        tenant_id: tenant.id,
+        campaign_name: campaign_name ? String(campaign_name).trim() : null,
+        channel: "whatsapp",
+        segment: normalizedSegment,
+        inactive_days: Math.max(1, Number(inactive_days || 60)),
+        subject: null,
+        message: String(message).trim(),
+        sort: normalizedSort,
+        plan_slug: currentPlan,
+        plan_limit: Number(plan_limit || 0),
+        requested_limit: Number(requested_limit || 0),
+        applied_limit: Number(applied_limit || 0),
+        audience_total: Number(audience_total || 0),
+        recipients_with_contact: Number(recipients_with_contact || 0),
+        sent_count: Number(sent_count || 0),
+        failed_count: Number(failed_count || 0),
+      })
+      .select("id")
+      .single();
+
+    if (historyError || !historyRow) {
+      console.error("❌ Error creando campaign_history whatsapp:", historyError?.message);
+      return res.status(500).json({
+        error: "No se pudo guardar el historial de campaña WhatsApp",
+      });
+    }
+
+    const campaignHistoryId = historyRow.id;
+
+    if (Array.isArray(final_recipients) && final_recipients.length > 0) {
+      for (const recipient of final_recipients) {
+        const phone = String(recipient?.phone || "").trim();
+        const email = String(recipient?.email || "").trim().toLowerCase();
+        const name = String(recipient?.name || "cliente").trim();
+
+        const hasPhone = !!phone;
+
+        await insertCampaignDeliveryLog({
+          tenantId: tenant.id,
+          campaignHistoryId,
+          channel: "whatsapp",
+          customerName: name,
+          customerEmail: email || null,
+          customerPhone: phone || null,
+          status: hasPhone ? "sent" : "failed",
+          errorMessage: hasPhone ? null : "Destinatario sin teléfono",
+        });
+      }
+    }
+
+    return res.json({
+      ok: true,
+      campaign_history_id: campaignHistoryId,
+      campaign_name: campaign_name ? String(campaign_name).trim() : null,
+      channel: "whatsapp",
+      slug,
+      plan: currentPlan,
+      plan_limit: Number(plan_limit || 0),
+      requested_limit: Number(requested_limit || 0),
+      applied_limit: Number(applied_limit || 0),
+      sort: normalizedSort,
+      segment: normalizedSegment,
+      inactive_days: Math.max(1, Number(inactive_days || 60)),
+      audience_total: Number(audience_total || 0),
+      recipients_with_contact: Number(recipients_with_contact || 0),
+      sent: Number(sent_count || 0),
+      failed: Number(failed_count || 0),
+    });
+  } catch (err) {
+    console.error("POST /campaigns/save-whatsapp error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    📊 GET /campaigns/history/:slug
 ====================================================== */
 app.get("/campaigns/history/:slug", async (req, res) => {
