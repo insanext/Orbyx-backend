@@ -4200,7 +4200,15 @@ app.get("/campaigns/logs/:campaignId", async (req, res) => {
 
     const { data, error } = await supabase
       .from("campaign_delivery_logs")
-      .select("*")
+      .select(`
+  id,
+  customer_name,
+  customer_email,
+  customer_phone,
+  status,
+  error_message,
+  created_at
+`)
       .eq("campaign_history_id", campaignId)
       .order("created_at", { ascending: false });
 
