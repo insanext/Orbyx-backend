@@ -4107,9 +4107,17 @@ app.post("/campaigns/save-whatsapp", async (req, res) => {
 
     if (Array.isArray(final_recipients) && final_recipients.length > 0) {
       for (const recipient of final_recipients) {
-        const phone = String(recipient?.phone || "").trim();
-        const email = String(recipient?.email || "").trim().toLowerCase();
-        const name = String(recipient?.name || "cliente").trim();
+const phone = String(
+  recipient?.phone || recipient?.telefono || ""
+).trim();
+
+const email = String(
+  recipient?.email || ""
+).trim().toLowerCase();
+
+const name = String(
+  recipient?.name || recipient?.nombre || "Sin nombre"
+).trim();
 
         const hasPhone = !!phone;
 
