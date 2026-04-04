@@ -4201,7 +4201,7 @@ app.get("/campaigns/logs/:campaignId", async (req, res) => {
     const { data, error } = await supabase
       .from("campaign_delivery_logs")
       .select("*")
-      .eq("campaign_id", campaignId)
+      .eq("campaign_history_id", campaignId)
       .order("created_at", { ascending: false });
 
     if (error) {
@@ -4209,13 +4209,14 @@ app.get("/campaigns/logs/:campaignId", async (req, res) => {
       return res.status(500).json({ error: "Error obteniendo logs" });
     }
 
-    return res.json(data || []);
+    return res.json({
+      logs: data || [],
+    });
   } catch (err) {
     console.error("Unexpected error logs:", err);
     return res.status(500).json({ error: "Error inesperado" });
   }
 });
-
 /* ======================================================
    ✅ PATCH /appointments/:id/status
 ====================================================== */
