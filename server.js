@@ -4190,6 +4190,32 @@ app.get("/campaigns/history/:slug", async (req, res) => {
   }
 });
 
+app.get("/campaigns/logs/:campaignId", async (req, res) => {
+  try {
+    const { campaignId } = req.params;
+
+    if (!campaignId) {
+      return res.status(400).json({ error: "campaignId requerido" });
+    }
+
+    const { data, error } = await supabase
+      .from("campaign_delivery_logs")
+      .select("*")
+      .eq("campaign_id", campaignId)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Error fetching campaign logs:", error);
+      return res.status(500).json({ error: "Error obteniendo logs" });
+    }
+
+    return res.json(data || []);
+  } catch (err) {
+    console.error("Unexpected error logs:", err);
+    return res.status(500).json({ error: "Error inesperado" });
+  }
+});
+
 /* ======================================================
    ✅ PATCH /appointments/:id/status
 ====================================================== */
