@@ -1654,6 +1654,12 @@ function normalizeColor(value) {
   return color;
 }
 
+function normalizeNullablePetText(value) {
+  if (value === undefined || value === null) return null;
+  const trimmed = String(value).trim();
+  return trimmed ? trimmed : null;
+}
+
 /* ======================================================
    ✅ GET /staff
 ====================================================== */
@@ -3288,6 +3294,54 @@ app.get("/dashboard/metrics/:slug", async (req, res) => {
   }
 });
 
+
+/* ======================================================
+   ✅ GET /appointments/customer-history/:slug
+   Historial por cliente para ficha veterinaria
+====================================================== */
+app.get("/appointments/customer-history/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { customer_id } = req.query;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    if (!customer_id) {
+      return res.status(400).json({ error: "customer_id es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, slug")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data, error } = await supabase
+      .from("appointments")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .eq("customer_id", customer_id)
+      .order("start_at", { ascending: false });
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      appointments: data || [],
+    });
+  } catch (err) {
+    console.error("GET /appointments/customer-history/:slug error:", err.message);
+    return res.status(500).json({ error: err.message || "Error obteniendo historial" });
+  }
+});
+
 /* ======================================================
    ✅ GET /appointments
 ====================================================== */
@@ -3471,6 +3525,169 @@ const isInactive =
   }
 });
 
+
+/* ======================================================
+   ✅ GET /pets/:slug
+   Listar mascotas por negocio y opcionalmente por cliente
+====================================================== */
+app.get("/pets/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { customer_id } = req.query;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, slug")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    let query = supabase
+      .from("pets")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .order("created_at", { ascending: false });
+
+    if (customer_id) {
+      query = query.eq("customer_id", customer_id);
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      pets: data || [],
+    });
+  } catch (err) {
+    console.error("GET /pets/:slug error:", err.message);
+    return res.status(500).json({ error: err.message || "Error obteniendo mascotas" });
+  }
+});
+
+/* ======================================================
+   ✅ POST /pets
+   Crear mascota para un cliente
+====================================================== */
+app.post("/pets", async (req, res) => {
+  try {
+    const {
+      slug,
+      customer_id,
+      name,
+      species_base,
+      species_custom,
+      breed,
+      sex,
+      weight_kg,
+      is_sterilized = false,
+      notes,
+    } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    if (!customer_id) {
+      return res.status(400).json({ error: "customer_id es obligatorio" });
+    }
+
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "name es obligatorio" });
+    }
+
+    const normalizedSpeciesBase = String(species_base || "").trim().toLowerCase();
+
+    if (!["perro", "gato", "otro"].includes(normalizedSpeciesBase)) {
+      return res.status(400).json({
+        error: "species_base inválido. Usa: perro, gato u otro",
+      });
+    }
+
+    if (
+      normalizedSpeciesBase === "otro" &&
+      !String(species_custom || "").trim()
+    ) {
+      return res.status(400).json({
+        error: "species_custom es obligatorio cuando species_base es 'otro'",
+      });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, slug")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data: customer, error: customerError } = await supabase
+      .from("customers")
+      .select("id, tenant_id")
+      .eq("id", customer_id)
+      .eq("tenant_id", tenant.id)
+      .single();
+
+    if (customerError || !customer) {
+      return res.status(404).json({ error: "Cliente no encontrado para este negocio" });
+    }
+
+    let normalizedWeight = null;
+
+    if (weight_kg !== undefined && weight_kg !== null && String(weight_kg).trim() !== "") {
+      normalizedWeight = Number(weight_kg);
+
+      if (Number.isNaN(normalizedWeight) || normalizedWeight < 0) {
+        return res.status(400).json({ error: "weight_kg debe ser un número válido" });
+      }
+    }
+
+    const payload = {
+      tenant_id: tenant.id,
+      customer_id,
+      name: String(name).trim(),
+      species_base: normalizedSpeciesBase,
+      species_custom:
+        normalizedSpeciesBase === "otro"
+          ? normalizeNullablePetText(species_custom)
+          : null,
+      breed: normalizeNullablePetText(breed),
+      sex: normalizeNullablePetText(sex),
+      weight_kg: normalizedWeight,
+      is_sterilized: Boolean(is_sterilized),
+      notes: normalizeNullablePetText(notes),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from("pets")
+      .insert(payload)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.status(201).json({
+      ok: true,
+      pet: data,
+    });
+  } catch (err) {
+    console.error("POST /pets error:", err.message);
+    return res.status(500).json({ error: err.message || "Error creando mascota" });
+  }
+});
 
 /* ======================================================
    ✅ POST /campaigns/send-email
