@@ -2865,6 +2865,8 @@ if (normalizedEmail) {
 const petName = String(req.body?.customer_data?.pet_name || "").trim();
 const petSpecies = String(req.body?.customer_data?.pet_species || "").trim();
 
+const customerData = req.body?.customer_data || {};
+
 await sendBookingEmail({
   email: normalizedEmail,
   customerName: String(customer_name).trim(),
@@ -2875,8 +2877,10 @@ await sendBookingEmail({
   address: tenantInfo?.address || null,
   phone: tenantInfo?.phone || null,
   businessCategory: tenantInfo?.business_category || null,
-  petName: petName || null,
-  petSpecies: petSpecies || null,
+
+  // 👇 AQUÍ ESTÁ LA CLAVE
+  petName: String(customerData.pet_name || "").trim() || null,
+  petSpecies: String(customerData.pet_species || "").trim() || null,
 });
 }
 
