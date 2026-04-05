@@ -5600,7 +5600,7 @@ business_category,
 
       .eq("slug", slug)
       .eq("is_active", true)
-      .single();
+      .maybeSingle();
 
     if (tenantError || !tenant) {
       return res.status(404).json({ error: "negocio no encontrado" });
