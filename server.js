@@ -5595,6 +5595,7 @@ app.get("/public/business/:slug", async (req, res) => {
   pending_change_type,
   proration_credit,
   proration_charge
+business_category,
 `)
 
       .eq("slug", slug)
