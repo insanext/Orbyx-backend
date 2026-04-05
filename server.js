@@ -5594,10 +5594,9 @@ app.get("/public/business/:slug", async (req, res) => {
   scheduled_change_at,
   pending_change_type,
   proration_credit,
-  proration_charge
-business_category,
+  proration_charge,
+  business_category
 `)
-
       .eq("slug", slug)
       .eq("is_active", true)
       .maybeSingle();
