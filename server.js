@@ -2857,21 +2857,27 @@ await supabase
 
 if (normalizedEmail) {
   const { data: tenantInfo } = await supabase
-    .from("tenants")
-    .select("name, address, phone")
-    .eq("id", cal.tenant_id)
-    .single();
+  .from("tenants")
+  .select("name, address, phone, business_category")
+  .eq("id", cal.tenant_id)
+  .single();
 
-  await sendBookingEmail({
-    email: normalizedEmail,
-    customerName: String(customer_name).trim(),
-    businessName: tenantInfo?.name || "Tu negocio",
-    serviceName: serviceName || "Reserva",
-    startAt: start.toISOString(),
-    cancelUrl,
-    address: tenantInfo?.address || null,
-    phone: tenantInfo?.phone || null,
-  });
+const petName = String(req.body?.customer_data?.pet_name || "").trim();
+const petSpecies = String(req.body?.customer_data?.pet_species || "").trim();
+
+await sendBookingEmail({
+  email: normalizedEmail,
+  customerName: String(customer_name).trim(),
+  businessName: tenantInfo?.name || "Tu negocio",
+  serviceName: serviceName || "Reserva",
+  startAt: start.toISOString(),
+  cancelUrl,
+  address: tenantInfo?.address || null,
+  phone: tenantInfo?.phone || null,
+  businessCategory: tenantInfo?.business_category || null,
+  petName: petName || null,
+  petSpecies: petSpecies || null,
+});
 }
 
     return res.status(201).json({
