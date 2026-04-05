@@ -3543,7 +3543,7 @@ const isInactive =
 app.get("/pets/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
-    const { customer_id } = req.query;
+    const { customer_id, phone, email } = req.query;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
@@ -3560,14 +3560,45 @@ app.get("/pets/:slug", async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
+    let resolvedCustomerId = customer_id || null;
+
+    if (!resolvedCustomerId && phone) {
+      const { data: customerByPhone } = await supabase
+        .from("customers")
+        .select("id")
+        .eq("tenant_id", tenant.id)
+        .ilike("phone", `%${String(phone).trim()}%`)
+        .limit(1)
+        .maybeSingle();
+
+      resolvedCustomerId = customerByPhone?.id || null;
+    }
+
+    if (!resolvedCustomerId && email) {
+      const { data: customerByEmail } = await supabase
+        .from("customers")
+        .select("id")
+        .eq("tenant_id", tenant.id)
+        .eq("email", String(email).trim().toLowerCase())
+        .limit(1)
+        .maybeSingle();
+
+      resolvedCustomerId = customerByEmail?.id || null;
+    }
+
     let query = supabase
       .from("pets")
       .select("*")
       .eq("tenant_id", tenant.id)
       .order("created_at", { ascending: false });
 
-    if (customer_id) {
-      query = query.eq("customer_id", customer_id);
+    if (resolvedCustomerId) {
+      query = query.eq("customer_id", resolvedCustomerId);
+    } else {
+      return res.json({
+        total: 0,
+        pets: [],
+      });
     }
 
     const { data, error } = await query;
@@ -3583,7 +3614,6 @@ app.get("/pets/:slug", async (req, res) => {
     return res.status(500).json({ error: err.message || "Error obteniendo mascotas" });
   }
 });
-
 /* ======================================================
    ✅ POST /pets
    Crear mascota para un cliente
@@ -6430,4 +6460,53 @@ app.delete("/campaign-images/:id", async (req, res) => {
 ====================================================== */
 app.listen(PORT, () => {
   console.log(`🚀 Servidor listo en http://localhost:${PORT}`);
+});
+
+app.get("/api/pets/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { phone, email } = req.query;
+
+    if (!slug) {
+      return res.status(400).json({ error: "Falta slug" });
+    }
+
+    const { data: tenant } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    if (!tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    let query = supabase
+      .from("customers")
+      .select("id")
+      .eq("tenant_id", tenant.id);
+
+    if (phone) {
+      query = query.eq("phone", phone);
+    } else if (email) {
+      query = query.eq("email", email);
+    }
+
+    const { data: customer } = await query.single();
+
+    if (!customer) {
+      return res.json({ pets: [] });
+    }
+
+    const { data: pets } = await supabase
+      .from("pets")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .eq("customer_id", customer.id);
+
+    res.json({ pets: pets || [] });
+  } catch (error) {
+    console.error("Error pets:", error);
+    res.status(500).json({ error: "Error interno" });
+  }
 });
