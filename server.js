@@ -2083,7 +2083,7 @@ app.put("/staff-hours", async (req, res) => {
 
     const { data, error } = await supabase
       .from("staff_hours")
-      .upsert(payload, { onConflict: "staff_id,day_of_week" })
+      .upsert(payload, { onConflict: "tenant_id,branch_id,staff_id,day_of_week" })
       .select("*");
 
     if (error) throw error;
