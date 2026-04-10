@@ -2175,9 +2175,6 @@ app.post("/staff-special-dates", async (req, res) => {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
     }
 
-    if (!branch_id) {
-      return res.status(400).json({ error: "branch_id es obligatorio" });
-    }
 
     if (!staff_id) {
       return res.status(400).json({ error: "staff_id es obligatorio" });
