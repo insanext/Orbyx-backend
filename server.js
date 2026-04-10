@@ -1462,13 +1462,15 @@ app.put("/business-hours", async (req, res) => {
     }
 
     const payload = hours.map((item) => ({
-      tenant_id,
-      day_of_week: Number(item.day_of_week),
-      enabled: !!item.enabled,
-      start_time: item.enabled ? item.start_time || null : null,
-      end_time: item.enabled ? item.end_time || null : null,
-      updated_at: new Date().toISOString(),
-    }));
+  tenant_id,
+  branch_id: item.branch_id || null, // 👈 IMPORTANTE
+  staff_id,
+  day_of_week: Number(item.day_of_week),
+  enabled: Boolean(item.enabled),
+  start_time: item.enabled ? item.start_time || null : null,
+  end_time: item.enabled ? item.end_time || null : null,
+  updated_at: new Date().toISOString(),
+}));
 
     const { data, error } = await supabase
       .from("business_hours")
@@ -2051,7 +2053,24 @@ app.get("/staff-hours", async (req, res) => {
 ====================================================== */
 app.put("/staff-hours", async (req, res) => {
   try {
-    const { tenant_id, staff_id, hours } = req.body;
+    const { tenant_id, branch_id, staff_id, hours } = req.body;
+
+// Obtener branch_id real desde la tabla staff
+const { data: staffData, error: staffError } = await supabase
+  .from("staff")
+  .select("branch_id")
+  .eq("id", staff_id)
+  .single();
+
+if (staffError || !staffData) {
+  return res.status(400).json({ error: "No se pudo obtener branch_id del staff" });
+}
+
+const branch_id_real = staffData.branch_id;
+
+if (!branch_id) {
+  return res.status(400).json({ error: "branch_id es obligatorio" });
+}
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -2072,14 +2091,15 @@ app.put("/staff-hours", async (req, res) => {
     }
 
     const payload = hours.map((item) => ({
-      tenant_id,
-      staff_id,
-      day_of_week: Number(item.day_of_week),
-      enabled: Boolean(item.enabled),
-      start_time: item.enabled ? item.start_time || null : null,
-      end_time: item.enabled ? item.end_time || null : null,
-      updated_at: new Date().toISOString(),
-    }));
+  tenant_id,
+  branch_id: branch_id_real, // 👈 ESTE ES EL FIX
+  staff_id,
+  day_of_week: Number(item.day_of_week),
+  enabled: Boolean(item.enabled),
+  start_time: item.enabled ? item.start_time || null : null,
+  end_time: item.enabled ? item.end_time || null : null,
+  updated_at: new Date().toISOString(),
+}));
 
     const { data, error } = await supabase
       .from("staff_hours")
