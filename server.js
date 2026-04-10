@@ -1924,7 +1924,7 @@ app.get("/staff-services", async (req, res) => {
 ====================================================== */
 app.put("/staff-services", async (req, res) => {
   try {
-    const { tenant_id, staff_id, service_ids } = req.body;
+    const { tenant_id, branch_id, staff_id, service_ids } = req.body;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -1938,12 +1938,18 @@ app.put("/staff-services", async (req, res) => {
       return res.status(400).json({ error: "service_ids debe ser un arreglo" });
     }
 
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id,
+      branch_id: branch_id || null,
+    });
+
     const uniqueServiceIds = [...new Set(service_ids.filter(Boolean))];
 
     const { error: deleteError } = await supabase
       .from("staff_services")
       .delete()
       .eq("tenant_id", tenant_id)
+      .eq("branch_id", resolvedBranchId)
       .eq("staff_id", staff_id);
 
     if (deleteError) throw deleteError;
@@ -1957,6 +1963,7 @@ app.put("/staff-services", async (req, res) => {
 
     const payload = uniqueServiceIds.map((service_id) => ({
       tenant_id,
+      branch_id: resolvedBranchId,
       staff_id,
       service_id,
     }));
@@ -1974,7 +1981,7 @@ app.put("/staff-services", async (req, res) => {
     });
   } catch (err) {
     console.error("PUT /staff-services error:", err.message);
-    return res.status(500).json({ error: "Error guardando staff_services" });
+    return res.status(500).json({ error: err.message || "Error guardando staff_services" });
   }
 });
 
