@@ -1453,10 +1453,14 @@ app.get("/business-hours", async (req, res) => {
 ====================================================== */
 app.put("/business-hours", async (req, res) => {
   try {
-    const { tenant_id, hours } = req.body;
+    const { tenant_id, branch_id, hours } = req.body;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!branch_id) {
+      return res.status(400).json({ error: "branch_id es obligatorio" });
     }
 
     if (!Array.isArray(hours)) {
@@ -1464,19 +1468,18 @@ app.put("/business-hours", async (req, res) => {
     }
 
     const payload = hours.map((item) => ({
-  tenant_id,
-  branch_id: item.branch_id || null, // 👈 IMPORTANTE
-  staff_id,
-  day_of_week: Number(item.day_of_week),
-  enabled: Boolean(item.enabled),
-  start_time: item.enabled ? item.start_time || null : null,
-  end_time: item.enabled ? item.end_time || null : null,
-  updated_at: new Date().toISOString(),
-}));
+      tenant_id,
+      branch_id,
+      day_of_week: Number(item.day_of_week),
+      enabled: !!item.enabled,
+      start_time: item.enabled ? item.start_time || null : null,
+      end_time: item.enabled ? item.end_time || null : null,
+      updated_at: new Date().toISOString(),
+    }));
 
     const { data, error } = await supabase
       .from("business_hours")
-      .upsert(payload, { onConflict: "tenant_id,day_of_week" })
+      .upsert(payload, { onConflict: "tenant_id,branch_id,day_of_week" })
       .select("*");
 
     if (error) throw error;
@@ -1488,11 +1491,10 @@ app.put("/business-hours", async (req, res) => {
     });
   } catch (err) {
     console.error("PUT /business-hours error:", err.message);
-    return res.status(500).json({ error: "Error guardando horarios" });
+    return res.status(500).json({ error: err.message || "Error guardando horarios" });
   }
-});
 
-/* ======================================================
+});/* ======================================================
    ✅ GET /business-special-dates
 ====================================================== */
 app.get("/business-special-dates", async (req, res) => {
