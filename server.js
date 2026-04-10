@@ -2053,7 +2053,7 @@ app.get("/staff-hours", async (req, res) => {
 ====================================================== */
 app.put("/staff-hours", async (req, res) => {
   try {
-    const { tenant_id, branch_id, staff_id, hours } = req.body;
+    const { tenant_id, staff_id, hours } = req.body;
 
 // Obtener branch_id real desde la tabla staff
 const { data: staffData, error: staffError } = await supabase
@@ -2067,10 +2067,6 @@ if (staffError || !staffData) {
 }
 
 const branch_id_real = staffData.branch_id;
-
-if (!branch_id) {
-  return res.status(400).json({ error: "branch_id es obligatorio" });
-}
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
