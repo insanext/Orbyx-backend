@@ -531,20 +531,22 @@ async function getStaffAvailabilityWindows({
 
     if (weeklyError) throw weeklyError;
 
-    const weekly = weeklyRows?.[0] || null;
+    const validRows = (weeklyRows || []).filter(
+  (row) => row.enabled && row.start_time && row.end_time
+);
 
-    if (weekly?.enabled && weekly.start_time && weekly.end_time) {
-      const weeklyStart = timeToMinutes(weekly.start_time);
-      const weeklyEnd = timeToMinutes(weekly.end_time);
+windows = validRows
+  .map((row) => {
+    const start = timeToMinutes(row.start_time);
+    const end = timeToMinutes(row.end_time);
 
-      if (
-        weeklyStart !== null &&
-        weeklyEnd !== null &&
-        weeklyEnd > weeklyStart
-      ) {
-        windows = [{ start: weeklyStart, end: weeklyEnd }];
-      }
+    if (start !== null && end !== null && end > start) {
+      return { start, end };
     }
+
+    return null;
+  })
+  .filter(Boolean);
   }
 
   const { data: specialRows, error: specialError } = await supabase
