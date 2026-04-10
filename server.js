@@ -5984,7 +5984,10 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
         date,
       });
 
-      let finalWindows = intersectWindows(businessWindows, staffWindows);
+      let finalWindows =
+  businessWindows.length > 0
+    ? intersectWindows(businessWindows, staffWindows)
+    : staffWindows;
 
       finalWindows = await subtractAppointmentsFromWindows({
         tenant_id: tenant.id,
