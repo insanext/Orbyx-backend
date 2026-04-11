@@ -1427,16 +1427,21 @@ app.get("/test-event", async (req, res) => {
 ====================================================== */
 app.get("/business-hours", async (req, res) => {
   try {
-    const { tenant_id } = req.query;
+    const { tenant_id, branch_id } = req.query;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!branch_id) {
+      return res.status(400).json({ error: "branch_id es obligatorio" });
     }
 
     const { data, error } = await supabase
       .from("business_hours")
       .select("*")
       .eq("tenant_id", tenant_id)
+      .eq("branch_id", branch_id)
       .order("day_of_week", { ascending: true });
 
     if (error) throw error;
@@ -1499,16 +1504,21 @@ app.put("/business-hours", async (req, res) => {
 ====================================================== */
 app.get("/business-special-dates", async (req, res) => {
   try {
-    const { tenant_id } = req.query;
+    const { tenant_id, branch_id } = req.query;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!branch_id) {
+      return res.status(400).json({ error: "branch_id es obligatorio" });
     }
 
     const { data, error } = await supabase
       .from("business_special_dates")
       .select("*")
       .eq("tenant_id", tenant_id)
+      .eq("branch_id", branch_id)
       .order("date", { ascending: true })
       .order("created_at", { ascending: true });
 
@@ -1528,6 +1538,7 @@ app.post("/business-special-dates", async (req, res) => {
   try {
     const {
       tenant_id,
+      branch_id,
       date,
       label,
       is_closed,
@@ -1539,17 +1550,22 @@ app.post("/business-special-dates", async (req, res) => {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
     }
 
+    if (!branch_id) {
+      return res.status(400).json({ error: "branch_id es obligatorio" });
+    }
+
     if (!date) {
       return res.status(400).json({ error: "date es obligatorio" });
     }
 
     const payload = {
       tenant_id,
+      branch_id,
       date,
       label: label || null,
       is_closed: !!is_closed,
-      start_time: is_closed ? (start_time || null) : (start_time || null),
-      end_time: is_closed ? (end_time || null) : (end_time || null),
+      start_time: start_time || null,
+      end_time: end_time || null,
       updated_at: new Date().toISOString(),
     };
 
@@ -1568,10 +1584,11 @@ app.post("/business-special-dates", async (req, res) => {
     });
   } catch (err) {
     console.error("POST /business-special-dates error:", err.message);
-    return res.status(500).json({ error: "Error creando fecha especial" });
+    return res.status(500).json({
+      error: err.message || "Error creando fecha especial",
+    });
   }
 });
-
 /* ======================================================
    ✅ PUT /business-special-dates/:id
 ====================================================== */
@@ -1579,6 +1596,8 @@ app.put("/business-special-dates/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const {
+      tenant_id,
+      branch_id,
       label,
       date,
       is_closed,
@@ -1586,14 +1605,21 @@ app.put("/business-special-dates/:id", async (req, res) => {
       end_time,
     } = req.body;
 
+    if (!id) {
+      return res.status(400).json({ error: "id es obligatorio" });
+    }
+
     const payload = {
-      label: label || null,
-      date,
-      is_closed: !!is_closed,
-      start_time: start_time || null,
-      end_time: end_time || null,
       updated_at: new Date().toISOString(),
     };
+
+    if (tenant_id !== undefined) payload.tenant_id = tenant_id;
+    if (branch_id !== undefined) payload.branch_id = branch_id;
+    if (label !== undefined) payload.label = label || null;
+    if (date !== undefined) payload.date = date;
+    if (is_closed !== undefined) payload.is_closed = !!is_closed;
+    if (start_time !== undefined) payload.start_time = start_time || null;
+    if (end_time !== undefined) payload.end_time = end_time || null;
 
     const { data, error } = await supabase
       .from("business_special_dates")
@@ -1611,7 +1637,9 @@ app.put("/business-special-dates/:id", async (req, res) => {
     });
   } catch (err) {
     console.error("PUT /business-special-dates/:id error:", err.message);
-    return res.status(500).json({ error: "Error actualizando fecha especial" });
+    return res.status(500).json({
+      error: err.message || "Error actualizando fecha especial",
+    });
   }
 });
 
@@ -2123,7 +2151,7 @@ const branch_id_real = staffData.branch_id;
 ====================================================== */
 app.get("/staff-special-dates", async (req, res) => {
   try {
-    const { tenant_id, staff_id } = req.query;
+    const { tenant_id, branch_id, staff_id } = req.query;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -2135,6 +2163,10 @@ app.get("/staff-special-dates", async (req, res) => {
       .eq("tenant_id", tenant_id)
       .order("date", { ascending: true })
       .order("created_at", { ascending: true });
+
+    if (branch_id) {
+      query = query.eq("branch_id", branch_id);
+    }
 
     if (staff_id) {
       query = query.eq("staff_id", staff_id);
