@@ -5958,6 +5958,36 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       date,
     });
 
+const weekday = parseDateToWeekday(date);
+
+const { data: businessWeeklyRows, error: businessWeeklyError } = await supabase
+  .from("business_hours")
+  .select("id")
+  .eq("tenant_id", tenant.id)
+  .eq("branch_id", resolvedBranchId)
+  .eq("day_of_week", weekday)
+  .limit(1);
+
+if (businessWeeklyError) {
+  throw businessWeeklyError;
+}
+
+const { data: businessSpecialRows, error: businessSpecialError } = await supabase
+  .from("business_special_dates")
+  .select("id")
+  .eq("tenant_id", tenant.id)
+  .eq("branch_id", resolvedBranchId)
+  .eq("date", date)
+  .limit(1);
+
+if (businessSpecialError) {
+  throw businessSpecialError;
+}
+
+const hasBusinessConfig =
+  (businessWeeklyRows && businessWeeklyRows.length > 0) ||
+  (businessSpecialRows && businessSpecialRows.length > 0);
+
     if (!candidateStaffIds.length) {
       let slots = buildSlotsFromWindows(
         businessWindows,
@@ -6016,10 +6046,9 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
         date,
       });
 
-      let finalWindows =
-  businessWindows.length > 0
-    ? intersectWindows(businessWindows, staffWindows)
-    : staffWindows;
+      let finalWindows = hasBusinessConfig
+  ? intersectWindows(businessWindows, staffWindows)
+  : staffWindows;
 
       finalWindows = await subtractAppointmentsFromWindows({
         tenant_id: tenant.id,
