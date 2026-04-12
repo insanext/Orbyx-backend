@@ -883,6 +883,67 @@ async function upsertCustomerFromAppointment({
   return createdCustomer;
 }
 
+async function resolvePetFromAppointment({
+  tenant_id,
+  customer_id,
+  customer_data,
+}) {
+  const petId = String(customer_data?.pet_id || "").trim();
+  const petName = String(customer_data?.pet_name || "").trim();
+  const petSpeciesRaw = String(customer_data?.pet_species || "").trim().toLowerCase();
+
+  if (!customer_id) return null;
+
+  if (petId) {
+    const { data: existingPet, error: petError } = await supabase
+      .from("pets")
+      .select("*")
+      .eq("id", petId)
+      .eq("tenant_id", tenant_id)
+      .eq("customer_id", customer_id)
+      .single();
+
+    if (petError || !existingPet) {
+      throw new Error("La mascota seleccionada no pertenece a este cliente.");
+    }
+
+    return existingPet;
+  }
+
+  if (!petName) {
+    return null;
+  }
+
+  let normalizedSpeciesBase = "otro";
+  let speciesCustom = null;
+
+  if (petSpeciesRaw === "perro" || petSpeciesRaw === "gato") {
+    normalizedSpeciesBase = petSpeciesRaw;
+  } else if (petSpeciesRaw) {
+    normalizedSpeciesBase = "otro";
+    speciesCustom = petSpeciesRaw;
+  }
+
+  const { data: createdPet, error: createPetError } = await supabase
+    .from("pets")
+    .insert({
+      tenant_id,
+      customer_id,
+      name: petName,
+      species_base: normalizedSpeciesBase,
+      species_custom: speciesCustom,
+      updated_at: new Date().toISOString(),
+    })
+    .select("*")
+    .single();
+
+  if (createPetError) {
+    throw createPetError;
+  }
+
+  return createdPet;
+}
+
 async function sendCampaignEmail({
   to,
   subject,
@@ -2846,6 +2907,14 @@ const customer = await upsertCustomerFromAppointment({
   start_at: start.toISOString(),
 });
 
+const customerData = req.body?.customer_data || {};
+
+const resolvedPet = await resolvePetFromAppointment({
+  tenant_id: cal.tenant_id,
+  customer_id: customer.id,
+  customer_data: customerData,
+});
+
 await supabase
   .from("appointments")
   .update({
@@ -2918,10 +2987,18 @@ if (normalizedEmail) {
   .eq("id", cal.tenant_id)
   .single();
 
-const petName = String(req.body?.customer_data?.pet_name || "").trim();
-const petSpecies = String(req.body?.customer_data?.pet_species || "").trim();
-
 const customerData = req.body?.customer_data || {};
+
+const petName =
+  String(resolvedPet?.name || customerData?.pet_name || "").trim();
+
+const petSpecies =
+  String(
+    resolvedPet?.species_custom ||
+      resolvedPet?.species_base ||
+      customerData?.pet_species ||
+      ""
+  ).trim();
 
 await sendBookingEmail({
   email: normalizedEmail,
