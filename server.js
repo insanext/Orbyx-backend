@@ -2915,10 +2915,27 @@ const resolvedPet = await resolvePetFromAppointment({
   customer_data: customerData,
 });
 
+const petName =
+  String(resolvedPet?.name || customerData?.pet_name || "").trim();
+
+const petSpecies =
+  String(
+    resolvedPet?.species_custom ||
+      resolvedPet?.species_base ||
+      customerData?.pet_species ||
+      ""
+  ).trim();
+
 await supabase
   .from("appointments")
   .update({
     customer_id: customer.id,
+    pet_id: resolvedPet?.id || null,
+    customer_data: {
+      ...customerData,
+      pet_name: petName || null,
+      pet_species: petSpecies || null,
+    },
   })
   .eq("id", apptCreated.id);
 
@@ -2987,18 +3004,7 @@ if (normalizedEmail) {
   .eq("id", cal.tenant_id)
   .single();
 
-const customerData = req.body?.customer_data || {};
-
-const petName =
-  String(resolvedPet?.name || customerData?.pet_name || "").trim();
-
-const petSpecies =
-  String(
-    resolvedPet?.species_custom ||
-      resolvedPet?.species_base ||
-      customerData?.pet_species ||
-      ""
-  ).trim();
+const emailCustomerData = req.body?.customer_data || {};
 
 await sendBookingEmail({
   email: normalizedEmail,
@@ -3010,10 +3016,8 @@ await sendBookingEmail({
   address: tenantInfo?.address || null,
   phone: tenantInfo?.phone || null,
   businessCategory: tenantInfo?.business_category || null,
-
-  // 👇 AQUÍ ESTÁ LA CLAVE
-  petName: String(customerData.pet_name || "").trim() || null,
-  petSpecies: String(customerData.pet_species || "").trim() || null,
+  petName: petName || null,
+  petSpecies: petSpecies || null,
 });
 }
 
