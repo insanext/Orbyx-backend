@@ -1755,6 +1755,132 @@ function normalizeNullablePetText(value) {
   return trimmed ? trimmed : null;
 }
 
+function addMonths(date, months) {
+  const next = new Date(date);
+  const originalDay = next.getDate();
+
+  next.setMonth(next.getMonth() + months);
+
+  if (next.getDate() < originalDay) {
+    next.setDate(0);
+  }
+
+  return next;
+}
+
+function addYears(date, years) {
+  const next = new Date(date);
+  next.setFullYear(next.getFullYear() + years);
+  return next;
+}
+
+function resolveNextControlDate({
+  baseDate,
+  next_control_mode,
+  next_control_custom_value,
+  next_control_custom_unit,
+}) {
+  const base = new Date(baseDate);
+
+  if (Number.isNaN(base.getTime())) {
+    throw new Error("Fecha base inválida para calcular próximo control");
+  }
+
+  const mode = String(next_control_mode || "none").trim().toLowerCase();
+
+  if (!mode || mode === "none") {
+    return {
+      next_control_at: null,
+      next_control_label: null,
+    };
+  }
+
+  if (mode === "7_days") {
+    return {
+      next_control_at: addDays(base, 7).toISOString(),
+      next_control_label: "7 días",
+    };
+  }
+
+  if (mode === "15_days") {
+    return {
+      next_control_at: addDays(base, 15).toISOString(),
+      next_control_label: "15 días",
+    };
+  }
+
+  if (mode === "30_days") {
+    return {
+      next_control_at: addDays(base, 30).toISOString(),
+      next_control_label: "30 días",
+    };
+  }
+
+  if (mode === "2_months") {
+    return {
+      next_control_at: addMonths(base, 2).toISOString(),
+      next_control_label: "2 meses",
+    };
+  }
+
+  if (mode === "3_months") {
+    return {
+      next_control_at: addMonths(base, 3).toISOString(),
+      next_control_label: "3 meses",
+    };
+  }
+
+  if (mode === "6_months") {
+    return {
+      next_control_at: addMonths(base, 6).toISOString(),
+      next_control_label: "6 meses",
+    };
+  }
+
+  if (mode === "1_year") {
+    return {
+      next_control_at: addYears(base, 1).toISOString(),
+      next_control_label: "1 año",
+    };
+  }
+
+  if (mode === "custom") {
+    const rawValue = Number(next_control_custom_value);
+    const unit = String(next_control_custom_unit || "")
+      .trim()
+      .toLowerCase();
+
+    if (!rawValue || Number.isNaN(rawValue) || rawValue < 1) {
+      throw new Error("Debes indicar una cantidad válida para el próximo control personalizado");
+    }
+
+    if (!["days", "months", "years"].includes(unit)) {
+      throw new Error("Unidad inválida para próximo control personalizado");
+    }
+
+    if (unit === "days") {
+      return {
+        next_control_at: addDays(base, rawValue).toISOString(),
+        next_control_label: `${rawValue} día${rawValue === 1 ? "" : "s"}`,
+      };
+    }
+
+    if (unit === "months") {
+      return {
+        next_control_at: addMonths(base, rawValue).toISOString(),
+        next_control_label: `${rawValue} mes${rawValue === 1 ? "" : "es"}`,
+      };
+    }
+
+    return {
+      next_control_at: addYears(base, rawValue).toISOString(),
+      next_control_label: `${rawValue} año${rawValue === 1 ? "" : "s"}`,
+    };
+  }
+
+  throw new Error("next_control_mode inválido");
+}
+
 /* ======================================================
    ✅ GET /staff
 ====================================================== */
@@ -4627,6 +4753,139 @@ app.get("/campaigns/logs/:campaignId", async (req, res) => {
     return res.status(500).json({ error: "Error inesperado" });
   }
 });
+
+/* ======================================================
+   ✅ POST /appointments/:id/close
+   Cierre atendido con control veterinario
+====================================================== */
+app.post("/appointments/:id/close", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const {
+      control_type,
+      control_note,
+      next_control_mode = "none",
+      next_control_custom_value = null,
+      next_control_custom_unit = null,
+    } = req.body || {};
+
+    if (!id) {
+      return res.status(400).json({ error: "id es obligatorio" });
+    }
+
+    const normalizedControlType = String(control_type || "").trim();
+
+    if (!normalizedControlType) {
+      return res.status(400).json({
+        error: "control_type es obligatorio",
+      });
+    }
+
+    const { data: appointment, error: appointmentError } = await supabase
+      .from("appointments")
+      .select(`
+        id,
+        tenant_id,
+        customer_id,
+        pet_id,
+        staff_id,
+        start_at,
+        status
+      `)
+      .eq("id", id)
+      .single();
+
+    if (appointmentError || !appointment) {
+      return res.status(404).json({ error: "Reserva no encontrada" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, business_category")
+      .eq("id", appointment.tenant_id)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const businessCategory = String(tenant.business_category || "")
+      .trim()
+      .toLowerCase();
+
+    if (!["veterinaria", "vet"].includes(businessCategory)) {
+      return res.status(400).json({
+        error: "Este cierre con control solo está disponible para negocios veterinaria",
+      });
+    }
+
+    if (!appointment.pet_id) {
+      return res.status(400).json({
+        error: "La reserva no tiene mascota asociada",
+      });
+    }
+
+    if (String(appointment.status || "").toLowerCase() === "canceled") {
+      return res.status(400).json({
+        error: "No puedes cerrar una reserva cancelada",
+      });
+    }
+
+    const nextControl = resolveNextControlDate({
+      baseDate: appointment.start_at,
+      next_control_mode,
+      next_control_custom_value,
+      next_control_custom_unit,
+    });
+
+    const followupPayload = {
+      tenant_id: appointment.tenant_id,
+      appointment_id: appointment.id,
+      customer_id: appointment.customer_id || null,
+      pet_id: appointment.pet_id,
+      staff_id: appointment.staff_id || null,
+      control_type: normalizedControlType,
+      control_note: normalizeNullablePetText(control_note),
+      next_control_at: nextControl.next_control_at,
+      next_control_label: nextControl.next_control_label,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data: followup, error: followupError } = await supabase
+      .from("pet_followups")
+      .insert(followupPayload)
+      .select("*")
+      .single();
+
+    if (followupError) {
+      throw followupError;
+    }
+
+    const { data: updatedAppointment, error: updateAppointmentError } = await supabase
+      .from("appointments")
+      .update({
+        status: "completed",
+      })
+      .eq("id", appointment.id)
+      .select("*")
+      .single();
+
+    if (updateAppointmentError) {
+      throw updateAppointmentError;
+    }
+
+    return res.json({
+      ok: true,
+      appointment: updatedAppointment,
+      followup,
+    });
+  } catch (err) {
+    console.error("POST /appointments/:id/close error:", err.message);
+    return res.status(500).json({ error: err.message || "Error cerrando atención" });
+  }
+});
+
 /* ======================================================
    ✅ PATCH /appointments/:id/status
 ====================================================== */
