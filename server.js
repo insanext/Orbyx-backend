@@ -790,6 +790,7 @@ function filterPastSlots(slots, minNoticeMinutes = 0) {
   });
 }
 
+
 async function upsertCustomerFromAppointment({
   tenant_id,
   customer_name,
@@ -797,6 +798,9 @@ async function upsertCustomerFromAppointment({
   customer_phone,
   start_at,
 }) {
+  const normalizedName = String(customer_name || "").trim();
+  const normalizedNameKey = normalizedName.toLowerCase();
+
   const normalizedEmail = customer_email
     ? String(customer_email).trim().toLowerCase()
     : null;
@@ -805,33 +809,32 @@ async function upsertCustomerFromAppointment({
     ? String(customer_phone).trim()
     : null;
 
-  let existingCustomer = null;
+  const { data: candidateCustomers, error: candidateError } = await supabase
+    .from("customers")
+    .select("*")
+    .eq("tenant_id", tenant_id);
 
-  if (normalizedEmail) {
-    const { data } = await supabase
-      .from("customers")
-      .select("*")
-      .eq("tenant_id", tenant_id)
-      .eq("email", normalizedEmail)
-      .maybeSingle();
+  if (candidateError) throw candidateError;
 
-    if (data) {
-      existingCustomer = data;
-    }
-  }
+  const existingCustomer =
+    (candidateCustomers || []).find((customer) => {
+      const customerNameKey = String(customer.name || "").trim().toLowerCase();
+      const sameName = !!normalizedNameKey && customerNameKey === normalizedNameKey;
 
-  if (!existingCustomer && normalizedPhone) {
-    const { data } = await supabase
-      .from("customers")
-      .select("*")
-      .eq("tenant_id", tenant_id)
-      .eq("phone", normalizedPhone)
-      .maybeSingle();
+      if (!sameName) return false;
 
-    if (data) {
-      existingCustomer = data;
-    }
-  }
+      const sameEmail =
+        !!normalizedEmail &&
+        !!customer.email &&
+        String(customer.email).trim().toLowerCase() === normalizedEmail;
+
+      const samePhone =
+        !!normalizedPhone &&
+        !!customer.phone &&
+        String(customer.phone).trim() === normalizedPhone;
+
+      return sameEmail || samePhone;
+    }) || null;
 
   if (existingCustomer) {
     const currentLastVisit = existingCustomer.last_visit_at
@@ -847,7 +850,7 @@ async function upsertCustomerFromAppointment({
     const { data: updatedCustomer, error: updateError } = await supabase
       .from("customers")
       .update({
-        name: String(customer_name || existingCustomer.name || "").trim(),
+        name: normalizedName || existingCustomer.name || "",
         email: normalizedEmail || existingCustomer.email || null,
         phone: normalizedPhone || existingCustomer.phone || null,
         last_visit_at: shouldUpdateLastVisit
@@ -869,7 +872,7 @@ async function upsertCustomerFromAppointment({
     .from("customers")
     .insert({
       tenant_id,
-      name: String(customer_name || "").trim(),
+      name: normalizedName,
       email: normalizedEmail,
       phone: normalizedPhone,
       last_visit_at: start_at ? new Date(start_at).toISOString() : null,
@@ -882,6 +885,7 @@ async function upsertCustomerFromAppointment({
 
   return createdCustomer;
 }
+
 
 async function resolvePetFromAppointment({
   tenant_id,
@@ -3877,6 +3881,68 @@ app.get("/pets/:slug", async (req, res) => {
     return res.status(500).json({ error: err.message || "Error obteniendo mascotas" });
   }
 });
+
+/* ======================================================
+   🐾 GET /pet-followups/:slug
+   Lista de próximos controles por cliente o mascota
+====================================================== */
+app.get("/pet-followups/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { customer_id, pet_id } = req.query;
+
+    const { data: business, error: businessError } = await supabase
+      .from("tenants")
+      .select("id, business_category")
+      .eq("slug", slug)
+      .single();
+
+    if (businessError || !business) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const tenantId = business.id;
+
+    let query = supabase
+      .from("pet_followups")
+      .select(`
+        *,
+        pets (
+          id,
+          name,
+          species_base,
+          species_custom
+        )
+      `)
+      .eq("tenant_id", tenantId)
+      .order("next_control_at", { ascending: true, nullsFirst: false });
+
+    if (customer_id) {
+      query = query.eq("customer_id", customer_id);
+    }
+
+    if (pet_id) {
+      query = query.eq("pet_id", pet_id);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      throw error;
+    }
+
+    return res.json({
+      total: data?.length || 0,
+      followups: data || [],
+    });
+  } catch (err) {
+    console.error("GET /pet-followups/:slug error:", err.message);
+    return res.status(500).json({
+      error: err.message || "Error obteniendo seguimientos",
+    });
+  }
+});
+
 /* ======================================================
    ✅ POST /pets
    Crear mascota para un cliente
