@@ -3870,6 +3870,9 @@ app.get("/pets/:slug", async (req, res) => {
       return res.status(400).json({ error: "slug es obligatorio" });
     }
 
+    const normalizedEmail = String(email || "").trim().toLowerCase();
+    const normalizedPhoneDigits = String(phone || "").replace(/\D/g, "");
+
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .select("id, slug")
@@ -3883,58 +3886,62 @@ app.get("/pets/:slug", async (req, res) => {
 
     let resolvedCustomerId = customer_id || null;
 
-    if (!resolvedCustomerId && phone) {
-      const { data: customerByPhone } = await supabase
-        .from("customers")
-        .select("id")
-        .eq("tenant_id", tenant.id)
-        .ilike("phone", `%${String(phone).trim()}%`)
-        .limit(1)
-        .maybeSingle();
-
-      resolvedCustomerId = customerByPhone?.id || null;
-    }
-
-    if (!resolvedCustomerId && email) {
+    if (!resolvedCustomerId && normalizedEmail) {
       const { data: customerByEmail } = await supabase
         .from("customers")
         .select("id")
         .eq("tenant_id", tenant.id)
-        .eq("email", String(email).trim().toLowerCase())
+        .eq("email", normalizedEmail)
         .limit(1)
         .maybeSingle();
 
       resolvedCustomerId = customerByEmail?.id || null;
     }
 
-    let query = supabase
-      .from("pets")
-      .select("*")
-      .eq("tenant_id", tenant.id)
-      .order("created_at", { ascending: false });
+    if (!resolvedCustomerId && normalizedPhoneDigits) {
+      const { data: customerByPhone } = await supabase
+        .from("customers")
+        .select("id")
+        .eq("tenant_id", tenant.id)
+        .ilike("phone", `%${normalizedPhoneDigits}%`)
+        .limit(1)
+        .maybeSingle();
 
-    if (resolvedCustomerId) {
-      query = query.eq("customer_id", resolvedCustomerId);
-    } else {
+      resolvedCustomerId = customerByPhone?.id || null;
+    }
+
+    if (!resolvedCustomerId) {
       return res.json({
         total: 0,
         pets: [],
+        customer_found: false,
+        resolved_customer_id: null,
       });
     }
 
-    const { data, error } = await query;
+    const { data, error } = await supabase
+      .from("pets")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .eq("customer_id", resolvedCustomerId)
+      .order("created_at", { ascending: false });
 
     if (error) throw error;
 
     return res.json({
       total: data?.length || 0,
       pets: data || [],
+      customer_found: true,
+      resolved_customer_id: resolvedCustomerId,
     });
   } catch (err) {
     console.error("GET /pets/:slug error:", err.message);
-    return res.status(500).json({ error: err.message || "Error obteniendo mascotas" });
+    return res.status(500).json({
+      error: err.message || "Error obteniendo mascotas",
+    });
   }
 });
+
 
 /* ======================================================
    🐾 GET /pet-followups/:slug
