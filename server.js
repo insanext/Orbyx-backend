@@ -2838,27 +2838,81 @@ app.post("/appointments/slot", async (req, res) => {
       });
     }
 
+        const nowIso = new Date().toISOString();
+    const normalizedCustomerName = String(customer_name || "")
+      .trim()
+      .toLowerCase();
+
     const { data: existingAppointments, error: existingErr } = await supabase
       .from("appointments")
-      .select("id, start_at, status")
+      .select(
+        "id, start_at, status, customer_name, customer_email, customer_phone"
+      )
       .eq("tenant_id", cal.tenant_id)
-      .eq("customer_email", normalizedEmail)
       .eq("status", "booked")
-      .gte("start_at", new Date().toISOString())
-      .order("start_at", { ascending: true })
-      .limit(1);
+      .gte("start_at", nowIso);
 
     if (existingErr) {
       return res.status(500).json({ error: existingErr.message });
     }
 
-    const existingAppointment = existingAppointments?.[0] || null;
+    const futureAppointments = existingAppointments || [];
 
-    if (existingAppointment) {
+    const samePersonAppointment = futureAppointments.find((appt) => {
+      const apptName = String(appt.customer_name || "").trim().toLowerCase();
+      const sameName =
+        normalizedCustomerName && apptName === normalizedCustomerName;
+
+      if (!sameName) return false;
+
+      const sameEmail =
+        normalizedEmail &&
+        appt.customer_email &&
+        String(appt.customer_email).trim().toLowerCase() === normalizedEmail;
+
+      const samePhone =
+        normalizedPhone &&
+        appt.customer_phone &&
+        String(appt.customer_phone).trim() === normalizedPhone;
+
+      return sameEmail || samePhone;
+    });
+
+    if (samePersonAppointment) {
       return res.status(409).json({
         error:
-          "Este email ya tiene una reserva futura activa. Revisa tu correo o cancela la reserva actual antes de tomar otra.",
+          "Esta persona ya tiene una reserva futura activa. Revisa su correo o cancela la reserva actual antes de tomar otra.",
       });
+    }
+
+    if (normalizedEmail) {
+      const emailActiveCount = futureAppointments.filter(
+        (appt) =>
+          appt.customer_email &&
+          String(appt.customer_email).trim().toLowerCase() === normalizedEmail
+      ).length;
+
+      if (emailActiveCount >= 2) {
+        return res.status(409).json({
+          error:
+            "Este correo ya alcanzó el máximo de 2 reservas futuras activas.",
+        });
+      }
+    }
+
+    if (normalizedPhone) {
+      const phoneActiveCount = futureAppointments.filter(
+        (appt) =>
+          appt.customer_phone &&
+          String(appt.customer_phone).trim() === normalizedPhone
+      ).length;
+
+      if (phoneActiveCount >= 2) {
+        return res.status(409).json({
+          error:
+            "Este teléfono ya alcanzó el máximo de 2 reservas futuras activas.",
+        });
+      }
     }
 
     const slotMinutes = cal.slot_minutes ?? 30;
