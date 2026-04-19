@@ -6286,7 +6286,7 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
 
     const { data: staffRows, error: staffError } = await supabase
       .from("staff")
-      .select("id, name, role, color, is_active, sort_order")
+      .select("id, name, role, color, photo_url, is_active, sort_order")
       .eq("tenant_id", tenant.id)
       .eq("branch_id", resolvedBranchId)
       .eq("is_active", true)
