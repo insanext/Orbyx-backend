@@ -1934,17 +1934,18 @@ app.get("/staff", async (req, res) => {
 app.post("/staff", async (req, res) => {
   try {
     const {
-      tenant_id,
-      branch_id,
-      name,
-      role,
-      email,
-      phone,
-      color = "#0f172a",
-      is_active = true,
-      sort_order = 0,
-      use_business_hours = true,
-    } = req.body;
+  tenant_id,
+  branch_id,
+  name,
+  role,
+  email,
+  phone,
+  color = "#0f172a",
+  is_active = true,
+  sort_order = 0,
+  use_business_hours = true,
+  photo_url = null,
+} = req.body;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -1981,6 +1982,7 @@ app.post("/staff", async (req, res) => {
       is_active: Boolean(is_active),
       sort_order: Number(sort_order || 0),
       use_business_hours: Boolean(use_business_hours),
+photo_url: photo_url || null,
     };
 
     const { data, error } = await supabase
@@ -2038,6 +2040,7 @@ app.put("/staff/:id", async (req, res) => {
     const effectiveTenantId = tenant_id || existingStaff.tenant_id;
 
     const updateData = {};
+console.log("PUT /staff/:id body:", req.body);
 
     if (branch_id !== undefined) {
       const resolvedBranchId = await resolveBranchId({
@@ -2064,6 +2067,12 @@ app.put("/staff/:id", async (req, res) => {
     if (use_business_hours !== undefined) {
       updateData.use_business_hours = Boolean(use_business_hours);
     }
+
+if (req.body.photo_url !== undefined) {
+  updateData.photo_url = req.body.photo_url || null;
+}
+
+console.log("PUT /staff/:id updateData:", updateData);
 
     const { data, error } = await supabase
       .from("staff")
