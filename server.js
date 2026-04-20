@@ -2689,18 +2689,23 @@ app.post("/appointments/slot", async (req, res) => {
   let apptCreated = null;
 
   try {
-    const {
-      calendar_id,
-      branch_id,
-      service_id,
-      staff_id,
-      date,
-      slot_start,
-      customer_name,
-      customer_phone,
-      customer_email,
-      source = "whatsapp",
-    } = req.body;
+const {
+  calendar_id,
+  branch_id,
+  service_id,
+  staff_id,
+  date,
+  slot_start,
+  customer_name,
+  customer_phone,
+  customer_email,
+  source = "whatsapp",
+
+  reason,
+  notes,
+  next_control_at,
+
+} = req.body;
 
     function normalizeChileanPhone(rawPhone) {
       if (!rawPhone) return null;
@@ -3059,6 +3064,9 @@ app.post("/appointments/slot", async (req, res) => {
         end_at: end.toISOString(),
         source,
         status: "booked",
+reason: reason || null,
+notes: notes || null,
+next_control_at: next_control_at || null,
         cancel_token: cancelToken,
       })
       .select("*");
