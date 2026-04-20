@@ -3247,6 +3247,46 @@ await sendBookingEmail({
 });
 
 /* ======================================================
+   ✅ PATCH /appointments/:id/clinical
+====================================================== */
+
+app.patch("/appointments/:id/clinical", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason, notes } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: "Falta appointment id" });
+    }
+
+    const payload = {
+      reason: String(reason || "").trim() || null,
+      notes: String(notes || "").trim() || null,
+    };
+
+    const { data, error } = await supabase
+      .from("appointments")
+      .update(payload)
+      .eq("id", id)
+      .select("id, reason, notes, next_control_at")
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      appointment: data,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: err.message || "No se pudo guardar la ficha clínica.",
+    });
+  }
+});
+
+/* ======================================================
    ✅ GET /appointments/by-day/:slug/:date
 ====================================================== */
 app.get("/appointments/by-day/:slug/:date", async (req, res) => {
