@@ -3246,6 +3246,7 @@ await sendBookingEmail({
   }
 });
 
+
 /* ======================================================
    ✅ PATCH /appointments/:id/clinical
 ====================================================== */
@@ -3253,26 +3254,97 @@ await sendBookingEmail({
 app.patch("/appointments/:id/clinical", async (req, res) => {
   try {
     const { id } = req.params;
-    const { reason, notes } = req.body;
+    const {
+      reason,
+      notes,
+      control_type,
+      control_note,
+      next_control_at,
+    } = req.body;
 
     if (!id) {
       return res.status(400).json({ error: "Falta appointment id" });
     }
 
+    const { data: appointment, error: appointmentError } = await supabase
+      .from("appointments")
+      .select("id, tenant_id, customer_id, pet_id, staff_id")
+      .eq("id", id)
+      .single();
+
+    if (appointmentError || !appointment) {
+      return res.status(404).json({ error: "Atención no encontrada" });
+    }
+
     const payload = {
       reason: String(reason || "").trim() || null,
       notes: String(notes || "").trim() || null,
+      next_control_at: next_control_at || null,
     };
 
     const { data, error } = await supabase
       .from("appointments")
       .update(payload)
       .eq("id", id)
-      .select("id, reason, notes, next_control_at")
+      .select("id, reason, notes, next_control_at, pet_id")
       .single();
 
     if (error) {
       return res.status(500).json({ error: error.message });
+    }
+
+    if (appointment.pet_id && (control_type || control_note || next_control_at)) {
+      const normalizedControlType = String(control_type || "").trim() || "Control";
+      const normalizedControlNote = String(control_note || "").trim() || null;
+
+      const labelDate = next_control_at
+        ? new Date(next_control_at).toLocaleDateString("es-CL")
+        : null;
+
+      const nextControlLabel = next_control_at
+        ? `${normalizedControlType} · ${labelDate}`
+        : normalizedControlType;
+
+      const { data: existingFollowup } = await supabase
+        .from("pet_followups")
+        .select("id")
+        .eq("appointment_id", id)
+        .maybeSingle();
+
+      if (existingFollowup?.id) {
+        const { error: updateFollowupError } = await supabase
+          .from("pet_followups")
+          .update({
+            control_type: normalizedControlType,
+            control_note: normalizedControlNote,
+            next_control_at: next_control_at || null,
+            next_control_label: nextControlLabel,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", existingFollowup.id);
+
+        if (updateFollowupError) {
+          return res.status(500).json({ error: updateFollowupError.message });
+        }
+      } else {
+        const { error: insertFollowupError } = await supabase
+          .from("pet_followups")
+          .insert({
+            tenant_id: appointment.tenant_id,
+            appointment_id: appointment.id,
+            customer_id: appointment.customer_id || null,
+            pet_id: appointment.pet_id,
+            staff_id: appointment.staff_id || null,
+            control_type: normalizedControlType,
+            control_note: normalizedControlNote,
+            next_control_at: next_control_at || null,
+            next_control_label: nextControlLabel,
+          });
+
+        if (insertFollowupError) {
+          return res.status(500).json({ error: insertFollowupError.message });
+        }
+      }
     }
 
     return res.status(200).json({
