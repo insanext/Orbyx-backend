@@ -2319,6 +2319,8 @@ const branch_id_real = staffData.branch_id;
       }
     }
 
+console.log("STAFF HOURS PAYLOAD =>", JSON.stringify(payload, null, 2));
+
     const payload = hours.map((item) => ({
   tenant_id,
   branch_id: branch_id_real, // 👈 ESTE ES EL FIX
