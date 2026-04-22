@@ -2342,7 +2342,7 @@ const branch_id_real = staffData.branch_id;
     });
   } catch (err) {
     console.error("PUT /staff-hours error:", err.message);
-    return res.status(500).json({ error: "Error guardando staff_hours" });
+    return res.status(500).json({ error: err.message || "Error guardando staff_hours" });
   }
 });
 
