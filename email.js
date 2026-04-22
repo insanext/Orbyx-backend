@@ -1,6 +1,9 @@
 const { Resend } = require("resend");
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+// 👇 no rompe si no hay API key
+const resend = process.env.RESEND_API_KEY
+  ? new Resend(process.env.RESEND_API_KEY)
+  : null;
 
 function formatDate(dateString) {
   const date = new Date(dateString);
@@ -31,6 +34,12 @@ async function sendBookingEmail({
   petSpecies,
 }) {
   try {
+    // 👇 evita que explote en local
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Email omitido.");
+      return;
+    }
+
     const formattedDate = formatDate(startAt);
 
     const isVeterinary =
@@ -61,7 +70,6 @@ async function sendBookingEmail({
 
     <div style="background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.1);">
 
-      <!-- HEADER -->
       <div style="background:linear-gradient(135deg,#0f172a,#312e81); padding:28px; text-align:center;">
         <div style="color:#cbd5e1; font-size:12px; letter-spacing:0.2em;">
           RESERVA CONFIRMADA
@@ -72,7 +80,6 @@ async function sendBookingEmail({
         </h1>
       </div>
 
-      <!-- BODY -->
       <div style="padding:24px;">
 
         <div style="background:#dcfce7; color:#166534; display:inline-block; padding:6px 12px; border-radius:999px; font-size:12px; margin-bottom:12px;">
@@ -114,7 +121,6 @@ async function sendBookingEmail({
 
       </div>
 
-      <!-- FOOTER (IMPORTANTE PARA QUE NO LO CORTE GMAIL) -->
       <div style="padding:16px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
         <a 
           href="https://orbyx.cl"
