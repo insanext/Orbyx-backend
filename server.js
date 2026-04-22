@@ -1538,14 +1538,15 @@ app.put("/business-hours", async (req, res) => {
     }
 
     const payload = hours.map((item) => ({
-      tenant_id,
-      branch_id,
-      day_of_week: Number(item.day_of_week),
-      enabled: !!item.enabled,
-      start_time: item.enabled ? item.start_time || null : null,
-      end_time: item.enabled ? item.end_time || null : null,
-      updated_at: new Date().toISOString(),
-    }));
+  tenant_id,
+  branch_id: branch_id_real,
+  staff_id,
+  day_of_week: Number(item.day_of_week),
+  enabled: Boolean(item.enabled),
+  start_time: item.start_time || "09:00:00",
+  end_time: item.end_time || "18:00:00",
+  updated_at: new Date().toISOString(),
+}));
 
     const { data, error } = await supabase
       .from("business_hours")
