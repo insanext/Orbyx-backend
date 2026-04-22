@@ -1521,6 +1521,7 @@ app.get("/business-hours", async (req, res) => {
 /* ======================================================
    ✅ PUT /business-hours
 ====================================================== */
+
 app.put("/business-hours", async (req, res) => {
   try {
     const { tenant_id, branch_id, hours } = req.body;
@@ -1538,17 +1539,14 @@ app.put("/business-hours", async (req, res) => {
     }
 
     const payload = hours.map((item) => ({
-  tenant_id,
-  branch_id: branch_id_real,
-  staff_id,
-  day_of_week: Number(item.day_of_week),
-  enabled: Boolean(item.enabled),
-  start_time: item.start_time || "09:00:00",
-  end_time: item.end_time || "18:00:00",
-  updated_at: new Date().toISOString(),
-}));
-
-console.log("STAFF HOURS PAYLOAD =>", JSON.stringify(payload, null, 2));
+      tenant_id,
+      branch_id,
+      day_of_week: Number(item.day_of_week),
+      enabled: Boolean(item.enabled),
+      start_time: item.start_time || "09:00:00",
+      end_time: item.end_time || "18:00:00",
+      updated_at: new Date().toISOString(),
+    }));
 
     const { data, error } = await supabase
       .from("business_hours")
@@ -1564,8 +1562,12 @@ console.log("STAFF HOURS PAYLOAD =>", JSON.stringify(payload, null, 2));
     });
   } catch (err) {
     console.error("PUT /business-hours error:", err.message);
-    return res.status(500).json({ error: err.message || "Error guardando horarios" });
+    return res.status(500).json({
+      error: err.message || "Error guardando horarios",
+    });
   }
+});
+
 
 });/* ======================================================
    ✅ GET /business-special-dates
@@ -2286,22 +2288,22 @@ app.get("/staff-hours", async (req, res) => {
    ✅ PUT /staff-hours
    Reemplaza horarios semanales de un staff
 ====================================================== */
+
 app.put("/staff-hours", async (req, res) => {
   try {
     const { tenant_id, staff_id, hours } = req.body;
 
-// Obtener branch_id real desde la tabla staff
-const { data: staffData, error: staffError } = await supabase
-  .from("staff")
-  .select("branch_id")
-  .eq("id", staff_id)
-  .single();
+    const { data: staffData, error: staffError } = await supabase
+      .from("staff")
+      .select("branch_id")
+      .eq("id", staff_id)
+      .single();
 
-if (staffError || !staffData) {
-  return res.status(400).json({ error: "No se pudo obtener branch_id del staff" });
-}
+    if (staffError || !staffData) {
+      return res.status(400).json({ error: "No se pudo obtener branch_id del staff" });
+    }
 
-const branch_id_real = staffData.branch_id;
+    const branch_id_real = staffData.branch_id;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -2321,18 +2323,18 @@ const branch_id_real = staffData.branch_id;
       }
     }
 
-console.log("STAFF HOURS PAYLOAD =>", JSON.stringify(payload, null, 2));
-
     const payload = hours.map((item) => ({
-  tenant_id,
-  branch_id: branch_id_real, // 👈 ESTE ES EL FIX
-  staff_id,
-  day_of_week: Number(item.day_of_week),
-  enabled: Boolean(item.enabled),
-  start_time: item.enabled ? item.start_time || null : null,
-  end_time: item.enabled ? item.end_time || null : null,
-  updated_at: new Date().toISOString(),
-}));
+      tenant_id,
+      branch_id: branch_id_real,
+      staff_id,
+      day_of_week: Number(item.day_of_week),
+      enabled: Boolean(item.enabled),
+      start_time: item.start_time || "09:00:00",
+      end_time: item.end_time || "18:00:00",
+      updated_at: new Date().toISOString(),
+    }));
+
+    console.log("STAFF HOURS PAYLOAD =>", JSON.stringify(payload, null, 2));
 
     const { data, error } = await supabase
       .from("staff_hours")
