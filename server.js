@@ -1521,7 +1521,6 @@ app.get("/business-hours", async (req, res) => {
 /* ======================================================
    ✅ PUT /business-hours
 ====================================================== */
-
 app.put("/business-hours", async (req, res) => {
   try {
     const { tenant_id, branch_id, hours } = req.body;
@@ -1568,8 +1567,7 @@ app.put("/business-hours", async (req, res) => {
   }
 });
 
-
-});/* ======================================================
+/* ======================================================
    ✅ GET /business-special-dates
 ====================================================== */
 app.get("/business-special-dates", async (req, res) => {
