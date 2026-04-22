@@ -1548,6 +1548,8 @@ app.put("/business-hours", async (req, res) => {
   updated_at: new Date().toISOString(),
 }));
 
+console.log("STAFF HOURS PAYLOAD =>", JSON.stringify(payload, null, 2));
+
     const { data, error } = await supabase
       .from("business_hours")
       .upsert(payload, { onConflict: "tenant_id,branch_id,day_of_week" })
