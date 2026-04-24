@@ -2958,15 +2958,16 @@ const {
     let bufferAfter = 0;
     let serviceName = null;
 
-    const { data: service, error: serviceErr } = await supabase
-  .from("services")
-  .select("*")
-  .eq("id", service_id)
-  .eq("tenant_id", cal.tenant_id)
-  .eq("branch_id", resolvedBranchId)
-  .is("deleted_at", null)
-  .limit(1)
-  .maybeSingle();
+    if (service_id) {
+      const { data: service, error: serviceErr } = await supabase
+        .from("services")
+        .select("*")
+        .eq("id", service_id)
+        .eq("tenant_id", cal.tenant_id)
+        .eq("branch_id", resolvedBranchId)
+        .is("deleted_at", null)
+        .limit(1)
+	.maybeSingle();
 
       if (serviceErr || !service) {
         return res.status(404).json({ error: "Servicio no encontrado" });
