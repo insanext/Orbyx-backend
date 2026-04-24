@@ -2966,7 +2966,8 @@ const {
         .eq("tenant_id", cal.tenant_id)
         .eq("branch_id", resolvedBranchId)
         .is("deleted_at", null)
-        .single();
+        ..limit(1)
+.maybeSingle();
 
       if (serviceErr || !service) {
         return res.status(404).json({ error: "Servicio no encontrado" });
