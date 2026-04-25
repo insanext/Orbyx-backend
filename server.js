@@ -477,8 +477,8 @@ const startDate = new Date(`${date}T${startHour}:${startMinute}:00`);
 const endDate = new Date(`${date}T${endHour}:${endMinute}:00`);
 
       slots.push({
-        slot_start: startDate.toISOString(),
-        slot_end: endDate.toISOString(),
+        slot_start: `${date}T${startHour}:${startMinute}:00`,
+slot_end: `${date}T${endHour}:${endMinute}:00`,
       });
 
       cursor += slotMinutes;
