@@ -3302,11 +3302,17 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
       return res.status(404).json({ error: "Atención no encontrada" });
     }
 
-    const payload = {
-      reason: String(reason || "").trim() || null,
-      notes: String(notes || "").trim() || null,
-      next_control_at: next_control_at || null,
-    };
+    const normalizedReason = String(reason || control_type || "").trim() || null;
+const normalizedNotes =
+  String(notes || "").trim() ||
+  String(control_note || "").trim() ||
+  null;
+
+const payload = {
+  reason: normalizedReason,
+  notes: normalizedNotes,
+  next_control_at: next_control_at || null,
+};
 
     const { data, error } = await supabase
       .from("appointments")
