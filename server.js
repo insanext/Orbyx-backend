@@ -459,6 +459,46 @@ function intersectWindows(a, b) {
   return result.sort((x, y) => x.start - y.start);
 }
 
+
+
+function santiagoLocalToUtcIso(date, hour, minute) {
+  const [year, month, day] = String(date).split("-").map(Number);
+
+  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Santiago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(utcGuess);
+
+  const map = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value])
+  );
+
+  const zonedAsUtc = Date.UTC(
+    Number(map.year),
+    Number(map.month) - 1,
+    Number(map.day),
+    Number(map.hour),
+    Number(map.minute),
+    Number(map.second)
+  );
+
+  const desiredAsUtc = Date.UTC(year, month - 1, day, hour, minute, 0);
+  const offset = zonedAsUtc - utcGuess.getTime();
+
+  return new Date(desiredAsUtc - offset).toISOString();
+}
+
+
 function buildSlotsFromWindows(windows, date, slotMinutes) {
   const slots = [];
 
@@ -473,13 +513,18 @@ function buildSlotsFromWindows(windows, date, slotMinutes) {
       const endHour = String(Math.floor(endCursor / 60)).padStart(2, "0");
       const endMinute = String(endCursor % 60).padStart(2, "0");
 
-const startDate = new Date(`${date}T${startHour}:${startMinute}:00`);
-const endDate = new Date(`${date}T${endHour}:${endMinute}:00`);
-
-      slots.push({
-        slot_start: `${date}T${startHour}:${startMinute}:00`,
-slot_end: `${date}T${endHour}:${endMinute}:00`,
-      });
+slots.push({
+  slot_start: santiagoLocalToUtcIso(
+    date,
+    Number(startHour),
+    Number(startMinute)
+  ),
+  slot_end: santiagoLocalToUtcIso(
+    date,
+    Number(endHour),
+    Number(endMinute)
+  ),
+});
 
       cursor += slotMinutes;
     }
