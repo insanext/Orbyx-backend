@@ -1212,7 +1212,11 @@ async function getGoogleCalendarClientByCalendarId(calendar_id) {
     .from("calendar_tokens")
     .select("refresh_token, google_calendar_id")
     .eq("calendar_id", calendar_id)
-    .single();
+    .maybeSingle();
+
+if (!tokenRow) {
+  throw new Error("Este negocio no tiene Google Calendar conectado.");
+}
 
   if (tokErr) throw tokErr;
 
