@@ -3101,11 +3101,11 @@ const {
       );
     }
 
-    const wantedStartIso = new Date(slot_start).toISOString();
+    const wantedStart = slot_start.slice(0, 16); // "YYYY-MM-DDTHH:mm"
 
-    const ok = validSlots.some(
-      (s) => new Date(s.slot_start).toISOString() === wantedStartIso
-    );
+const ok = validSlots.some(
+  (s) => s.slot_start.slice(0, 16) === wantedStart
+);
 
     if (!ok) {
       return res.status(409).json({
