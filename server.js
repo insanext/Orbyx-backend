@@ -3030,8 +3030,7 @@ const {
 
     const totalMinutes = duration + bufferBefore + bufferAfter;
 
-    const slotDateObj = new Date(slot_start);
-    const slotDateStr = formatDateForServer(slotDateObj);
+const slotDateStr = String(date).slice(0, 10);
 
     let validSlots = [];
 
