@@ -473,8 +473,8 @@ function buildSlotsFromWindows(windows, date, slotMinutes) {
       const endHour = String(Math.floor(endCursor / 60)).padStart(2, "0");
       const endMinute = String(endCursor % 60).padStart(2, "0");
 
-      const startDate = new Date(`${date}T${startHour}:${startMinute}:00-03:00`);
-      const endDate = new Date(`${date}T${endHour}:${endMinute}:00-03:00`);
+      const startDate = new Date(`${date}T${startHour}:${startMinute}:00-04:00`);
+const endDate = new Date(`${date}T${endHour}:${endMinute}:00-04:00`);
 
       slots.push({
         slot_start: startDate.toISOString(),
