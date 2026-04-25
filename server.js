@@ -5151,10 +5151,13 @@ app.post("/appointments/:id/close", async (req, res) => {
     }
 
     const { data: updatedAppointment, error: updateAppointmentError } = await supabase
-      .from("appointments")
-      .update({
-        status: "completed",
-      })
+  .from("appointments")
+  .update({
+    status: "completed",
+    reason: normalizedControlType,
+    notes: normalizeNullablePetText(control_note),
+    next_control_at: nextControl.next_control_at,
+  })
       .eq("id", appointment.id)
       .select("*")
       .single();
