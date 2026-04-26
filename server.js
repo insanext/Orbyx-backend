@@ -3929,11 +3929,9 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
       .eq("pet_id", pet.id)
       .order("start_at", { ascending: false });
 
-    if (appointmentsError) {
-      throw appointmentsError;
-    }
+    if (appointmentsError) throw appointmentsError;
 
-    const doc = new PDFDocument({ margin: 50, size: "A4" });
+    const doc = new PDFDocument({ margin: 42, size: "A4" });
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
@@ -3943,91 +3941,205 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
 
     doc.pipe(res);
 
-    doc.fontSize(20).font("Helvetica-Bold").text("Ficha clínica veterinaria");
-    doc.moveDown(0.4);
-    doc.fontSize(10).font("Helvetica").fillColor("#666").text(`Generado por Orbyx - ${new Date().toLocaleDateString("es-CL")}`);
-    doc.moveDown(1);
+    const pageWidth = doc.page.width;
+    const left = 42;
+    const right = pageWidth - 42;
+    const contentWidth = right - left;
 
-    doc.fillColor("#000").fontSize(14).font("Helvetica-Bold").text(tenant.name || "Veterinaria");
-    doc.moveDown(1);
+    function formatLongDate(value) {
+      if (!value) return "No definido";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "No definido";
 
-    doc.fontSize(12).font("Helvetica-Bold").text("Cliente");
-    doc.font("Helvetica").fontSize(10);
-    doc.text(`Nombre: ${customer?.name || "Sin información"}`);
-    doc.text(`Teléfono: ${customer?.phone || "Sin información"}`);
-    doc.text(`Email: ${customer?.email || "Sin información"}`);
-    doc.moveDown(1);
+      return date.toLocaleDateString("es-CL", {
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      });
+    }
 
-    doc.fontSize(12).font("Helvetica-Bold").text("Mascota");
-    doc.font("Helvetica").fontSize(10);
-    doc.text(`Nombre: ${pet.name || "Sin información"}`);
-    doc.text(`Especie: ${pet.species_base === "otro" ? pet.species_custom || "Otro" : pet.species_base || "Sin información"}`);
-    doc.text(`Raza: ${pet.breed || "Sin información"}`);
-    doc.text(`Sexo: ${pet.sex || "Sin información"}`);
-    doc.text(`Peso: ${pet.weight_kg ? `${pet.weight_kg} kg` : "Sin información"}`);
-    doc.text(`Esterilizado: ${pet.is_sterilized ? "Sí" : "No"}`);
-    doc.moveDown(1.2);
+    function safe(value) {
+      return String(value || "").trim();
+    }
 
-    doc.fontSize(14).font("Helvetica-Bold").text("Historial clínico");
-    doc.moveDown(0.5);
+    function drawSectionTitle(title) {
+      doc.moveDown(1);
+      doc.font("Helvetica-Bold").fontSize(13).fillColor("#0f172a").text(title);
+      doc.moveDown(0.35);
+      doc.moveTo(left, doc.y).lineTo(right, doc.y).strokeColor("#e2e8f0").stroke();
+      doc.moveDown(0.7);
+    }
 
-    if (!appointments || appointments.length === 0) {
-      doc.font("Helvetica").fontSize(10).text("Sin atenciones registradas.");
-    } else {
-      for (const appt of appointments) {
-        if (doc.y > 700) doc.addPage();
+    function drawInfoGrid(items) {
+      const cleanItems = items.filter((item) => item.value);
+      const colWidth = contentWidth / 2 - 8;
+      let startY = doc.y;
 
-        const dateText = appt.start_at
-          ? new Date(appt.start_at).toLocaleDateString("es-CL", {
-              weekday: "long",
-              day: "numeric",
-              month: "long",
-              year: "numeric",
-            })
-          : "Sin fecha";
-
-        const nextControlText = appt.next_control_at
-          ? new Date(appt.next_control_at).toLocaleDateString("es-CL", {
-              weekday: "long",
-              day: "numeric",
-              month: "long",
-              year: "numeric",
-            })
-          : "No definido";
+      cleanItems.forEach((item, index) => {
+        const col = index % 2;
+        const row = Math.floor(index / 2);
+        const x = left + col * (colWidth + 16);
+        const y = startY + row * 42;
 
         doc
-          .roundedRect(50, doc.y, 495, 120, 10)
-          .strokeColor("#e5e7eb")
-          .stroke();
+          .roundedRect(x, y, colWidth, 32, 8)
+          .fillAndStroke("#f8fafc", "#e2e8f0");
 
-        doc.moveDown(0.6);
-        doc.x = 65;
+        doc
+          .font("Helvetica-Bold")
+          .fontSize(7)
+          .fillColor("#64748b")
+          .text(item.label.toUpperCase(), x + 10, y + 7, { width: colWidth - 20 });
 
-        doc.fontSize(11).font("Helvetica-Bold").fillColor("#111827")
-          .text(`${dateText} - ${appt.service_name_snapshot || "Atención"}`, { width: 465 });
+        doc
+          .font("Helvetica-Bold")
+          .fontSize(9.5)
+          .fillColor("#0f172a")
+          .text(item.value, x + 10, y + 18, { width: colWidth - 20 });
+      });
 
-        doc.moveDown(0.3);
-        doc.fontSize(10).font("Helvetica-Bold").fillColor("#111827")
-          .text(appt.reason || "Sin motivo registrado", { width: 465 });
+      doc.y = startY + Math.ceil(cleanItems.length / 2) * 42;
+    }
 
-        doc.moveDown(0.3);
-        doc.font("Helvetica").fillColor("#374151")
-          .text(`Notas clínicas: ${appt.notes || "Sin notas clínicas."}`, { width: 465 });
+    // Header
+    doc
+      .roundedRect(left, 36, contentWidth, 92, 18)
+      .fill("#0f172a");
 
-        doc.moveDown(0.3);
-        doc.text(`Próximo control: ${nextControlText}`, { width: 465 });
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(22)
+      .fillColor("#ffffff")
+      .text("Ficha clínica veterinaria", left + 24, 58);
 
-        doc.moveDown(1.4);
-        doc.x = 50;
+    doc
+      .font("Helvetica")
+      .fontSize(10)
+      .fillColor("#cbd5e1")
+      .text(tenant.name || "Veterinaria", left + 24, 88);
+
+    doc
+      .font("Helvetica")
+      .fontSize(9)
+      .fillColor("#94a3b8")
+      .text(`Fecha de emisión: ${new Date().toLocaleDateString("es-CL")}`, left + 24, 106);
+
+    doc.y = 155;
+
+    drawSectionTitle("Cliente");
+    drawInfoGrid([
+      { label: "Nombre", value: customer?.name },
+      { label: "Teléfono", value: customer?.phone },
+      { label: "Email", value: customer?.email },
+    ]);
+
+    drawSectionTitle("Mascota");
+    drawInfoGrid([
+      { label: "Nombre", value: pet.name },
+      {
+        label: "Especie",
+        value:
+          pet.species_base === "otro"
+            ? pet.species_custom || "Otro"
+            : pet.species_base,
+      },
+      { label: "Raza", value: pet.breed },
+      { label: "Sexo", value: pet.sex },
+      { label: "Peso", value: pet.weight_kg ? `${pet.weight_kg} kg` : "" },
+      { label: "Esterilizado", value: pet.is_sterilized ? "Sí" : "No" },
+    ]);
+
+    drawSectionTitle("Historial clínico");
+
+    if (!appointments || appointments.length === 0) {
+      doc
+        .roundedRect(left, doc.y, contentWidth, 52, 12)
+        .fillAndStroke("#f8fafc", "#e2e8f0");
+
+      doc
+        .font("Helvetica")
+        .fontSize(10)
+        .fillColor("#64748b")
+        .text("Sin atenciones registradas.", left + 16, doc.y + 18);
+    } else {
+      for (const appt of appointments) {
+        if (doc.y > 680) {
+          doc.addPage();
+          doc.y = 42;
+        }
+
+        const cardY = doc.y;
+        const noteText = appt.notes || "Sin notas clínicas.";
+        const noteHeight = doc.heightOfString(noteText, { width: contentWidth - 32 });
+        const cardHeight = Math.max(118, 96 + noteHeight);
+
+        doc
+          .roundedRect(left, cardY, contentWidth, cardHeight, 14)
+          .fillAndStroke("#ffffff", "#e2e8f0");
+
+        doc
+          .font("Helvetica-Bold")
+          .fontSize(10.5)
+          .fillColor("#0f172a")
+          .text(formatLongDate(appt.start_at), left + 16, cardY + 16, {
+            width: contentWidth - 32,
+          });
+
+        doc
+          .font("Helvetica")
+          .fontSize(9)
+          .fillColor("#64748b")
+          .text(appt.service_name_snapshot || "Atención", left + 16, cardY + 33, {
+            width: contentWidth - 32,
+          });
+
+        doc
+          .font("Helvetica-Bold")
+          .fontSize(11)
+          .fillColor("#2563eb")
+          .text(appt.reason || "Sin motivo registrado", left + 16, cardY + 54, {
+            width: contentWidth - 32,
+          });
+
+        doc
+          .font("Helvetica-Bold")
+          .fontSize(8)
+          .fillColor("#64748b")
+          .text("NOTAS CLÍNICAS", left + 16, cardY + 77);
+
+        doc
+          .font("Helvetica")
+          .fontSize(9.5)
+          .fillColor("#334155")
+          .text(noteText, left + 16, cardY + 90, {
+            width: contentWidth - 32,
+          });
+
+        doc
+          .font("Helvetica-Bold")
+          .fontSize(9)
+          .fillColor("#0f172a")
+          .text(
+            `Próximo control: ${appt.next_control_at ? formatLongDate(appt.next_control_at) : "No definido"}`,
+            left + 16,
+            cardY + cardHeight - 22,
+            { width: contentWidth - 32 }
+          );
+
+        doc.y = cardY + cardHeight + 14;
       }
     }
 
     doc.end();
   } catch (err) {
     console.error("GET /pets/:id/clinical-pdf error:", err.message);
-    return res.status(500).json({ error: err.message || "Error generando PDF clínico" });
+    return res.status(500).json({
+      error: err.message || "Error generando PDF clínico",
+    });
   }
 });
+
 
 /* ======================================================
    ✅ GET /appointments
