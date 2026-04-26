@@ -3365,21 +3365,16 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
       return res.status(404).json({ error: "Atención no encontrada" });
     }
 
-    const normalizedReason = String(reason || control_type || "").trim() || null;
-const normalizedNotes =
-  String(notes || "").trim() ||
-  String(control_note || "").trim() ||
-  null;
-
-const payload = {
-  reason: normalizedReason,
-  notes: normalizedNotes,
-  next_control_at: next_control_at || null,
-};
+    const normalizedReason = String(reason || "").trim() || null;
+    const normalizedNotes = String(notes || "").trim() || null;
 
     const { data, error } = await supabase
       .from("appointments")
-      .update(payload)
+      .update({
+        reason: normalizedReason,
+        notes: normalizedNotes,
+        next_control_at: next_control_at || null,
+      })
       .eq("id", id)
       .select("id, reason, notes, next_control_at, pet_id")
       .single();
@@ -3388,57 +3383,37 @@ const payload = {
       return res.status(500).json({ error: error.message });
     }
 
-    if (appointment.pet_id && (control_type || control_note || next_control_at)) {
-      const normalizedControlType = String(control_type || "").trim() || "Control";
-      const normalizedControlNote = String(control_note || "").trim() || null;
+    await supabase
+      .from("pet_followups")
+      .delete()
+      .eq("appointment_id", id);
 
-      const labelDate = next_control_at
-        ? new Date(next_control_at).toLocaleDateString("es-CL")
-        : null;
+    if (appointment.pet_id && next_control_at) {
+      const normalizedControlType =
+        String(control_type || reason || "Control").trim() || "Control";
 
-      const nextControlLabel = next_control_at
-        ? `${normalizedControlType} · ${labelDate}`
-        : normalizedControlType;
+      const normalizedControlNote =
+        String(control_note || notes || "").trim() || null;
 
-      const { data: existingFollowup } = await supabase
+      const labelDate = new Date(next_control_at).toLocaleDateString("es-CL");
+
+      const { error: insertFollowupError } = await supabase
         .from("pet_followups")
-        .select("id")
-        .eq("appointment_id", id)
-        .maybeSingle();
+        .insert({
+          tenant_id: appointment.tenant_id,
+          appointment_id: appointment.id,
+          customer_id: appointment.customer_id || null,
+          pet_id: appointment.pet_id,
+          staff_id: appointment.staff_id || null,
+          control_type: normalizedControlType,
+          control_note: normalizedControlNote,
+          next_control_at,
+          next_control_label: `${normalizedControlType} · ${labelDate}`,
+          updated_at: new Date().toISOString(),
+        });
 
-      if (existingFollowup?.id) {
-        const { error: updateFollowupError } = await supabase
-          .from("pet_followups")
-          .update({
-            control_type: normalizedControlType,
-            control_note: normalizedControlNote,
-            next_control_at: next_control_at || null,
-            next_control_label: nextControlLabel,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", existingFollowup.id);
-
-        if (updateFollowupError) {
-          return res.status(500).json({ error: updateFollowupError.message });
-        }
-      } else {
-        const { error: insertFollowupError } = await supabase
-          .from("pet_followups")
-          .insert({
-            tenant_id: appointment.tenant_id,
-            appointment_id: appointment.id,
-            customer_id: appointment.customer_id || null,
-            pet_id: appointment.pet_id,
-            staff_id: appointment.staff_id || null,
-            control_type: normalizedControlType,
-            control_note: normalizedControlNote,
-            next_control_at: next_control_at || null,
-            next_control_label: nextControlLabel,
-          });
-
-        if (insertFollowupError) {
-          return res.status(500).json({ error: insertFollowupError.message });
-        }
+      if (insertFollowupError) {
+        return res.status(500).json({ error: insertFollowupError.message });
       }
     }
 
