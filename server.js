@@ -1849,6 +1849,7 @@ function addYears(date, years) {
 function resolveNextControlDate({
   baseDate,
   next_control_mode,
+  next_control_exact_date,
   next_control_custom_value,
   next_control_custom_unit,
 }) {
@@ -1915,6 +1916,24 @@ function resolveNextControlDate({
       next_control_label: "1 año",
     };
   }
+
+if (mode === "exact_date") {
+  if (!next_control_exact_date) {
+    throw new Error("Debes seleccionar una fecha para el próximo control");
+  }
+
+  const exactDate = new Date(`${next_control_exact_date}T12:00:00`);
+
+  if (Number.isNaN(exactDate.getTime())) {
+    throw new Error("Fecha exacta inválida para próximo control");
+  }
+
+  return {
+    next_control_at: exactDate.toISOString(),
+    next_control_label: "Fecha exacta",
+  };
+}
+
 
   if (mode === "custom") {
     const rawValue = Number(next_control_custom_value);
@@ -5097,9 +5116,10 @@ app.post("/appointments/:id/close", async (req, res) => {
     const {
       control_type,
       control_note,
-      next_control_mode = "none",
-      next_control_custom_value = null,
-      next_control_custom_unit = null,
+next_control_mode = "none",
+next_control_exact_date = null,
+next_control_custom_value = null,
+next_control_custom_unit = null,
     } = req.body || {};
 
     if (!id) {
@@ -5164,12 +5184,13 @@ app.post("/appointments/:id/close", async (req, res) => {
       });
     }
 
-    const nextControl = resolveNextControlDate({
-      baseDate: appointment.start_at,
-      next_control_mode,
-      next_control_custom_value,
-      next_control_custom_unit,
-    });
+const nextControl = resolveNextControlDate({
+  baseDate: appointment.start_at,
+  next_control_mode,
+  next_control_exact_date,
+  next_control_custom_value,
+  next_control_custom_unit,
+});
 
     const followupPayload = {
       tenant_id: appointment.tenant_id,
