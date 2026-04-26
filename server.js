@@ -5675,6 +5675,7 @@ if (updated?.customer_id) {
 }
 
 return res.json({ ok: true, canceled: true, appointment: updated });
+}
 
 app.post("/appointments/:id", async (req, res) => {
   try {
