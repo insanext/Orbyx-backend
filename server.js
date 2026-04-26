@@ -4137,9 +4137,7 @@ doc
     left + 16,
     doc.y,
     { width: contentWidth - 32 }
-  );
-            { width: contentWidth - 32 }
-          );
+    );
 
         doc.y = cardY + cardHeight + 14;
       }
