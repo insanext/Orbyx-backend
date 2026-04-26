@@ -4102,28 +4102,42 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
             width: contentWidth - 32,
           });
 
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(8)
-          .fillColor("#64748b")
-          .text("NOTAS CLÍNICAS", left + 16, cardY + 77);
+        // NOTAS CLÍNICAS
+	doc
+ 	 .font("Helvetica-Bold")
+  	.fontSize(8)
+ 	 .fillColor("#64748b")
+  	.text("NOTAS CLÍNICAS", left + 16, cardY + 75);
 
-        doc
-          .font("Helvetica")
-          .fontSize(9.5)
-          .fillColor("#334155")
-          .text(noteText, left + 16, cardY + 90, {
-            width: contentWidth - 32,
-          });
+	doc
+  	.moveDown(0.3);
 
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(9)
-          .fillColor("#0f172a")
-          .text(
-            `Próximo control: ${appt.next_control_at ? formatLongDate(appt.next_control_at) : "No definido"}`,
-            left + 16,
-            cardY + cardHeight - 22,
+	doc
+  	.font("Helvetica")
+  	.fontSize(9.5)
+  	.fillColor("#334155")
+  	.text(noteText, left + 16, doc.y, {
+   	 width: contentWidth - 32,
+  	});
+
+// ESPACIO
+doc.moveDown(0.6);
+
+// PRÓXIMO CONTROL (más discreto)
+doc
+  .font("Helvetica")
+  .fontSize(8.5)
+  .fillColor("#64748b")
+  .text(
+    `Próximo control: ${
+      appt.next_control_at
+        ? formatLongDate(appt.next_control_at)
+        : "No definido"
+    }`,
+    left + 16,
+    doc.y,
+    { width: contentWidth - 32 }
+  );
             { width: contentWidth - 32 }
           );
 
