@@ -837,6 +837,51 @@ function filterPastSlots(slots, minNoticeMinutes = 0) {
 }
 
 
+
+
+async function recalculateCustomerStats(customerId) {
+  if (!customerId) return null;
+
+  const { data: customer, error: customerError } = await supabase
+    .from("customers")
+    .select("id, tenant_id")
+    .eq("id", customerId)
+    .single();
+
+  if (customerError || !customer) return null;
+
+  const { data: appointments, error: appointmentsError } = await supabase
+    .from("appointments")
+    .select("id, start_at, status")
+    .eq("tenant_id", customer.tenant_id)
+    .eq("customer_id", customer.id)
+    .order("start_at", { ascending: false });
+
+  if (appointmentsError) throw appointmentsError;
+
+  const validAppointments = (appointments || []).filter((appt) => {
+    const status = String(appt.status || "").toLowerCase();
+    return status !== "canceled" && status !== "cancelled";
+  });
+
+  const lastValidAppointment = validAppointments[0] || null;
+
+  const { data: updatedCustomer, error: updateError } = await supabase
+    .from("customers")
+    .update({
+      total_visits: validAppointments.length,
+      last_visit_at: lastValidAppointment?.start_at || null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", customer.id)
+    .select("*")
+    .single();
+
+  if (updateError) throw updateError;
+
+  return updatedCustomer;
+}
+
 async function upsertCustomerFromAppointment({
   tenant_id,
   customer_name,
@@ -897,26 +942,12 @@ async function upsertCustomerFromAppointment({
     existingByEmail || existingByPhone || existingByName || null;
 
   if (existingCustomer) {
-    const currentLastVisit = existingCustomer.last_visit_at
-      ? new Date(existingCustomer.last_visit_at)
-      : null;
-
-    const nextVisitDate = start_at ? new Date(start_at) : null;
-
-    const shouldUpdateLastVisit =
-      nextVisitDate &&
-      (!currentLastVisit || nextVisitDate.getTime() > currentLastVisit.getTime());
-
     const { data: updatedCustomer, error: updateError } = await supabase
       .from("customers")
       .update({
         name: normalizedName || existingCustomer.name || "",
         email: normalizedEmail || existingCustomer.email || null,
         phone: normalizedPhone || existingCustomer.phone || null,
-        last_visit_at: shouldUpdateLastVisit
-          ? nextVisitDate.toISOString()
-          : existingCustomer.last_visit_at,
-        total_visits: Number(existingCustomer.total_visits || 0) + 1,
         updated_at: new Date().toISOString(),
       })
       .eq("id", existingCustomer.id)
@@ -936,7 +967,7 @@ async function upsertCustomerFromAppointment({
       email: normalizedEmail,
       phone: normalizedPhone,
       last_visit_at: start_at ? new Date(start_at).toISOString() : null,
-      total_visits: 1,
+      total_visits: 0,
     })
     .select("*")
     .single();
@@ -3229,6 +3260,7 @@ await supabase
     },
   })
   .eq("id", apptCreated.id);
+await recalculateCustomerStats(customer.id);
 
     const { calendar, googleCalendarId } =
       await getGoogleCalendarClientByCalendarId(calendar_id);
@@ -5559,20 +5591,24 @@ app.patch("/appointments/:id/status", async (req, res) => {
     }
 
     const { data, error } = await supabase
-      .from("appointments")
-      .update({
-        status,
-      })
-      .eq("id", id)
-      .select()
-      .single();
+  .from("appointments")
+  .update({
+    status,
+  })
+  .eq("id", id)
+  .select()
+  .single();
 
-    if (error) throw error;
+if (error) throw error;
 
-    return res.json({
-      ok: true,
-      appointment: data,
-    });
+if (data?.customer_id) {
+  await recalculateCustomerStats(data.customer_id);
+}
+
+return res.json({
+  ok: true,
+  appointment: data,
+});
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -5622,20 +5658,23 @@ if (st === "canceled" || st === "cancelled") {
     }
   }
 
-  const { data: updated, error: updErr } = await supabase
-    .from("appointments")
-    .update({
-      status: "canceled",
-      canceled_at: new Date().toISOString(),
-    })
-    .eq("id", id)
-    .select("*")
-    .single();
+const { data: updated, error: updErr } = await supabase
+  .from("appointments")
+  .update({
+    status: "canceled",
+    canceled_at: new Date().toISOString(),
+  })
+  .eq("id", id)
+  .select("*")
+  .single();
 
-  if (updErr) return res.status(500).json({ error: updErr.message });
+if (updErr) return res.status(500).json({ error: updErr.message });
 
-  return res.json({ ok: true, canceled: true, appointment: updated });
+if (updated?.customer_id) {
+  await recalculateCustomerStats(updated.customer_id);
 }
+
+return res.json({ ok: true, canceled: true, appointment: updated });
 
 app.post("/appointments/:id", async (req, res) => {
   try {
