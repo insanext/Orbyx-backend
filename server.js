@@ -3495,8 +3495,8 @@ app.get("/appointments/by-range/:slug", async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    const start = `${from}T00:00:00`;
-    const end = `${to}T23:59:59`;
+const start = new Date(`${from}T00:00:00-04:00`).toISOString();
+const end = new Date(`${to}T23:59:59-04:00`).toISOString();
 
     let query = supabase
       .from("appointments")
@@ -3535,6 +3535,52 @@ function formatDateForServer(date) {
   const d = String(date.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 }
+
+
+/* ======================================================
+   ✅ GET /appointments/pending-close/:slug
+   Pendientes de cierre globales
+====================================================== */
+app.get("/appointments/pending-close/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { branch_id, staff_id } = req.query;
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    let query = supabase
+      .from("appointments")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .eq("status", "booked")
+      .lt("start_at", new Date().toISOString())
+      .order("start_at", { ascending: true });
+
+    if (branch_id) query = query.eq("branch_id", branch_id);
+    if (staff_id) query = query.eq("staff_id", staff_id);
+
+    const { data, error } = await query;
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    return res.json({
+      total: data?.length || 0,
+      appointments: data || [],
+    });
+  } catch (error) {
+    console.error("Error en /appointments/pending-close/:slug", error);
+    return res.status(500).json({ error: "Error obteniendo pendientes" });
+  }
+});
+
 
 /* ======================================================
    ✅ GET /dashboard/metrics/:slug
