@@ -3097,16 +3097,6 @@ if (!isGroup) {
     }
 
 
-duration = service.duration_minutes;
-bufferBefore = service.buffer_before_minutes || 0;
-bufferAfter = service.buffer_after_minutes || 0;
-serviceName = service.name;
-
-// 🆕 NUEVO
-const isGroup = Boolean(service.is_group);
-const capacity = Number(service.capacity || 1);
-    }
-
     const totalMinutes = duration + bufferBefore + bufferAfter;
 
 const slotDateStr = String(date).slice(0, 10);
