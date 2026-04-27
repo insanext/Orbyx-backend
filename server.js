@@ -2953,6 +2953,39 @@ const {
 
     const startIso = start.toISOString();
 
+const slotMinutes = cal.slot_minutes ?? 30;
+const timeZone = cal.timezone || "America/Santiago";
+
+let duration = slotMinutes;
+let bufferBefore = 0;
+let bufferAfter = 0;
+let serviceName = null;
+let isGroup = false;
+let capacity = 1;
+
+if (service_id) {
+  const { data: service, error: serviceErr } = await supabase
+    .from("services")
+    .select("*")
+    .eq("id", service_id)
+    .eq("tenant_id", cal.tenant_id)
+    .eq("branch_id", resolvedBranchId)
+    .is("deleted_at", null)
+    .limit(1)
+    .maybeSingle();
+
+  if (serviceErr || !service) {
+    return res.status(404).json({ error: "Servicio no encontrado" });
+  }
+
+  duration = service.duration_minutes;
+  bufferBefore = service.buffer_before_minutes || 0;
+  bufferAfter = service.buffer_after_minutes || 0;
+  serviceName = service.name;
+  isGroup = Boolean(service.is_group);
+  capacity = Number(service.capacity || 1);
+}
+
     let bookingQuery = supabase
   .from("appointments")
   .select("id", { count: "exact" })
@@ -3063,28 +3096,6 @@ if (!isGroup) {
       }
     }
 
-    const slotMinutes = cal.slot_minutes ?? 30;
-    const timeZone = cal.timezone || "America/Santiago";
-
-    let duration = slotMinutes;
-    let bufferBefore = 0;
-    let bufferAfter = 0;
-    let serviceName = null;
-
-    if (service_id) {
-      const { data: service, error: serviceErr } = await supabase
-        .from("services")
-        .select("*")
-        .eq("id", service_id)
-        .eq("tenant_id", cal.tenant_id)
-        .eq("branch_id", resolvedBranchId)
-        .is("deleted_at", null)
-        .limit(1)
-	.maybeSingle();
-
-      if (serviceErr || !service) {
-        return res.status(404).json({ error: "Servicio no encontrado" });
-      }
 
 duration = service.duration_minutes;
 bufferBefore = service.buffer_before_minutes || 0;
@@ -6976,6 +6987,73 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
       return res.status(404).json({ error: "servicio no encontrado" });
     }
 
+const isGroup = Boolean(service.is_group);
+const capacity = Number(service.capacity || 1);
+
+async function attachCapacityToSlots(slotsToCheck) {
+  if (!isGroup || !slotsToCheck.length) {
+    return slotsToCheck.map((slot) => ({
+      ...slot,
+      is_group: isGroup,
+      capacity,
+      booked_count: 0,
+      available_spots: capacity,
+    }));
+  }
+
+  const dayStart = new Date(`${date}T00:00:00-03:00`).toISOString();
+  const dayEnd = new Date(`${date}T23:59:59-03:00`).toISOString();
+
+  let apptQuery = supabase
+    .from("appointments")
+    .select("id, start_at, staff_id")
+    .eq("tenant_id", tenant.id)
+    .eq("branch_id", resolvedBranchId)
+    .eq("service_id", service_id)
+    .eq("status", "booked")
+    .gte("start_at", dayStart)
+    .lte("start_at", dayEnd);
+
+  if (requestedStaffId) {
+    apptQuery = apptQuery.eq("staff_id", requestedStaffId);
+  }
+
+  const { data: appointmentsForDay, error: apptCountError } = await apptQuery;
+
+  if (apptCountError) {
+    throw apptCountError;
+  }
+
+  return slotsToCheck
+    .map((slot) => {
+      const slotKey = String(slot.slot_start || "").slice(0, 16);
+
+      const bookedCount = (appointmentsForDay || []).filter((appt) => {
+        const apptKey = String(appt.start_at || "").slice(0, 16);
+        const sameTime = apptKey === slotKey;
+
+        if (!sameTime) return false;
+
+        if (slot.staff_id) {
+          return String(appt.staff_id || "") === String(slot.staff_id);
+        }
+
+        return true;
+      }).length;
+
+      const availableSpots = Math.max(capacity - bookedCount, 0);
+
+      return {
+        ...slot,
+        is_group: isGroup,
+        capacity,
+        booked_count: bookedCount,
+        available_spots: availableSpots,
+      };
+    })
+    .filter((slot) => slot.available_spots > 0);
+}
+
     const { data: calendar, error: calendarError } = await supabase
       .from("calendars")
       .select("id, slot_minutes")
@@ -7050,19 +7128,21 @@ const hasBusinessConfig =
         calendar.slot_minutes || 30
       );
 
-      slots = await subtractAppointmentsFromWindows({
-        tenant_id: tenant.id,
-        branch_id: resolvedBranchId,
-        staff_id: null,
-        date,
-        windows: businessWindows,
-      });
+      if (!isGroup) {
+  slots = await subtractAppointmentsFromWindows({
+    tenant_id: tenant.id,
+    branch_id: resolvedBranchId,
+    staff_id: null,
+    date,
+    windows: businessWindows,
+  });
 
-      slots = buildSlotsFromWindows(
-        slots,
-        date,
-        calendar.slot_minutes || 30
-      );
+  slots = buildSlotsFromWindows(
+    slots,
+    date,
+    calendar.slot_minutes || 30
+  );
+}
 
       const totalMinutes =
         (service.duration_minutes || 0) +
@@ -7076,8 +7156,9 @@ const hasBusinessConfig =
       );
 
       slots = filterPastSlots(slots, minBookingNoticeMinutes);
+slots = await attachCapacityToSlots(slots);
 
-      return res.json({
+return res.json({
         business: {
           name: tenant.name,
           slug: tenant.slug,
@@ -7105,13 +7186,15 @@ const hasBusinessConfig =
   ? intersectWindows(businessWindows, staffWindows)
   : staffWindows;
 
-      finalWindows = await subtractAppointmentsFromWindows({
-        tenant_id: tenant.id,
-        branch_id: resolvedBranchId,
-        staff_id: currentStaffId,
-        date,
-        windows: finalWindows,
-      });
+      if (!isGroup) {
+  finalWindows = await subtractAppointmentsFromWindows({
+    tenant_id: tenant.id,
+    branch_id: resolvedBranchId,
+    staff_id: currentStaffId,
+    date,
+    windows: finalWindows,
+  });
+}
 
       let staffSlots = buildSlotsFromWindows(
         finalWindows,
@@ -7153,9 +7236,10 @@ const hasBusinessConfig =
         new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
     );
 
-    slots = filterPastSlots(slots, minBookingNoticeMinutes);
+slots = filterPastSlots(slots, minBookingNoticeMinutes);
+slots = await attachCapacityToSlots(slots);
 
-    return res.json({
+return res.json({
       business: {
         name: tenant.name,
         slug: tenant.slug,
