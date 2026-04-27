@@ -2953,25 +2953,38 @@ const {
 
     const startIso = start.toISOString();
 
-    let doubleBookingQuery = supabase
-      .from("appointments")
-      .select("id")
-      .eq("tenant_id", cal.tenant_id)
-      .eq("branch_id", resolvedBranchId)
-      .eq("start_at", startIso)
-      .eq("status", "booked");
+    let bookingQuery = supabase
+  .from("appointments")
+  .select("id", { count: "exact" })
+  .eq("tenant_id", cal.tenant_id)
+  .eq("branch_id", resolvedBranchId)
+  .eq("start_at", startIso)
+  .eq("status", "booked");
 
-    if (staff_id) {
-      doubleBookingQuery = doubleBookingQuery.eq("staff_id", staff_id);
-    }
+if (staff_id) {
+  bookingQuery = bookingQuery.eq("staff_id", staff_id);
+}
 
-    const { data: existingSlot } = await doubleBookingQuery.limit(1);
+const { count: existingCount, error: countErr } = await bookingQuery;
 
-    if (existingSlot && existingSlot.length > 0) {
-      return res.status(409).json({
-        error: "Este horario acaba de ser reservado por otro cliente.",
-      });
-    }
+if (countErr) {
+  return res.status(500).json({ error: countErr.message });
+}
+
+// 🧠 Lógica híbrida
+if (!isGroup) {
+  if (existingCount > 0) {
+    return res.status(409).json({
+      error: "Este horario acaba de ser reservado por otro cliente.",
+    });
+  }
+} else {
+  if (existingCount >= capacity) {
+    return res.status(409).json({
+      error: "Este horario ya alcanzó su capacidad máxima.",
+    });
+  }
+}
 
         const nowIso = new Date().toISOString();
     const normalizedCustomerName = String(customer_name || "")
@@ -3073,10 +3086,14 @@ const {
         return res.status(404).json({ error: "Servicio no encontrado" });
       }
 
-      duration = service.duration_minutes;
-      bufferBefore = service.buffer_before_minutes || 0;
-      bufferAfter = service.buffer_after_minutes || 0;
-      serviceName = service.name;
+duration = service.duration_minutes;
+bufferBefore = service.buffer_before_minutes || 0;
+bufferAfter = service.buffer_after_minutes || 0;
+serviceName = service.name;
+
+// 🆕 NUEVO
+const isGroup = Boolean(service.is_group);
+const capacity = Number(service.capacity || 1);
     }
 
     const totalMinutes = duration + bufferBefore + bufferAfter;
