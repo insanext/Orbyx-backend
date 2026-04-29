@@ -5862,6 +5862,54 @@ app.patch("/appointments/:id", async (req, res) => {
 });
 
 /* ======================================================
+   ✅ PATCH /calendars/:id/slot-minutes
+====================================================== */
+app.patch("/calendars/:id/slot-minutes", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { slot_minutes } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: "calendar id es obligatorio" });
+    }
+
+    const normalizedSlotMinutes = Number(slot_minutes || 30);
+
+    if (
+      !Number.isInteger(normalizedSlotMinutes) ||
+      normalizedSlotMinutes < 5 ||
+      normalizedSlotMinutes > 180
+    ) {
+      return res.status(400).json({
+        error: "slot_minutes debe ser un número entre 5 y 180",
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("calendars")
+      .update({
+        slot_minutes: normalizedSlotMinutes,
+      })
+      .eq("id", id)
+      .select("id, slot_minutes")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      calendar: data,
+    });
+  } catch (err) {
+    console.error("PATCH /calendars/:id/slot-minutes error:", err.message);
+    return res.status(500).json({
+      error: err.message || "Error guardando intervalo",
+    });
+  }
+});
+
+
+/* ======================================================
    🔹 HEALTHCHECK
 ====================================================== */
 app.get("/_ping", (req, res) => {
@@ -6759,7 +6807,7 @@ app.get("/public/business/:slug", async (req, res) => {
 
     const { data: calendar } = await supabase
       .from("calendars")
-      .select("id")
+      .select("id, slot_minutes")
       .eq("tenant_id", tenant.id)
       .eq("is_active", true)
       .limit(1)
@@ -6772,6 +6820,7 @@ app.get("/public/business/:slug", async (req, res) => {
         max_booking_days_ahead: tenant.max_booking_days_ahead || 60,
       },
       calendar_id: calendar?.id,
+	slot_minutes: calendar?.slot_minutes || 30,
       google_connected: false,
     });
   } catch (err) {
