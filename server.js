@@ -7169,12 +7169,20 @@ const hasBusinessConfig =
   (businessWeeklyRows && businessWeeklyRows.length > 0) ||
   (businessSpecialRows && businessSpecialRows.length > 0);
 
-    if (!candidateStaffIds.length) {
-      let slots = buildSlotsFromWindows(
-        businessWindows,
-        date,
-        calendar.slot_minutes || 30
-      );
+if (!candidateStaffIds.length) {
+  return res.json({
+    business: {
+      name: tenant.name,
+      slug: tenant.slug,
+    },
+    branch,
+    calendar_id: calendar.id,
+    service,
+    date,
+    total: 0,
+    slots: [],
+  });
+}
 
       if (!isGroup) {
   slots = await subtractAppointmentsFromWindows({
