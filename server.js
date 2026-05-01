@@ -7188,7 +7188,6 @@ if (!candidateStaffIds.length) {
   });
 }
 
-let mergedSlots = [];
 
     let mergedSlots = [];
 
