@@ -6578,17 +6578,19 @@ app.patch("/services/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const {
-      tenant_id,
-      branch_id,
-      name,
-      description,
-      duration_minutes,
-      price,
-      buffer_before_minutes = 0,
-      buffer_after_minutes = 0,
-      active,
-    } = req.body;
+const {
+  tenant_id,
+  branch_id,
+  name,
+  description,
+  duration_minutes,
+  price,
+  buffer_before_minutes = 0,
+  buffer_after_minutes = 0,
+  active,
+  is_group,
+  capacity,
+} = req.body;
 
     if (!id) {
       return res.status(400).json({ error: "id es obligatorio" });
@@ -6629,6 +6631,9 @@ app.patch("/services/:id", async (req, res) => {
     if (buffer_after_minutes !== undefined)
       updateData.buffer_after_minutes = Number(buffer_after_minutes);
     if (active !== undefined) updateData.active = Boolean(active);
+if (is_group !== undefined) updateData.is_group = Boolean(is_group);
+if (capacity !== undefined) updateData.capacity = Number(capacity);
+
 
     const { data, error } = await supabase
       .from("services")
