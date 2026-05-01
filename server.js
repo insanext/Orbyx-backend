@@ -1371,37 +1371,61 @@ body{
   display:flex;
   align-items:center;
   justify-content:center;
-  height:100vh;
+  min-height:100vh;
+  padding:24px;
 }
 
 .card{
   background:white;
-  padding:40px;
-  border-radius:16px;
-  box-shadow:0 10px 30px rgba(0,0,0,0.1);
-  width:420px;
+  padding:34px;
+  border-radius:22px;
+  box-shadow:0 18px 50px rgba(15,23,42,0.10);
+  width:460px;
+  max-width:100%;
   text-align:center;
 }
 
 h1{
-  margin-bottom:10px;
-  font-size:22px;
+  margin:0 0 10px;
+  font-size:24px;
 }
 
 p{
   color:#64748b;
   font-size:14px;
-  margin-bottom:25px;
+  line-height:1.55;
+}
+
+.warning{
+  margin:20px 0 22px;
+  padding:14px 16px;
+  border:1px solid #fecaca;
+  background:#fff1f2;
+  border-radius:16px;
+  text-align:left;
+}
+
+.warning strong{
+  display:block;
+  color:#be123c;
+  font-size:13px;
+  margin-bottom:6px;
+}
+
+.warning p{
+  margin:6px 0 0;
+  color:#7f1d1d;
+  font-size:13px;
 }
 
 .btn{
   display:inline-block;
   background:#111827;
   color:white;
-  padding:12px 18px;
-  border-radius:10px;
+  padding:13px 18px;
+  border-radius:12px;
   text-decoration:none;
-  font-weight:500;
+  font-weight:600;
 }
 
 .btn:hover{
@@ -1427,6 +1451,18 @@ Orbyx necesita acceso a tu Google Calendar para crear automáticamente
 las reservas cuando un cliente agenda una cita.
 </p>
 
+<div class="warning">
+  <strong>Importante antes de continuar</strong>
+  <p>
+    Google puede mostrar una pantalla indicando que la app aún no está verificada.
+    Esto es normal mientras Orbyx está en fase de pruebas.
+  </p>
+  <p>
+    Para continuar, presiona “Configuración avanzada” y luego
+    “Ir a orbyx-backend.onrender.com”.
+  </p>
+</div>
+
 <a class="btn" href="${url}">
 Autorizar con Google
 </a>
@@ -1444,6 +1480,7 @@ Modo: ${calendar_id ? "SaaS" : "Compatibilidad"}
     res.status(500).send("Error en /auth: " + e.message);
   }
 });
+
 
 /* ======================================================
    🔹 ENDPOINT: /oauth2callback
