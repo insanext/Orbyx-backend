@@ -7169,6 +7169,10 @@ const hasBusinessConfig =
   (businessWeeklyRows && businessWeeklyRows.length > 0) ||
   (businessSpecialRows && businessSpecialRows.length > 0);
 
+
+
+
+
 if (!candidateStaffIds.length) {
   return res.json({
     business: {
@@ -7184,49 +7188,7 @@ if (!candidateStaffIds.length) {
   });
 }
 
-      if (!isGroup) {
-  slots = await subtractAppointmentsFromWindows({
-    tenant_id: tenant.id,
-    branch_id: resolvedBranchId,
-    staff_id: null,
-    date,
-    windows: businessWindows,
-  });
-
-  slots = buildSlotsFromWindows(
-    slots,
-    date,
-    calendar.slot_minutes || 30
-  );
-}
-
-      const totalMinutes =
-        (service.duration_minutes || 0) +
-        (service.buffer_before_minutes || 0) +
-        (service.buffer_after_minutes || 0);
-
-      slots = filterSlotsForServiceDuration(
-        slots,
-        totalMinutes,
-        calendar.slot_minutes || 30
-      );
-
-      slots = filterPastSlots(slots, minBookingNoticeMinutes);
-slots = await attachCapacityToSlots(slots);
-
-return res.json({
-        business: {
-          name: tenant.name,
-          slug: tenant.slug,
-        },
-        branch,
-        calendar_id: calendar.id,
-        service,
-        date,
-        total: slots.length,
-        slots,
-      });
-    }
+let mergedSlots = [];
 
     let mergedSlots = [];
 
