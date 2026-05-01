@@ -6752,6 +6752,27 @@ app.get("/public/services/:slug", async (req, res) => {
       .is("deleted_at", null)
       .order("created_at", { ascending: true });
 
+// 🔽 obtener relaciones staff-servicio
+const { data: staffRelations, error: staffRelError } = await supabase
+  .from("staff_services")
+  .select("service_id")
+  .eq("tenant_id", tenant.id)
+  .eq("branch_id", resolvedBranchId);
+
+if (staffRelError) {
+  return res.status(500).json({ error: staffRelError.message });
+}
+
+// 🔽 servicios que tienen al menos 1 staff
+const serviceIdsWithStaff = new Set(
+  (staffRelations || []).map((r) => r.service_id)
+);
+
+// 🔽 filtrar servicios
+const filteredServices = (services || []).filter((s) =>
+  serviceIdsWithStaff.has(s.id)
+);
+
     if (servicesError) {
       return res.status(500).json({ error: servicesError.message });
     }
@@ -6760,7 +6781,7 @@ app.get("/public/services/:slug", async (req, res) => {
       business: tenant,
       branch,
       calendar_id: calendar.id,
-      services: services || [],
+      services: filteredServices,
     });
   } catch (error) {
     console.error("Error en /public/services/:slug", error);
