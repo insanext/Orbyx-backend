@@ -6502,17 +6502,19 @@ app.get("/services", async (req, res) => {
 
 app.post("/services", async (req, res) => {
   try {
-    const {
-      tenant_id,
-      branch_id,
-      name,
-      description,
-      duration_minutes,
-      buffer_before_minutes = 0,
-      buffer_after_minutes = 0,
-      price = 0,
-      active = true,
-    } = req.body;
+const {
+  tenant_id,
+  branch_id,
+  name,
+  description,
+  duration_minutes,
+  buffer_before_minutes = 0,
+  buffer_after_minutes = 0,
+  price = 0,
+  active = true,
+  is_group = false,
+  capacity = 1,
+} = req.body;
 
     if (!tenant_id || !name || !duration_minutes) {
       return res.status(400).json({
@@ -6548,6 +6550,8 @@ app.post("/services", async (req, res) => {
         buffer_after_minutes: Number(buffer_after_minutes || 0),
         price: Number(price || 0),
         active: Boolean(active),
+  is_group: Boolean(is_group),
+  capacity: Number(capacity || 1),
       })
       .select()
       .single();
@@ -7530,14 +7534,47 @@ app.get("/booking-fields/:slug", async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    return res.json({
-      booking_fields_config: data.booking_fields_config || [],
-    });
+    const bookingFieldsConfig =
+  Array.isArray(data.booking_fields_config) &&
+  data.booking_fields_config.length > 0
+    ? data.booking_fields_config
+    : DEFAULT_BOOKING_FIELDS_CONFIG;
+
+return res.json({
+  booking_fields_config: bookingFieldsConfig,
+});
   } catch (err) {
     console.error("GET /booking-fields/:slug error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
+
+const DEFAULT_BOOKING_FIELDS_CONFIG = [
+  {
+    key: "name",
+    label: "Nombre",
+    enabled: true,
+    required: true,
+  },
+  {
+    key: "email",
+    label: "Correo",
+    enabled: true,
+    required: true,
+  },
+  {
+    key: "phone",
+    label: "Teléfono",
+    enabled: true,
+    required: true,
+  },
+  {
+    key: "notes",
+    label: "Notas o comentarios",
+    enabled: true,
+    required: false,
+  },
+];
 
 /* ======================================================
    🔹 PUT /booking-fields/:slug
