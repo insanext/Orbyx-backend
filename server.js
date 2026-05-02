@@ -712,24 +712,24 @@ async function getBusinessAvailabilityWindows({ tenant_id, branch_id, date }) {
     .eq("branch_id", branch_id)
     .eq("day_of_week", weekday);
 
-  if (weeklyError) throw weeklyError;
+let windows = [];
 
-  const weekly = weeklyRows?.[0] || null;
+const validWeeklyRows = (weeklyRows || []).filter(
+  (row) => row.enabled && row.start_time && row.end_time
+);
 
-  let windows = [];
+windows = validWeeklyRows
+  .map((row) => {
+    const start = timeToMinutes(row.start_time);
+    const end = timeToMinutes(row.end_time);
 
-  if (weekly?.enabled && weekly.start_time && weekly.end_time) {
-    const weeklyStart = timeToMinutes(weekly.start_time);
-    const weeklyEnd = timeToMinutes(weekly.end_time);
-
-    if (
-      weeklyStart !== null &&
-      weeklyEnd !== null &&
-      weeklyEnd > weeklyStart
-    ) {
-      windows = [{ start: weeklyStart, end: weeklyEnd }];
+    if (start !== null && end !== null && end > start) {
+      return { start, end };
     }
-  }
+
+    return null;
+  })
+  .filter(Boolean);
 
   const { data: specialRows, error: specialError } = await supabase
     .from("business_special_dates")
@@ -1536,35 +1536,62 @@ app.get("/business-hours", async (req, res) => {
 /* ======================================================
    ✅ PUT /business-hours
 ====================================================== */
+
 app.put("/business-hours", async (req, res) => {
   try {
     const { tenant_id, branch_id, hours } = req.body;
 
-    if (!tenant_id) {
-      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    if (!tenant_id) return res.status(400).json({ error: "tenant_id es obligatorio" });
+    if (!branch_id) return res.status(400).json({ error: "branch_id es obligatorio" });
+    if (!Array.isArray(hours)) return res.status(400).json({ error: "hours debe ser un arreglo" });
+
+    const rows = [];
+
+    for (const item of hours) {
+      const dayOfWeek = Number(item.day_of_week);
+      const enabled = Boolean(item.enabled);
+
+      const blocks = Array.isArray(item.blocks)
+        ? item.blocks
+        : [{ start_time: item.start_time, end_time: item.end_time }];
+
+      if (!enabled) {
+        rows.push({
+          tenant_id,
+          branch_id,
+          day_of_week: dayOfWeek,
+          enabled: false,
+          start_time: null,
+          end_time: null,
+          updated_at: new Date().toISOString(),
+        });
+        continue;
+      }
+
+      for (const block of blocks) {
+        if (!block.start_time || !block.end_time) continue;
+
+        rows.push({
+          tenant_id,
+          branch_id,
+          day_of_week: dayOfWeek,
+          enabled: true,
+          start_time: block.start_time,
+          end_time: block.end_time,
+          updated_at: new Date().toISOString(),
+        });
+      }
     }
 
-    if (!branch_id) {
-      return res.status(400).json({ error: "branch_id es obligatorio" });
-    }
-
-    if (!Array.isArray(hours)) {
-      return res.status(400).json({ error: "hours debe ser un arreglo" });
-    }
-
-    const payload = hours.map((item) => ({
-      tenant_id,
-      branch_id,
-      day_of_week: Number(item.day_of_week),
-      enabled: Boolean(item.enabled),
-      start_time: item.start_time || "09:00:00",
-      end_time: item.end_time || "18:00:00",
-      updated_at: new Date().toISOString(),
-    }));
+    await supabase
+      .from("business_hours")
+      .delete()
+      .eq("tenant_id", tenant_id)
+      .eq("branch_id", branch_id);
 
     const { data, error } = await supabase
       .from("business_hours")
-      .upsert(payload, { onConflict: "tenant_id,branch_id,day_of_week" })
+      .insert(rows)
       .select("*");
 
     if (error) throw error;
