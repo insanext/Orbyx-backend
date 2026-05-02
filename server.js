@@ -2957,62 +2957,68 @@ if (!isGroup) {
 
     const futureAppointments = existingAppointments || [];
 
-    const samePersonAppointment = futureAppointments.find((appt) => {
-      const apptName = String(appt.customer_name || "").trim().toLowerCase();
-      const sameName =
-        normalizedCustomerName && apptName === normalizedCustomerName;
 
-      if (!sameName) return false;
 
-      const sameEmail =
-        normalizedEmail &&
-        appt.customer_email &&
-        String(appt.customer_email).trim().toLowerCase() === normalizedEmail;
 
-      const samePhone =
-        normalizedPhone &&
-        appt.customer_phone &&
-        String(appt.customer_phone).trim() === normalizedPhone;
 
-      return sameEmail || samePhone;
+    if (!isGroup) {
+  const samePersonAppointment = futureAppointments.find((appt) => {
+    const apptName = String(appt.customer_name || "").trim().toLowerCase();
+    const sameName =
+      normalizedCustomerName && apptName === normalizedCustomerName;
+
+    if (!sameName) return false;
+
+    const sameEmail =
+      normalizedEmail &&
+      appt.customer_email &&
+      String(appt.customer_email).trim().toLowerCase() === normalizedEmail;
+
+    const samePhone =
+      normalizedPhone &&
+      appt.customer_phone &&
+      String(appt.customer_phone).trim() === normalizedPhone;
+
+    return sameEmail || samePhone;
+  });
+
+  if (samePersonAppointment) {
+    return res.status(409).json({
+      error:
+        "Esta persona ya tiene una reserva futura activa. Revisa su correo o cancela la reserva actual antes de tomar otra.",
     });
+  }
 
-    if (samePersonAppointment) {
+  if (normalizedEmail) {
+    const emailActiveCount = futureAppointments.filter(
+      (appt) =>
+        appt.customer_email &&
+        String(appt.customer_email).trim().toLowerCase() === normalizedEmail
+    ).length;
+
+    if (emailActiveCount >= 2) {
       return res.status(409).json({
         error:
-          "Esta persona ya tiene una reserva futura activa. Revisa su correo o cancela la reserva actual antes de tomar otra.",
+          "Este correo ya alcanzó el máximo de 2 reservas futuras activas.",
       });
     }
+  }
 
-    if (normalizedEmail) {
-      const emailActiveCount = futureAppointments.filter(
-        (appt) =>
-          appt.customer_email &&
-          String(appt.customer_email).trim().toLowerCase() === normalizedEmail
-      ).length;
+  if (normalizedPhone) {
+    const phoneActiveCount = futureAppointments.filter(
+      (appt) =>
+        appt.customer_phone &&
+        String(appt.customer_phone).trim() === normalizedPhone
+    ).length;
 
-      if (emailActiveCount >= 2) {
-        return res.status(409).json({
-          error:
-            "Este correo ya alcanzó el máximo de 2 reservas futuras activas.",
-        });
-      }
+    if (phoneActiveCount >= 2) {
+      return res.status(409).json({
+        error:
+          "Este teléfono ya alcanzó el máximo de 2 reservas futuras activas.",
+      });
     }
-
-    if (normalizedPhone) {
-      const phoneActiveCount = futureAppointments.filter(
-        (appt) =>
-          appt.customer_phone &&
-          String(appt.customer_phone).trim() === normalizedPhone
-      ).length;
-
-      if (phoneActiveCount >= 2) {
-        return res.status(409).json({
-          error:
-            "Este teléfono ya alcanzó el máximo de 2 reservas futuras activas.",
-        });
-      }
-    }
+  }
+}
 
 
     const totalMinutes = duration + bufferBefore + bufferAfter;
