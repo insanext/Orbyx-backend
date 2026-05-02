@@ -3091,15 +3091,17 @@ const slotDateStr = String(date).slice(0, 10);
 
     const wantedStart = slot_start.slice(0, 16); // "YYYY-MM-DDTHH:mm"
 
-const ok = validSlots.some(
-  (s) => s.slot_start.slice(0, 16) === wantedStart
-);
+if (!isGroup) {
+  const ok = validSlots.some(
+    (s) => s.slot_start.slice(0, 16) === wantedStart
+  );
 
-    if (!ok) {
-      return res.status(409).json({
-        error: "Ese horario ya no está disponible.",
-      });
-    }
+  if (!ok) {
+    return res.status(409).json({
+      error: "Ese horario ya no está disponible.",
+    });
+  }
+}
 
     const end = new Date(
       start.getTime() + (duration + bufferBefore + bufferAfter) * 60 * 1000
