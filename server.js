@@ -3037,13 +3037,15 @@ const slotDateStr = String(date).slice(0, 10);
 
       let finalWindows = intersectWindows(businessWindows, staffWindows);
 
-      finalWindows = await subtractAppointmentsFromWindows({
-        tenant_id: cal.tenant_id,
-        branch_id: resolvedBranchId,
-        staff_id,
-        date: slotDateStr,
-        windows: finalWindows,
-      });
+      if (!isGroup) {
+        finalWindows = await subtractAppointmentsFromWindows({
+          tenant_id: cal.tenant_id,
+          branch_id: resolvedBranchId,
+          staff_id,
+          date: slotDateStr,
+          windows: finalWindows,
+        });
+      }
 
       validSlots = buildSlotsFromWindows(
         finalWindows,
