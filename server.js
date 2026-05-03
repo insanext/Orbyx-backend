@@ -7200,19 +7200,20 @@ if (!candidateStaffIds.length) {
         (service.buffer_before_minutes || 0) +
         (service.buffer_after_minutes || 0);
 
-      staffSlots = filterSlotsForServiceDuration(
-        staffSlots,
-        totalMinutes,
-        calendar.slot_minutes || 30
-      ).map((slot) => ({
-        ...slot,
-        staff_id: currentStaffId,
-      }));
-
 staffSlots = filterSlotsByWindows(
   staffSlots,
   finalWindows,
   date
+);
+
+staffSlots = filterSlotsForServiceDuration(
+  staffSlots,
+  totalMinutes,
+  calendar.slot_minutes || 30
+).map((slot) => ({
+  ...slot,
+  staff_id: currentStaffId,
+}));
 );
 
       mergedSlots.push(...staffSlots);
