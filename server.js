@@ -7209,6 +7209,12 @@ if (!candidateStaffIds.length) {
         staff_id: currentStaffId,
       }));
 
+staffSlots = filterSlotsByWindows(
+  staffSlots,
+  finalWindows,
+  date
+);
+
       mergedSlots.push(...staffSlots);
     }
 
