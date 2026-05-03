@@ -2346,23 +2346,11 @@ app.get("/staff-hours", async (req, res) => {
 /* ======================================================
    ✅ PUT /staff-hours
    Reemplaza horarios semanales de un staff
+   Soporta múltiples bloques por día
 ====================================================== */
-
 app.put("/staff-hours", async (req, res) => {
   try {
     const { tenant_id, staff_id, hours } = req.body;
-
-    const { data: staffData, error: staffError } = await supabase
-      .from("staff")
-      .select("branch_id")
-      .eq("id", staff_id)
-      .single();
-
-    if (staffError || !staffData) {
-      return res.status(400).json({ error: "No se pudo obtener branch_id del staff" });
-    }
-
-    const branch_id_real = staffData.branch_id;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -2376,28 +2364,65 @@ app.put("/staff-hours", async (req, res) => {
       return res.status(400).json({ error: "hours debe ser un arreglo" });
     }
 
+    const { data: staffData, error: staffError } = await supabase
+      .from("staff")
+      .select("branch_id")
+      .eq("id", staff_id)
+      .single();
+
+    if (staffError || !staffData) {
+      return res.status(400).json({ error: "No se pudo obtener branch_id del staff" });
+    }
+
+    const branch_id_real = staffData.branch_id;
+
     for (const item of hours) {
       if (!isValidDayOfWeek(item.day_of_week)) {
         return res.status(400).json({ error: "day_of_week inválido" });
       }
+
+      if (item.enabled && (!item.start_time || !item.end_time)) {
+        return res.status(400).json({ error: "Cada bloque activo debe tener inicio y fin" });
+      }
+
+      if (item.enabled && item.start_time >= item.end_time) {
+        return res.status(400).json({ error: "La hora fin debe ser mayor a la hora inicio" });
+      }
     }
 
-    const payload = hours.map((item) => ({
-      tenant_id,
-      branch_id: branch_id_real,
-      staff_id,
-      day_of_week: Number(item.day_of_week),
-      enabled: Boolean(item.enabled),
-      start_time: item.start_time || "09:00:00",
-      end_time: item.end_time || "18:00:00",
-      updated_at: new Date().toISOString(),
-    }));
+    const { error: deleteError } = await supabase
+      .from("staff_hours")
+      .delete()
+      .eq("tenant_id", tenant_id)
+      .eq("branch_id", branch_id_real)
+      .eq("staff_id", staff_id);
 
-    console.log("STAFF HOURS PAYLOAD =>", JSON.stringify(payload, null, 2));
+    if (deleteError) throw deleteError;
+
+    const payload = hours
+      .filter((item) => Boolean(item.enabled))
+      .map((item, index) => ({
+        tenant_id,
+        branch_id: branch_id_real,
+        staff_id,
+        day_of_week: Number(item.day_of_week),
+        block_order: Number(item.block_order || index + 1),
+        enabled: true,
+        start_time: item.start_time || "09:00:00",
+        end_time: item.end_time || "18:00:00",
+        updated_at: new Date().toISOString(),
+      }));
+
+    if (payload.length === 0) {
+      return res.json({
+        ok: true,
+        hours: [],
+      });
+    }
 
     const { data, error } = await supabase
       .from("staff_hours")
-      .upsert(payload, { onConflict: "tenant_id,branch_id,staff_id,day_of_week" })
+      .insert(payload)
       .select("*");
 
     if (error) throw error;
