@@ -7214,7 +7214,6 @@ staffSlots = filterSlotsForServiceDuration(
   ...slot,
   staff_id: currentStaffId,
 }));
-);
 
       mergedSlots.push(...staffSlots);
     }
