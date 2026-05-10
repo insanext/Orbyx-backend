@@ -2959,10 +2959,10 @@ if (service_id) {
     let bookingQuery = supabase
   .from("appointments")
   .select("id", { count: "exact" })
-  .eq("tenant_id", cal.tenant_id)
-  .eq("branch_id", resolvedBranchId)
-  .eq("start_at", startIso)
-  .eq("status", "booked");
+    .eq("tenant_id", cal.tenant_id)
+    .eq("branch_id", resolvedBranchId)
+    .eq("start_at", startIso)
+  .in("status", isGroup ? ["booked", "completed", "no_show"] : ["booked"]);
 
 if (staff_id) {
   bookingQuery = bookingQuery.eq("staff_id", staff_id);
@@ -7059,7 +7059,7 @@ async function attachCapacityToSlots(slotsToCheck) {
     .eq("tenant_id", tenant.id)
     .eq("branch_id", resolvedBranchId)
     .eq("service_id", service_id)
-    .eq("status", "booked")
+    .in("status", ["booked", "completed", "no_show"])
     .gte("start_at", dayStart)
     .lte("start_at", dayEnd);
 
