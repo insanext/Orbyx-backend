@@ -2186,10 +2186,18 @@ app.delete("/staff/:id", async (req, res) => {
 ====================================================== */
 app.get("/staff-services", async (req, res) => {
   try {
-    const { tenant_id, staff_id } = req.query;
+    const { tenant_id, staff_id, branch_id } = req.query;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    let resolvedBranchId = null;
+    if (branch_id) {
+      resolvedBranchId = await resolveBranchId({
+        tenant_id,
+        branch_id,
+      });
     }
 
     let query = supabase
@@ -2200,6 +2208,10 @@ app.get("/staff-services", async (req, res) => {
 
     if (staff_id) {
       query = query.eq("staff_id", staff_id);
+    }
+
+    if (resolvedBranchId) {
+      query = query.eq("branch_id", resolvedBranchId);
     }
 
     const { data, error } = await query;
