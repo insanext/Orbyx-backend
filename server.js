@@ -6373,7 +6373,7 @@ app.post("/branches", async (req, res) => {
 app.patch("/branches/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { tenant_id, name, is_active } = req.body;
+    const { tenant_id, name, slug, is_active } = req.body;
 
     if (!id) {
       return res.status(400).json({ error: "id es obligatorio" });
@@ -6381,7 +6381,7 @@ app.patch("/branches/:id", async (req, res) => {
 
     const { data: existingBranch, error: existingError } = await supabase
       .from("branches")
-      .select("id, tenant_id, name, is_active")
+      .select("id, tenant_id, name, slug, is_active")
       .eq("id", id)
       .single();
 
@@ -6399,6 +6399,36 @@ app.patch("/branches/:id", async (req, res) => {
       }
 
       updateData.name = String(name).trim();
+    }
+
+    if (slug !== undefined) {
+      const normalizedSlug = String(slug || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "-")
+        .replace(/[^a-z0-9-]/g, "")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "");
+
+      if (!normalizedSlug) {
+        return res.status(400).json({ error: "slug no puede estar vacio" });
+      }
+
+      const { data: duplicateBranch, error: duplicateError } = await supabase
+        .from("branches")
+        .select("id")
+        .eq("tenant_id", effectiveTenantId)
+        .eq("slug", normalizedSlug)
+        .neq("id", id)
+        .maybeSingle();
+
+      if (duplicateError) throw duplicateError;
+
+      if (duplicateBranch) {
+        return res.status(409).json({ error: "Ya existe una sucursal con ese slug" });
+      }
+
+      updateData.slug = normalizedSlug;
     }
 
     if (is_active !== undefined) {
