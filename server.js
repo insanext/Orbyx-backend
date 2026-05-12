@@ -900,56 +900,86 @@ async function upsertCustomerFromAppointment({
     ? String(customer_phone).trim()
     : null;
 
-  const { data: candidateCustomers, error: candidateError } = await supabase
-    .from("customers")
-    .select("*")
-    .eq("tenant_id", tenant_id);
+  let existingByPhone = null;
 
-  if (candidateError) throw candidateError;
+  if (normalizedPhone) {
+    const { data, error } = await supabase
+      .from("customers")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .eq("phone", normalizedPhone)
+      .limit(1)
+      .maybeSingle();
 
-  const customers = candidateCustomers || [];
+    if (error) throw error;
+    existingByPhone = data || null;
+  }
 
-  const existingByEmail =
-    normalizedEmail
-      ? customers.find(
-          (customer) =>
-            customer.email &&
-            String(customer.email).trim().toLowerCase() === normalizedEmail
-        ) || null
-      : null;
+  let existingByEmail = null;
 
-  const existingByPhone =
-    !existingByEmail && normalizedPhone
-      ? customers.find(
-          (customer) =>
-            customer.phone &&
-            String(customer.phone).trim() === normalizedPhone
-        ) || null
-      : null;
+  if (normalizedEmail) {
+    const { data, error } = await supabase
+      .from("customers")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .eq("email", normalizedEmail)
+      .limit(1)
+      .maybeSingle();
 
-  const existingByName =
-    !existingByEmail && !existingByPhone && normalizedNameKey
-      ? customers.find((customer) => {
+    if (error) throw error;
+    existingByEmail = data || null;
+  }
+
+  let existingByName = null;
+
+  if (!existingByPhone && !existingByEmail && !normalizedPhone && !normalizedEmail && normalizedNameKey) {
+    const { data: candidateCustomers, error: candidateError } = await supabase
+      .from("customers")
+      .select("*")
+      .eq("tenant_id", tenant_id);
+
+    if (candidateError) throw candidateError;
+
+    existingByName =
+      (candidateCustomers || []).find((customer) => {
           const customerNameKey = String(customer.name || "")
             .trim()
             .toLowerCase();
 
           return customerNameKey === normalizedNameKey;
-        }) || null
-      : null;
+        }) || null;
+  }
 
   const existingCustomer =
-    existingByEmail || existingByPhone || existingByName || null;
+    existingByPhone || existingByEmail || existingByName || null;
 
   if (existingCustomer) {
+    const updatePayload = {
+      name: normalizedName || existingCustomer.name || "",
+      updated_at: new Date().toISOString(),
+    };
+
+    if (
+      normalizedEmail &&
+      (!existingByEmail || existingByEmail.id === existingCustomer.id)
+    ) {
+      updatePayload.email = normalizedEmail;
+    } else if (!normalizedEmail && existingCustomer.email) {
+      updatePayload.email = existingCustomer.email;
+    }
+
+    if (
+      normalizedPhone &&
+      (!existingByPhone || existingByPhone.id === existingCustomer.id)
+    ) {
+      updatePayload.phone = normalizedPhone;
+    } else if (!normalizedPhone && existingCustomer.phone) {
+      updatePayload.phone = existingCustomer.phone;
+    }
+
     const { data: updatedCustomer, error: updateError } = await supabase
       .from("customers")
-      .update({
-        name: normalizedName || existingCustomer.name || "",
-        email: normalizedEmail || existingCustomer.email || null,
-        phone: normalizedPhone || existingCustomer.phone || null,
-        updated_at: new Date().toISOString(),
-      })
+      .update(updatePayload)
       .eq("id", existingCustomer.id)
       .select("*")
       .single();
