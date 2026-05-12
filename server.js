@@ -3562,8 +3562,37 @@ const end = new Date(`${to}T23:59:59-04:00`).toISOString();
       return res.status(500).json({ error: appointmentsError.message });
     }
 
+    const serviceIds = [
+      ...new Set((appointments || []).map((appt) => appt.service_id).filter(Boolean)),
+    ];
+
+    let servicesById = new Map();
+
+    if (serviceIds.length > 0) {
+      const { data: services, error: servicesError } = await supabase
+        .from("services")
+        .select("id, is_group, capacity")
+        .in("id", serviceIds);
+
+      if (servicesError) {
+        return res.status(500).json({ error: servicesError.message });
+      }
+
+      servicesById = new Map((services || []).map((service) => [service.id, service]));
+    }
+
+    const enrichedAppointments = (appointments || []).map((appt) => {
+      const service = appt.service_id ? servicesById.get(appt.service_id) : null;
+
+      return {
+        ...appt,
+        service_is_group: Boolean(service?.is_group),
+        service_capacity: service ? Number(service.capacity || 1) : null,
+      };
+    });
+
     return res.json({
-      appointments: appointments || [],
+      appointments: enrichedAppointments,
     });
   } catch (error) {
     console.error("Error en /appointments/by-range/:slug", error);
