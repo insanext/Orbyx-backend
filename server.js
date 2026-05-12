@@ -3206,6 +3206,36 @@ if (!isGroup) {
     const end = new Date(
       start.getTime() + (duration + bufferBefore + bufferAfter) * 60 * 1000
     );
+
+const customer = await upsertCustomerFromAppointment({
+  tenant_id: cal.tenant_id,
+  customer_name: String(customer_name).trim(),
+  customer_email: normalizedEmail,
+  customer_phone: normalizedPhone,
+  start_at: start.toISOString(),
+});
+
+const { data: overlappingAppointments, error: overlapErr } = await supabase
+  .from("appointments")
+  .select("id")
+  .eq("tenant_id", cal.tenant_id)
+  .eq("customer_id", customer.id)
+  .neq("status", "canceled")
+  .lt("start_at", end.toISOString())
+  .gt("end_at", start.toISOString())
+  .limit(1);
+
+if (overlapErr) {
+  return res.status(500).json({ error: overlapErr.message });
+}
+
+if ((overlappingAppointments || []).length > 0) {
+  return res.status(409).json({
+    error:
+      "Esta persona ya tiene una reserva activa que se cruza con este horario.",
+  });
+}
+
     const cancelToken = crypto.randomBytes(24).toString("hex");
 
     const { data: apptRows, error: insErr } = await supabase
@@ -3216,6 +3246,7 @@ if (!isGroup) {
         calendar_id,
         service_id,
         staff_id: staff_id || null,
+        customer_id: customer.id,
         service_name_snapshot: serviceName,
         duration_minutes_snapshot: duration,
         customer_name: String(customer_name).trim(),
@@ -3260,14 +3291,6 @@ if (!appt) {
 }
 
 apptCreated = appt;
-
-const customer = await upsertCustomerFromAppointment({
-  tenant_id: cal.tenant_id,
-  customer_name: String(customer_name).trim(),
-  customer_email: normalizedEmail,
-  customer_phone: normalizedPhone,
-  start_at: start.toISOString(),
-});
 
 const customerData = req.body?.customer_data || {};
 
