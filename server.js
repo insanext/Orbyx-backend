@@ -3712,6 +3712,7 @@ app.get("/appointments/pending-close/:slug", async (req, res) => {
 app.get("/dashboard/metrics/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
+    const { branch_id } = req.query;
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
@@ -3722,6 +3723,20 @@ app.get("/dashboard/metrics/:slug", async (req, res) => {
 
     if (tenantError || !tenant) {
       return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    let resolvedBranchId = null;
+    if (branch_id) {
+      try {
+        resolvedBranchId = await resolveBranchId({
+          tenant_id: tenant.id,
+          branch_id,
+        });
+      } catch (branchError) {
+        return res.status(400).json({
+          error: branchError.message || "branch_id inválido",
+        });
+      }
     }
 
     function getSantiagoParts(date) {
@@ -3863,23 +3878,36 @@ app.get("/dashboard/metrics/:slug", async (req, res) => {
     const rangeStartIso = `${rangeStartKey}T00:00:00`;
     const rangeEndIso = `${rangeEndKey}T23:59:59`;
 
-    const { data: appointments, error: appointmentsError } = await supabase
+    let appointmentsQuery = supabase
       .from("appointments")
       .select("id, start_at, status")
       .eq("tenant_id", tenant.id)
       .gte("start_at", rangeStartIso)
       .lte("start_at", rangeEndIso);
 
+    if (resolvedBranchId) {
+      appointmentsQuery = appointmentsQuery.eq("branch_id", resolvedBranchId);
+    }
+
+    const { data: appointments, error: appointmentsError } =
+      await appointmentsQuery;
+
     if (appointmentsError) {
       return res.status(500).json({ error: appointmentsError.message });
     }
 
-    const { count: upcomingCount, error: upcomingError } = await supabase
+    let upcomingQuery = supabase
       .from("appointments")
       .select("*", { count: "exact", head: true })
       .eq("tenant_id", tenant.id)
       .eq("status", "booked")
       .gte("start_at", nowIso);
+
+    if (resolvedBranchId) {
+      upcomingQuery = upcomingQuery.eq("branch_id", resolvedBranchId);
+    }
+
+    const { count: upcomingCount, error: upcomingError } = await upcomingQuery;
 
     if (upcomingError) {
       return res.status(500).json({ error: upcomingError.message });
