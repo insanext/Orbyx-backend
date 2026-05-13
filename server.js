@@ -6465,6 +6465,7 @@ app.patch("/tenants/:id", async (req, res) => {
       facebook_url,
       description,
       business_subtype,
+      business_subtype_config,
       min_booking_notice_minutes,
       max_booking_days_ahead,
     } = req.body;
@@ -6515,6 +6516,51 @@ app.patch("/tenants/:id", async (req, res) => {
         ? String(business_subtype).trim()
         : null;
 
+    const subtypeBookingFieldDefaults = [
+      { key: "unit_type", label: "Tipo de unidad/equipo", type: "text" },
+      { key: "brand", label: "Marca", type: "text" },
+      { key: "model", label: "Modelo", type: "text" },
+      { key: "year", label: "Anio", type: "text" },
+      { key: "unit_identifier", label: "Patente / Identificador", type: "text" },
+      { key: "usage_value", label: "Kilometraje / Horas de uso", type: "text" },
+      { key: "visit_reason", label: "Motivo de la visita", type: "textarea" },
+      { key: "observations", label: "Observaciones", type: "textarea" },
+    ];
+    const rawSubtypeBookingFields =
+      business_subtype_config &&
+      Array.isArray(business_subtype_config.booking_fields)
+        ? business_subtype_config.booking_fields
+        : [];
+    const normalizedBusinessSubtypeConfig =
+      currentCategory === "generic" && normalizedBusinessSubtype === "taller_automotriz"
+        ? {
+            booking_fields: subtypeBookingFieldDefaults.map((baseField) => {
+              const savedField = rawSubtypeBookingFields.find(
+                (item) => item && item.key === baseField.key
+              );
+
+              return {
+                key: baseField.key,
+                label:
+                  savedField &&
+                  typeof savedField.label === "string" &&
+                  savedField.label.trim()
+                    ? savedField.label.trim()
+                    : baseField.label,
+                enabled:
+                  savedField && typeof savedField.enabled === "boolean"
+                    ? savedField.enabled
+                    : true,
+                required:
+                  savedField && typeof savedField.required === "boolean"
+                    ? savedField.required
+                    : false,
+                type: baseField.type,
+              };
+            }),
+          }
+        : {};
+
     if (
       business_subtype &&
       !allowedBusinessSubtypes.includes(String(business_subtype).trim())
@@ -6535,6 +6581,7 @@ app.patch("/tenants/:id", async (req, res) => {
         description: description ? String(description).trim() : null,
         business_subtype:
           currentCategory === "generic" ? normalizedBusinessSubtype : null,
+        business_subtype_config: normalizedBusinessSubtypeConfig,
         min_booking_notice_minutes: normalizedMinBookingNoticeMinutes,
         max_booking_days_ahead: normalizedMaxBookingDaysAhead,
       })
