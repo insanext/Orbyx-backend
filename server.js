@@ -4521,8 +4521,8 @@ app.get("/customers/:slug", async (req, res) => {
 
     if (error) throw error;
 
-    const rows = Array.isArray(data) ? data : [];
-    const customerIds = rows.map((customer) => customer.id).filter(Boolean);
+    let rows = Array.isArray(data) ? data : [];
+    let customerIds = rows.map((customer) => customer.id).filter(Boolean);
     const activityByCustomer = new Map();
 
     if (customerIds.length > 0) {
@@ -4567,6 +4567,11 @@ app.get("/customers/:slug", async (req, res) => {
         }
 
         activityByCustomer.set(customerId, current);
+      }
+
+      if (resolvedBranchId) {
+        rows = rows.filter((customer) => activityByCustomer.has(customer.id));
+        customerIds = rows.map((customer) => customer.id).filter(Boolean);
       }
     }
 
