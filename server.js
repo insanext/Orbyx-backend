@@ -6517,14 +6517,44 @@ app.patch("/tenants/:id", async (req, res) => {
         : null;
 
     const subtypeBookingFieldDefaults = [
-      { key: "unit_type", label: "Tipo de unidad/equipo", type: "text" },
-      { key: "brand", label: "Marca", type: "text" },
-      { key: "model", label: "Modelo", type: "text" },
-      { key: "year", label: "Anio", type: "text" },
-      { key: "unit_identifier", label: "Patente / Identificador", type: "text" },
-      { key: "usage_value", label: "Kilometraje / Horas de uso", type: "text" },
-      { key: "visit_reason", label: "Motivo de la visita", type: "textarea" },
-      { key: "observations", label: "Observaciones", type: "textarea" },
+      {
+        key: "unit_type",
+        label: "Tipo de unidad/equipo",
+        type: "select",
+        required: true,
+        options: ["Auto", "Moto", "Camion", "Maquinaria", "Bus"],
+      },
+      { key: "brand", label: "Marca", type: "text", required: false, options: [] },
+      { key: "model", label: "Modelo", type: "text", required: false, options: [] },
+      { key: "year", label: "Anio", type: "text", required: false, options: [] },
+      {
+        key: "unit_identifier",
+        label: "Patente / Identificador",
+        type: "text",
+        required: false,
+        options: [],
+      },
+      {
+        key: "usage_value",
+        label: "Kilometraje / Horas de uso",
+        type: "text",
+        required: false,
+        options: [],
+      },
+      {
+        key: "visit_reason",
+        label: "Motivo de la visita",
+        type: "textarea",
+        required: false,
+        options: [],
+      },
+      {
+        key: "observations",
+        label: "Observaciones",
+        type: "textarea",
+        required: false,
+        options: [],
+      },
     ];
     const rawSubtypeBookingFields =
       business_subtype_config &&
@@ -6538,6 +6568,21 @@ app.patch("/tenants/:id", async (req, res) => {
               const savedField = rawSubtypeBookingFields.find(
                 (item) => item && item.key === baseField.key
               );
+              const savedType =
+                savedField &&
+                ["text", "textarea", "select"].includes(String(savedField.type || ""))
+                  ? String(savedField.type)
+                  : baseField.type;
+              const savedOptions =
+                savedField && Array.isArray(savedField.options)
+                  ? Array.from(
+                      new Set(
+                        savedField.options
+                          .map((option) => String(option || "").trim())
+                          .filter(Boolean)
+                      )
+                    )
+                  : baseField.options;
 
               return {
                 key: baseField.key,
@@ -6554,8 +6599,9 @@ app.patch("/tenants/:id", async (req, res) => {
                 required:
                   savedField && typeof savedField.required === "boolean"
                     ? savedField.required
-                    : false,
-                type: baseField.type,
+                    : baseField.required,
+                type: savedType,
+                options: savedType === "select" ? savedOptions : [],
               };
             }),
           }
