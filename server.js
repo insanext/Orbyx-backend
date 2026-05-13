@@ -4031,7 +4031,7 @@ app.get("/dashboard/metrics/:slug", async (req, res) => {
 app.get("/appointments/customer-history/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
-    const { customer_id } = req.query;
+    const { customer_id, branch_id } = req.query;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
@@ -4052,12 +4052,32 @@ app.get("/appointments/customer-history/:slug", async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    const { data, error } = await supabase
+    let resolvedBranchId = null;
+    if (branch_id) {
+      try {
+        resolvedBranchId = await resolveBranchId({
+          tenant_id: tenant.id,
+          branch_id,
+        });
+      } catch (branchError) {
+        return res.status(400).json({
+          error: branchError.message || "branch_id inválido",
+        });
+      }
+    }
+
+    let query = supabase
       .from("appointments")
       .select("*")
       .eq("tenant_id", tenant.id)
       .eq("customer_id", customer_id)
       .order("start_at", { ascending: false });
+
+    if (resolvedBranchId) {
+      query = query.eq("branch_id", resolvedBranchId);
+    }
+
+    const { data, error } = await query;
 
     if (error) throw error;
 
@@ -4448,7 +4468,7 @@ function normalizeCampaignError(error) {
 app.get("/customers/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
-    const { q, segment, inactive_days } = req.query;
+    const { q, segment, inactive_days, branch_id } = req.query;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
@@ -4467,6 +4487,20 @@ app.get("/customers/:slug", async (req, res) => {
 
     const normalizedSegment = String(segment || "").trim().toLowerCase();
     const inactiveDays = Math.max(1, Number(inactive_days || 60));
+
+    let resolvedBranchId = null;
+    if (branch_id) {
+      try {
+        resolvedBranchId = await resolveBranchId({
+          tenant_id: tenant.id,
+          branch_id,
+        });
+      } catch (branchError) {
+        return res.status(400).json({
+          error: branchError.message || "branch_id inválido",
+        });
+      }
+    }
 
     let query = supabase
       .from("customers")
@@ -4488,15 +4522,69 @@ app.get("/customers/:slug", async (req, res) => {
     if (error) throw error;
 
     const rows = Array.isArray(data) ? data : [];
+    const customerIds = rows.map((customer) => customer.id).filter(Boolean);
+    const activityByCustomer = new Map();
+
+    if (customerIds.length > 0) {
+      let activityQuery = supabase
+        .from("appointments")
+        .select("customer_id, start_at, status")
+        .eq("tenant_id", tenant.id)
+        .in("customer_id", customerIds);
+
+      if (resolvedBranchId) {
+        activityQuery = activityQuery.eq("branch_id", resolvedBranchId);
+      }
+
+      const { data: activityRows, error: activityError } = await activityQuery;
+
+      if (activityError) throw activityError;
+
+      for (const appt of activityRows || []) {
+        const customerId = appt.customer_id;
+        if (!customerId) continue;
+
+        const current =
+          activityByCustomer.get(customerId) || {
+            total_visits: 0,
+            last_visit_at: null,
+          };
+
+        const status = String(appt.status || "").toLowerCase();
+        const isCanceled = ["canceled", "cancelled"].includes(status);
+
+        if (!isCanceled) {
+          current.total_visits += 1;
+
+          if (
+            appt.start_at &&
+            (!current.last_visit_at ||
+              new Date(appt.start_at).getTime() >
+                new Date(current.last_visit_at).getTime())
+          ) {
+            current.last_visit_at = appt.start_at;
+          }
+        }
+
+        activityByCustomer.set(customerId, current);
+      }
+    }
+
     const now = new Date();
     const inactiveCutoff = new Date(
       now.getTime() - inactiveDays * 24 * 60 * 60 * 1000
     );
 
     function getCustomerSegment(customer) {
-      const totalVisits = Number(customer.total_visits || 0);
-      const lastVisitAt = customer.last_visit_at
-        ? new Date(customer.last_visit_at)
+      const activity = activityByCustomer.get(customer.id);
+      const totalVisits = resolvedBranchId
+        ? Number(activity?.total_visits || 0)
+        : Number(customer.total_visits || 0);
+      const lastVisitValue = resolvedBranchId
+        ? activity?.last_visit_at || null
+        : customer.last_visit_at;
+      const lastVisitAt = lastVisitValue
+        ? new Date(lastVisitValue)
         : null;
 
 const isInactive =
@@ -4511,10 +4599,19 @@ const isInactive =
     }
 
     const enrichedCustomers = rows.map((customer) => {
+      const activity = activityByCustomer.get(customer.id);
+      const activityTotalVisits = resolvedBranchId
+        ? Number(activity?.total_visits || 0)
+        : Number(customer.total_visits || 0);
+      const activityLastVisitAt = resolvedBranchId
+        ? activity?.last_visit_at || null
+        : customer.last_visit_at;
       const customerSegment = getCustomerSegment(customer);
 
       return {
         ...customer,
+        total_visits: activityTotalVisits,
+        last_visit_at: activityLastVisitAt,
         segment: customerSegment,
         is_inactive: customerSegment === "inactive",
       };
@@ -4543,6 +4640,7 @@ const isInactive =
         q: q ? String(q) : "",
         segment: normalizedSegment || null,
         inactive_days: inactiveDays,
+        branch_id: resolvedBranchId,
       },
     });
   } catch (err) {
