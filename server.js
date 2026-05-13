@@ -4101,7 +4101,7 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
 
     if (appointmentsError) throw appointmentsError;
 
-    const doc = new PDFDocument({ margin: 42, size: "A4" });
+    const doc = new PDFDocument({ margin: 48, size: "A4" });
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
@@ -4112,8 +4112,8 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
     doc.pipe(res);
 
     const pageWidth = doc.page.width;
-    const left = 42;
-    const right = pageWidth - 42;
+    const left = 48;
+    const right = pageWidth - 48;
     const contentWidth = right - left;
 
     function formatLongDate(value) {
@@ -4135,7 +4135,7 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
 
     function drawSectionTitle(title) {
       doc.moveDown(1);
-      doc.font("Helvetica-Bold").fontSize(13).fillColor("#0f172a").text(title);
+      doc.font("Helvetica-Bold").fontSize(11).fillColor("#0f172a").text(String(title).toUpperCase());
       doc.moveDown(0.35);
       doc.moveTo(left, doc.y).lineTo(right, doc.y).strokeColor("#e2e8f0").stroke();
       doc.moveDown(0.7);
@@ -4153,8 +4153,8 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
         const y = startY + row * 42;
 
         doc
-          .roundedRect(x, y, colWidth, 32, 8)
-          .fillAndStroke("#f8fafc", "#e2e8f0");
+          .roundedRect(x, y, colWidth, 32, 4)
+          .fillAndStroke("#ffffff", "#cbd5e1");
 
         doc
           .font("Helvetica-Bold")
@@ -4174,28 +4174,31 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
 
     // Header
     doc
-      .roundedRect(left, 36, contentWidth, 92, 18)
-      .fill("#0f172a");
+      .moveTo(left, 112)
+      .lineTo(right, 112)
+      .strokeColor("#cbd5e1")
+      .lineWidth(1)
+      .stroke();
 
     doc
       .font("Helvetica-Bold")
-      .fontSize(22)
-      .fillColor("#ffffff")
+      .fontSize(21)
+      .fillColor("#0f172a")
       .text("Ficha clínica veterinaria", left + 24, 58);
 
     doc
       .font("Helvetica")
       .fontSize(10)
-      .fillColor("#cbd5e1")
+      .fillColor("#475569")
       .text(tenant.name || "Veterinaria", left + 24, 88);
 
     doc
       .font("Helvetica")
       .fontSize(9)
-      .fillColor("#94a3b8")
+      .fillColor("#64748b")
       .text(`Fecha de emisión: ${new Date().toLocaleDateString("es-CL")}`, left + 24, 106);
 
-    doc.y = 155;
+    doc.y = 140;
 
     drawSectionTitle("Cliente");
     drawInfoGrid([
@@ -4241,35 +4244,38 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
 
         const cardY = doc.y;
         const noteText = appt.notes || "Sin notas clínicas.";
-        const noteHeight = doc.heightOfString(noteText, { width: contentWidth - 32 });
-        const cardHeight = Math.max(118, 96 + noteHeight);
+        const noteHeight = doc.heightOfString(noteText, { width: contentWidth - 190 });
+        const cardHeight = Math.max(88, 64 + noteHeight);
 
         doc
-          .roundedRect(left, cardY, contentWidth, cardHeight, 14)
-          .fillAndStroke("#ffffff", "#e2e8f0");
+          .moveTo(left, cardY)
+          .lineTo(right, cardY)
+          .strokeColor("#e2e8f0")
+          .lineWidth(0.8)
+          .stroke();
 
         doc
           .font("Helvetica-Bold")
-          .fontSize(10.5)
+          .fontSize(9.5)
           .fillColor("#0f172a")
           .text(formatLongDate(appt.start_at), left + 16, cardY + 16, {
-            width: contentWidth - 32,
+            width: 150,
           });
 
         doc
           .font("Helvetica")
-          .fontSize(9)
+          .fontSize(8.5)
           .fillColor("#64748b")
           .text(appt.service_name_snapshot || "Atención", left + 16, cardY + 33, {
-            width: contentWidth - 32,
+            width: 150,
           });
 
         doc
           .font("Helvetica-Bold")
-          .fontSize(11)
-          .fillColor("#2563eb")
-          .text(appt.reason || "Sin motivo registrado", left + 16, cardY + 54, {
-            width: contentWidth - 32,
+          .fontSize(10)
+          .fillColor("#0f172a")
+          .text(appt.reason || "Sin motivo registrado", left + 190, cardY + 16, {
+            width: contentWidth - 206,
           });
 
         // NOTAS CLÍNICAS
@@ -4277,7 +4283,7 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
  	 .font("Helvetica-Bold")
   	.fontSize(8)
  	 .fillColor("#64748b")
-  	.text("NOTAS CLÍNICAS", left + 16, cardY + 75);
+  	.text("NOTAS CLÍNICAS", left + 190, cardY + 34);
 
 	doc
   	.moveDown(0.3);
@@ -4286,8 +4292,8 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
   	.font("Helvetica")
   	.fontSize(9.5)
   	.fillColor("#334155")
-  	.text(noteText, left + 16, doc.y, {
-   	 width: contentWidth - 32,
+  	.text(noteText, left + 190, doc.y, {
+   	 width: contentWidth - 206,
   	});
 
 // ESPACIO
@@ -4304,14 +4310,25 @@ doc
         ? formatLongDate(appt.next_control_at)
         : "No definido"
     }`,
-    left + 16,
+    left + 190,
     doc.y,
-    { width: contentWidth - 32 }
+    { width: contentWidth - 206 }
     );
 
         doc.y = cardY + cardHeight + 14;
       }
     }
+
+    doc
+      .font("Helvetica")
+      .fontSize(7.5)
+      .fillColor("#94a3b8")
+      .text(
+        `Documento generado por Orbyx · ${tenant.name || "Veterinaria"}`,
+        left,
+        doc.page.height - 34,
+        { width: contentWidth, align: "center" }
+      );
 
     doc.end();
   } catch (err) {
