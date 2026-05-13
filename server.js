@@ -6333,6 +6333,7 @@ app.patch("/tenants/:id", async (req, res) => {
       instagram_url,
       facebook_url,
       description,
+      business_subtype,
       min_booking_notice_minutes,
       max_booking_days_ahead,
     } = req.body;
@@ -6355,6 +6356,41 @@ app.patch("/tenants/:id", async (req, res) => {
       Number(max_booking_days_ahead || 60)
     );
 
+    const allowedBusinessSubtypes = [
+      "belleza_estetica",
+      "salud_bienestar",
+      "taller_automotriz",
+      "servicios_tecnicos",
+      "profesionales_cita",
+      "educacion_individual",
+      "servicios_creativos",
+    ];
+
+    const { data: currentTenant, error: currentTenantError } = await supabase
+      .from("tenants")
+      .select("business_category")
+      .eq("id", id)
+      .single();
+
+    if (currentTenantError || !currentTenant) {
+      return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    const currentCategory = String(currentTenant.business_category || "")
+      .trim()
+      .toLowerCase();
+    const normalizedBusinessSubtype =
+      business_subtype && allowedBusinessSubtypes.includes(String(business_subtype).trim())
+        ? String(business_subtype).trim()
+        : null;
+
+    if (
+      business_subtype &&
+      !allowedBusinessSubtypes.includes(String(business_subtype).trim())
+    ) {
+      return res.status(400).json({ error: "business_subtype inválido" });
+    }
+
     const { data, error } = await supabase
       .from("tenants")
       .update({
@@ -6366,6 +6402,8 @@ app.patch("/tenants/:id", async (req, res) => {
         instagram_url: instagram_url ? String(instagram_url).trim() : null,
         facebook_url: facebook_url ? String(facebook_url).trim() : null,
         description: description ? String(description).trim() : null,
+        business_subtype:
+          currentCategory === "generic" ? normalizedBusinessSubtype : null,
         min_booking_notice_minutes: normalizedMinBookingNoticeMinutes,
         max_booking_days_ahead: normalizedMaxBookingDaysAhead,
       })
@@ -6946,7 +6984,9 @@ app.get("/public/business/:slug", async (req, res) => {
   pending_change_type,
   proration_credit,
   proration_charge,
-  business_category
+  business_category,
+  business_subtype,
+  business_subtype_config
 `)
       .eq("slug", slug)
       .eq("is_active", true)
