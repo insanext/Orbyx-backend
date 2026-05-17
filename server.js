@@ -3618,8 +3618,12 @@ const end = new Date(`${to}T23:59:59-04:00`).toISOString();
     const serviceIds = [
       ...new Set((appointments || []).map((appt) => appt.service_id).filter(Boolean)),
     ];
+    const staffIds = [
+      ...new Set((appointments || []).map((appt) => appt.staff_id).filter(Boolean)),
+    ];
 
     let servicesById = new Map();
+    let staffById = new Map();
 
     if (serviceIds.length > 0) {
       const { data: services, error: servicesError } = await supabase
@@ -3634,13 +3638,28 @@ const end = new Date(`${to}T23:59:59-04:00`).toISOString();
       servicesById = new Map((services || []).map((service) => [service.id, service]));
     }
 
+    if (staffIds.length > 0) {
+      const { data: staffRows, error: staffError } = await supabase
+        .from("staff")
+        .select("id, name")
+        .in("id", staffIds);
+
+      if (staffError) {
+        return res.status(500).json({ error: staffError.message });
+      }
+
+      staffById = new Map((staffRows || []).map((staff) => [staff.id, staff]));
+    }
+
     const enrichedAppointments = (appointments || []).map((appt) => {
       const service = appt.service_id ? servicesById.get(appt.service_id) : null;
+      const staff = appt.staff_id ? staffById.get(appt.staff_id) : null;
 
       return {
         ...appt,
         service_is_group: Boolean(service?.is_group),
         service_capacity: service ? Number(service.capacity || 1) : null,
+        staff_name: staff?.name || null,
       };
     });
 
@@ -5825,7 +5844,6 @@ app.patch("/appointments/:id/status", async (req, res) => {
     const { status } = req.body;
 
     const allowed = ["booked", "completed", "no_show", "rescheduled", "canceled"];
-
     if (!allowed.includes(status)) {
       return res.status(400).json({ error: "Estado inválido" });
     }
@@ -6042,6 +6060,7 @@ app.patch("/appointments/:id", async (req, res) => {
       customer_name,
       customer_email,
       customer_phone,
+      notes,
     } = req.body;
 
     if (!id) {
@@ -6062,6 +6081,14 @@ app.patch("/appointments/:id", async (req, res) => {
 
     if (customer_phone !== undefined) {
       updateData.customer_phone = String(customer_phone).trim();
+    }
+
+    if (notes !== undefined) {
+      updateData.notes = String(notes || "").trim() || null;
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ error: "No hay cambios para actualizar" });
     }
 
     const { data, error } = await supabase
