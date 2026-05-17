@@ -3004,7 +3004,7 @@ if (service_id) {
     .eq("tenant_id", cal.tenant_id)
     .eq("branch_id", resolvedBranchId)
     .eq("start_at", startIso)
-  .in("status", isGroup ? ["booked", "completed", "no_show"] : ["booked"]);
+  .in("status", isGroup ? ["booked", "completed", "no_show", "rescheduled"] : ["booked"]);
 
 if (staff_id) {
   bookingQuery = bookingQuery.eq("staff_id", staff_id);
@@ -5824,7 +5824,7 @@ app.patch("/appointments/:id/status", async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
 
-    const allowed = ["booked", "completed", "no_show", "canceled"];
+    const allowed = ["booked", "completed", "no_show", "rescheduled", "canceled"];
 
     if (!allowed.includes(status)) {
       return res.status(400).json({ error: "Estado inválido" });
@@ -7464,7 +7464,7 @@ async function attachCapacityToSlots(slotsToCheck) {
     .eq("tenant_id", tenant.id)
     .eq("branch_id", resolvedBranchId)
     .eq("service_id", service_id)
-    .in("status", ["booked", "completed", "no_show"])
+    .in("status", ["booked", "completed", "no_show", "rescheduled"])
     .gte("start_at", dayStart)
     .lte("start_at", dayEnd);
 
