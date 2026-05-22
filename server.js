@@ -3330,6 +3330,33 @@ await recalculateCustomerStats(customer.id);
     let eventId = null;
     let googleHtmlLink = null;
     let googleSynced = false;
+    let calendarSyncStatus = "pending";
+    let calendarSyncError = null;
+
+    async function updateCalendarSyncStatus(fields, context) {
+      const { data, error } = await supabase
+        .from("appointments")
+        .update(fields)
+        .eq("id", appt.id)
+        .select("*")
+        .single();
+
+      if (error) {
+        console.warn(`${context}:`, error.message);
+        return null;
+      }
+
+      return data || null;
+    }
+
+    await updateCalendarSyncStatus(
+      {
+        calendar_sync_status: "pending",
+        calendar_sync_error: null,
+        calendar_synced_at: null,
+      },
+      "Reserva creada, pero fallo marcar sync pending"
+    );
 
     try {
       const { calendar, googleCalendarId: connectedGoogleCalendarId } =
@@ -3351,23 +3378,60 @@ await recalculateCustomerStats(customer.id);
     eventId = response?.data?.id || null;
     googleHtmlLink = response?.data?.htmlLink || null;
 
-    const { data: updatedAppointment, error: updErr } = await supabase
-      .from("appointments")
-      .update({ event_id: eventId })
-      .eq("id", appt.id)
-      .select("*")
-      .single();
+    if (!eventId) {
+      throw new Error("Google Calendar no retorno event_id");
+    }
 
-    if (updErr) {
-      console.warn(
-        "Reserva creada, pero falló guardar event_id de Google:",
-        updErr.message
-      );
+    const updatedAppointment = await updateCalendarSyncStatus(
+      {
+        event_id: eventId,
+        calendar_sync_status: "synced",
+        calendar_sync_error: null,
+        calendar_synced_at: new Date().toISOString(),
+      },
+      "Reserva creada, pero fallo guardar sync_status de Google"
+    );
+
+    if (!updatedAppointment) {
+      const { data: fallbackAppointment, error: eventIdErr } = await supabase
+        .from("appointments")
+        .update({ event_id: eventId })
+        .eq("id", appt.id)
+        .select("*")
+        .single();
+
+      if (eventIdErr) {
+        console.warn(
+          "Reserva creada, pero fallo guardar event_id de Google:",
+          eventIdErr.message
+        );
+      } else if (fallbackAppointment) {
+        apptUpdated = fallbackAppointment;
+        googleSynced = true;
+        calendarSyncStatus = "synced";
+      }
     } else if (updatedAppointment) {
       apptUpdated = updatedAppointment;
       googleSynced = true;
+      calendarSyncStatus = "synced";
     }
     } catch (googleErr) {
+      calendarSyncStatus = "error";
+      calendarSyncError = String(googleErr?.message || googleErr).slice(0, 1000);
+
+      const syncErrorAppointment = await updateCalendarSyncStatus(
+        {
+          calendar_sync_status: "error",
+          calendar_sync_error: calendarSyncError,
+          calendar_synced_at: null,
+        },
+        "Reserva creada, pero fallo guardar error de sincronizacion Google"
+      );
+
+      if (syncErrorAppointment) {
+        apptUpdated = syncErrorAppointment;
+      }
+
       console.warn(
         "Reserva creada sin sincronizar Google Calendar:",
         googleErr?.message || googleErr
@@ -3421,6 +3485,8 @@ await sendBookingEmail({
         event_id: eventId,
         htmlLink: googleHtmlLink,
         synced: googleSynced,
+        sync_status: calendarSyncStatus,
+        sync_error: calendarSyncError,
       },
     });
   } catch (err) {
