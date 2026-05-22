@@ -3325,8 +3325,16 @@ await supabase
   .eq("id", apptCreated.id);
 await recalculateCustomerStats(customer.id);
 
-    const { calendar, googleCalendarId } =
-      await getGoogleCalendarClientByCalendarId(calendar_id);
+    let apptUpdated = appt;
+    let googleCalendarId = null;
+    let eventId = null;
+    let googleHtmlLink = null;
+    let googleSynced = false;
+
+    try {
+      const { calendar, googleCalendarId: connectedGoogleCalendarId } =
+        await getGoogleCalendarClientByCalendarId(calendar_id);
+      googleCalendarId = connectedGoogleCalendarId;
 
     const event = {
       summary: `Cita - ${String(customer_name).trim()}`,
@@ -3340,9 +3348,10 @@ await recalculateCustomerStats(customer.id);
       requestBody: event,
     });
 
-    const eventId = response?.data?.id || null;
+    eventId = response?.data?.id || null;
+    googleHtmlLink = response?.data?.htmlLink || null;
 
-    const { data: apptUpdated, error: updErr } = await supabase
+    const { data: updatedAppointment, error: updErr } = await supabase
       .from("appointments")
       .update({ event_id: eventId })
       .eq("id", appt.id)
@@ -3350,23 +3359,19 @@ await recalculateCustomerStats(customer.id);
       .single();
 
     if (updErr) {
-      try {
-        if (eventId) {
-          await calendar.events.delete({
-            calendarId: googleCalendarId,
-            eventId,
-          });
-        }
-      } catch (_) {}
-
-      await supabase
-        .from("appointments")
-        .update({ status: "canceled", canceled_at: new Date().toISOString() })
-        .eq("id", appt.id);
-
-      return res.status(500).json({
-        error: "Se creó evento, pero falló guardar event_id en DB.",
-      });
+      console.warn(
+        "Reserva creada, pero falló guardar event_id de Google:",
+        updErr.message
+      );
+    } else if (updatedAppointment) {
+      apptUpdated = updatedAppointment;
+      googleSynced = true;
+    }
+    } catch (googleErr) {
+      console.warn(
+        "Reserva creada sin sincronizar Google Calendar:",
+        googleErr?.message || googleErr
+      );
     }
 
     const { data: tenantData } = await supabase
@@ -3414,7 +3419,8 @@ await sendBookingEmail({
       google: {
         calendarId: googleCalendarId,
         event_id: eventId,
-        htmlLink: response?.data?.htmlLink,
+        htmlLink: googleHtmlLink,
+        synced: googleSynced,
       },
     });
   } catch (err) {
