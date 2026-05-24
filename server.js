@@ -1504,6 +1504,63 @@ function getGoogleCalendarClientFromConnection(connection) {
   return { calendar, googleCalendarId };
 }
 
+async function deleteCalendarEventForAppointment(appt) {
+  const externalEventId = appt?.provider_event_id || appt?.event_id;
+
+  if (!externalEventId) return;
+
+  try {
+    const provider = appt.calendar_provider || (appt.event_id ? "google" : null);
+
+    if (provider && provider !== "google") {
+      console.warn(
+        `Provider de calendario no soportado para borrar evento: ${provider}`
+      );
+      return;
+    }
+
+    if (appt.calendar_provider === "google" && appt.calendar_connection_id) {
+      const { data: connection, error } = await supabase
+        .from("calendar_connections")
+        .select("*")
+        .eq("id", appt.calendar_connection_id)
+        .maybeSingle();
+
+      if (error || !connection) {
+        throw new Error(
+          error?.message || "No se encontró calendar_connection para borrar evento"
+        );
+      }
+
+      const { calendar, googleCalendarId } =
+        getGoogleCalendarClientFromConnection(connection);
+
+      await calendar.events.delete({
+        calendarId: googleCalendarId,
+        eventId: externalEventId,
+      });
+
+      return;
+    }
+
+    if (
+      appt.calendar_connection_source === "legacy" ||
+      (!appt.calendar_provider && appt.event_id) ||
+      (appt.calendar_provider === "google" && !appt.calendar_connection_id)
+    ) {
+      const { calendar, googleCalendarId } =
+        await getGoogleCalendarClientByCalendarId(appt.calendar_id);
+
+      await calendar.events.delete({
+        calendarId: googleCalendarId,
+        eventId: externalEventId,
+      });
+    }
+  } catch (e) {
+    console.error("Error borrando evento externo de calendario:", e.message);
+  }
+}
+
 async function getGoogleCalendarClientFixed() {
   const { data: tokenRow, error: tokErr } = await supabase
     .from("calendar_tokens")
@@ -6116,10 +6173,25 @@ app.patch("/appointments/:id/status", async (req, res) => {
       return res.status(400).json({ error: "Estado inválido" });
     }
 
+    if (status === "canceled") {
+      const { data: appt, error: apptErr } = await supabase
+        .from("appointments")
+        .select("*")
+        .eq("id", id)
+        .single();
+
+      if (apptErr || !appt) {
+        return res.status(404).json({ error: "Appointment no encontrado" });
+      }
+
+      await deleteCalendarEventForAppointment(appt);
+    }
+
     const { data, error } = await supabase
   .from("appointments")
   .update({
     status,
+    ...(status === "canceled" ? { canceled_at: new Date().toISOString() } : {}),
   })
   .eq("id", id)
   .select()
@@ -6170,19 +6242,7 @@ if (st === "canceled" || st === "cancelled") {
   });
 }
 
-  if (appt.event_id) {
-    try {
-      const { calendar, googleCalendarId } =
-        await getGoogleCalendarClientByCalendarId(appt.calendar_id);
-
-      await calendar.events.delete({
-        calendarId: googleCalendarId,
-        eventId: appt.event_id,
-      });
-    } catch (e) {
-      console.error("⚠️ Error borrando evento en Google:", e.message);
-    }
-  }
+  await deleteCalendarEventForAppointment(appt);
 
 const { data: updated, error: updErr } = await supabase
   .from("appointments")
