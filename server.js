@@ -3492,6 +3492,9 @@ await recalculateCustomerStats(customer.id);
     let googleSynced = false;
     let calendarSyncStatus = "pending";
     let calendarSyncError = null;
+    let calendarProvider = null;
+    let calendarConnectionId = null;
+    let calendarConnectionSource = null;
 
     async function updateCalendarSyncStatus(fields, context) {
       const { data, error } = await supabase
@@ -3525,6 +3528,10 @@ await recalculateCustomerStats(customer.id);
         staff_id: staff_id || null,
         calendar_id,
       });
+
+      calendarProvider = calendarConnectionResult?.provider || null;
+      calendarConnectionId = calendarConnectionResult?.connection?.id || null;
+      calendarConnectionSource = calendarConnectionResult?.source || null;
 
       if (!calendarConnectionResult?.connection) {
         throw new Error("Sin conexión de calendario activa");
@@ -3560,6 +3567,10 @@ await recalculateCustomerStats(customer.id);
     const updatedAppointment = await updateCalendarSyncStatus(
       {
         event_id: eventId,
+        calendar_provider: calendarProvider,
+        calendar_connection_id: calendarConnectionId,
+        provider_event_id: eventId,
+        calendar_connection_source: calendarConnectionSource,
         calendar_sync_status: "synced",
         calendar_sync_error: null,
         calendar_synced_at: new Date().toISOString(),
@@ -3570,7 +3581,13 @@ await recalculateCustomerStats(customer.id);
     if (!updatedAppointment) {
       const { data: fallbackAppointment, error: eventIdErr } = await supabase
         .from("appointments")
-        .update({ event_id: eventId })
+        .update({
+          event_id: eventId,
+          calendar_provider: calendarProvider,
+          calendar_connection_id: calendarConnectionId,
+          provider_event_id: eventId,
+          calendar_connection_source: calendarConnectionSource,
+        })
         .eq("id", appt.id)
         .select("*")
         .single();
@@ -3596,6 +3613,10 @@ await recalculateCustomerStats(customer.id);
 
       const syncErrorAppointment = await updateCalendarSyncStatus(
         {
+          calendar_provider: calendarProvider,
+          calendar_connection_id: calendarConnectionId,
+          provider_event_id: null,
+          calendar_connection_source: calendarConnectionSource,
           calendar_sync_status: "error",
           calendar_sync_error: calendarSyncError,
           calendar_synced_at: null,
