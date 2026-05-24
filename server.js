@@ -1344,6 +1344,142 @@ if (!tokenRow) {
 /* ======================================================
    ✅ Helper (fallback): buscar token por CLIENTE_FIJO/CAL_FIJO
 ====================================================== */
+async function findActiveCalendarConnection({ tenant_id, branch_id, staff_id }) {
+  if (!tenant_id) return { provider: null, connection: null, source: "none" };
+
+  const baseSelect =
+    "id, tenant_id, branch_id, staff_id, provider, provider_calendar_id, account_email, access_token, refresh_token, expires_at, scope, token_type, is_active, created_at, updated_at";
+
+  async function maybeConnection(query, source) {
+    const { data, error } = await query
+      .eq("tenant_id", tenant_id)
+      .eq("is_active", true)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.warn(`No se pudo leer calendar_connections (${source}):`, error.message);
+      return null;
+    }
+
+    if (!data) return null;
+    return {
+      provider: data.provider,
+      connection: data,
+      source,
+    };
+  }
+
+  if (staff_id) {
+    const staffConnection = await maybeConnection(
+      supabase.from("calendar_connections").select(baseSelect).eq("staff_id", staff_id),
+      "staff"
+    );
+
+    if (staffConnection) return staffConnection;
+  }
+
+  if (branch_id) {
+    const branchConnection = await maybeConnection(
+      supabase
+        .from("calendar_connections")
+        .select(baseSelect)
+        .eq("branch_id", branch_id)
+        .is("staff_id", null),
+      "branch"
+    );
+
+    if (branchConnection) return branchConnection;
+  }
+
+  const businessConnection = await maybeConnection(
+    supabase
+      .from("calendar_connections")
+      .select(baseSelect)
+      .is("branch_id", null)
+      .is("staff_id", null),
+    "business"
+  );
+
+  return businessConnection || { provider: null, connection: null, source: "none" };
+}
+
+async function findLegacyCalendarTokenConnection(calendar_id) {
+  if (!calendar_id) {
+    return { provider: null, connection: null, source: "none" };
+  }
+
+  try {
+    const { data: tokenRow, error } = await supabase
+      .from("calendar_tokens")
+      .select(
+        "tenant_id, calendar_id, google_calendar_id, access_token, refresh_token, expiry_date, scope, token_type"
+      )
+      .eq("calendar_id", calendar_id)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("No se pudo leer calendar_tokens legacy:", error.message);
+      return { provider: null, connection: null, source: "none" };
+    }
+
+    if (!tokenRow?.refresh_token) {
+      return { provider: null, connection: null, source: "none" };
+    }
+
+    return {
+      provider: "google",
+      source: "legacy",
+      connection: {
+        id: null,
+        tenant_id: tokenRow.tenant_id || null,
+        branch_id: null,
+        staff_id: null,
+        provider: "google",
+        provider_calendar_id: tokenRow.google_calendar_id || "primary",
+        account_email: null,
+        access_token: tokenRow.access_token || null,
+        refresh_token: tokenRow.refresh_token,
+        expires_at: tokenRow.expiry_date
+          ? new Date(Number(tokenRow.expiry_date)).toISOString()
+          : null,
+        scope: tokenRow.scope || null,
+        token_type: tokenRow.token_type || null,
+        is_active: true,
+        legacy_calendar_id: tokenRow.calendar_id || calendar_id,
+      },
+    };
+  } catch (err) {
+    console.warn("Error resolviendo calendar_tokens legacy:", err.message);
+    return { provider: null, connection: null, source: "none" };
+  }
+}
+
+async function resolveCalendarConnection({
+  tenant_id,
+  branch_id = null,
+  staff_id = null,
+  calendar_id = null,
+}) {
+  try {
+    const connectionResult = await findActiveCalendarConnection({
+      tenant_id,
+      branch_id,
+      staff_id,
+    });
+
+    if (connectionResult?.connection) return connectionResult;
+
+    const legacyResult = await findLegacyCalendarTokenConnection(calendar_id);
+    if (legacyResult?.connection) return legacyResult;
+  } catch (err) {
+    console.warn("Error resolviendo calendar connection:", err.message);
+  }
+
+  return { provider: null, connection: null, source: "none" };
+}
+
 async function getGoogleCalendarClientFixed() {
   const { data: tokenRow, error: tokErr } = await supabase
     .from("calendar_tokens")
