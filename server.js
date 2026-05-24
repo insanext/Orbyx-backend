@@ -1480,6 +1480,30 @@ async function resolveCalendarConnection({
   return { provider: null, connection: null, source: "none" };
 }
 
+function getGoogleCalendarClientFromConnection(connection) {
+  if (!connection?.refresh_token) {
+    throw new Error("La conexión Google no tiene refresh_token.");
+  }
+
+  const connectionOAuthClient = new google.auth.OAuth2(
+    CLIENT_ID,
+    CLIENT_SECRET,
+    REDIRECT_URI
+  );
+
+  connectionOAuthClient.setCredentials({
+    refresh_token: connection.refresh_token,
+  });
+
+  const calendar = google.calendar({
+    version: "v3",
+    auth: connectionOAuthClient,
+  });
+  const googleCalendarId = connection.provider_calendar_id || "primary";
+
+  return { calendar, googleCalendarId };
+}
+
 async function getGoogleCalendarClientFixed() {
   const { data: tokenRow, error: tokErr } = await supabase
     .from("calendar_tokens")
@@ -3495,8 +3519,23 @@ await recalculateCustomerStats(customer.id);
     );
 
     try {
+      const calendarConnectionResult = await resolveCalendarConnection({
+        tenant_id: cal.tenant_id,
+        branch_id: resolvedBranchId,
+        staff_id: staff_id || null,
+        calendar_id,
+      });
+
+      if (!calendarConnectionResult?.connection) {
+        throw new Error("Sin conexión de calendario activa");
+      }
+
+      if (calendarConnectionResult.provider !== "google") {
+        throw new Error("Provider de calendario no soportado todavía");
+      }
+
       const { calendar, googleCalendarId: connectedGoogleCalendarId } =
-        await getGoogleCalendarClientByCalendarId(calendar_id);
+        getGoogleCalendarClientFromConnection(calendarConnectionResult.connection);
       googleCalendarId = connectedGoogleCalendarId;
 
     const event = {
