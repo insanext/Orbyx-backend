@@ -312,7 +312,10 @@ const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI;
 
-const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
+const SCOPES = [
+  "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/userinfo.email",
+];
 
 // ✅ Compatibilidad
 const CLIENTE_FIJO = "cliente_demo";
@@ -1588,11 +1591,21 @@ async function getGoogleCalendarClientFixed() {
 ====================================================== */
 app.get("/auth", async (req, res) => {
   try {
-    const { calendar_id } = req.query;
+    const { calendar_id, tenant_id, branch_id, staff_id, scope_level } = req.query;
 
-    const stateObj = calendar_id
-      ? { calendar_id: String(calendar_id) }
-      : { calendar_id: null, fixed: true };
+    const stateObj =
+      scope_level === "staff"
+        ? {
+            provider: "google",
+            calendar_id: calendar_id ? String(calendar_id) : null,
+            tenant_id: tenant_id ? String(tenant_id) : null,
+            branch_id: branch_id ? String(branch_id) : null,
+            staff_id: staff_id ? String(staff_id) : null,
+            scope_level: "staff",
+          }
+        : calendar_id
+        ? { calendar_id: String(calendar_id) }
+        : { calendar_id: null, fixed: true };
 
     const state = Buffer.from(JSON.stringify(stateObj)).toString("base64url");
 
@@ -1638,6 +1651,93 @@ app.get("/oauth2callback", async (req, res) => {
         .send(
           "⚠️ No vino refresh_token. Revoca acceso a la app en tu cuenta Google y reautoriza en /auth."
         );
+    }
+
+    if (state?.provider === "google" && state?.scope_level === "staff") {
+      const tenant_id = state.tenant_id ? String(state.tenant_id) : "";
+      const branch_id = state.branch_id ? String(state.branch_id) : null;
+      const staff_id = state.staff_id ? String(state.staff_id) : "";
+
+      if (!tenant_id || !staff_id) {
+        return res.status(400).send("Faltan tenant_id o staff_id para conectar calendario staff.");
+      }
+
+      const { data: tenantData, error: tenantErr } = await supabase
+        .from("tenants")
+        .select("id, slug")
+        .eq("id", tenant_id)
+        .single();
+
+      if (tenantErr || !tenantData) {
+        return res.status(404).send("Negocio no encontrado para conectar calendario staff.");
+      }
+
+      const { data: staffData, error: staffErr } = await supabase
+        .from("staff")
+        .select("id, tenant_id, branch_id")
+        .eq("id", staff_id)
+        .eq("tenant_id", tenant_id)
+        .single();
+
+      if (staffErr || !staffData) {
+        return res.status(404).send("Staff no encontrado para conectar calendario.");
+      }
+
+      if (branch_id && String(staffData.branch_id || "") !== branch_id) {
+        return res.status(400).send("El staff no pertenece a la sucursal indicada.");
+      }
+
+      let accountEmail = null;
+      try {
+        const oauth2 = google.oauth2({ version: "v2", auth: oAuth2Client });
+        const { data: profile } = await oauth2.userinfo.get();
+        accountEmail = profile?.email || null;
+      } catch (profileErr) {
+        console.warn("No se pudo obtener email de cuenta Google:", profileErr.message);
+      }
+
+      const nowIso = new Date().toISOString();
+
+      const { error: deactivateErr } = await supabase
+        .from("calendar_connections")
+        .update({ is_active: false, updated_at: nowIso })
+        .eq("tenant_id", tenant_id)
+        .eq("staff_id", staff_id)
+        .eq("provider", "google")
+        .eq("is_active", true);
+
+      if (deactivateErr) throw deactivateErr;
+
+      const { error: insertConnectionErr } = await supabase
+        .from("calendar_connections")
+        .insert({
+          tenant_id,
+          branch_id: branch_id || null,
+          staff_id,
+          provider: "google",
+          provider_calendar_id: "primary",
+          account_email: accountEmail,
+          refresh_token: tokens.refresh_token,
+          access_token: tokens.access_token ?? null,
+          token_type: tokens.token_type ?? null,
+          scope: tokens.scope ?? null,
+          expires_at: tokens.expiry_date
+            ? new Date(Number(tokens.expiry_date)).toISOString()
+            : null,
+          is_active: true,
+          updated_at: nowIso,
+        });
+
+      if (insertConnectionErr) throw insertConnectionErr;
+
+      const frontendUrl = "https://www.orbyx.cl";
+      if (tenantData.slug) {
+        return res.redirect(
+          `${frontendUrl}/dashboard/${tenantData.slug}/staff?calendar_connected=1`
+        );
+      }
+
+      return res.send("Calendario Google conectado correctamente para el staff.");
     }
 
     // ✅ SaaS: guardar por calendar_id
@@ -1711,6 +1811,39 @@ const { data: cal, error: calErr } = await supabase
   } catch (error) {
     console.error(error);
     res.status(500).send("Error en OAuth callback: " + error.message);
+  }
+});
+
+app.get("/calendar-connections", async (req, res) => {
+  try {
+    const { tenant_id, staff_id, branch_id } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    let query = supabase
+      .from("calendar_connections")
+      .select(
+        "id, provider, account_email, staff_id, branch_id, is_active, created_at, updated_at"
+      )
+      .eq("tenant_id", tenant_id)
+      .order("updated_at", { ascending: false });
+
+    if (staff_id) query = query.eq("staff_id", staff_id);
+    if (branch_id) query = query.eq("branch_id", branch_id);
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    return res.json({
+      total: data?.length || 0,
+      connections: data || [],
+    });
+  } catch (err) {
+    console.error("GET /calendar-connections error:", err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
 
