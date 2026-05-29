@@ -2431,22 +2431,27 @@ app.get("/test-event", async (req, res) => {
 ====================================================== */
 app.get("/business-hours", async (req, res) => {
   try {
-    const { tenant_id, branch_id } = req.query;
+    const { tenant_id, branch_id, scope } = req.query;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
     }
 
-    if (!branch_id) {
+    const isGlobalScope = scope === "global" || branch_id === "null";
+
+    if (!isGlobalScope && !branch_id) {
       return res.status(400).json({ error: "branch_id es obligatorio" });
     }
 
-    const { data, error } = await supabase
+    let query = supabase
       .from("business_hours")
       .select("*")
       .eq("tenant_id", tenant_id)
-      .eq("branch_id", branch_id)
       .order("day_of_week", { ascending: true });
+
+    query = isGlobalScope ? query.is("branch_id", null) : query.eq("branch_id", branch_id);
+
+    const { data, error } = await query;
 
     if (error) throw error;
 
@@ -2463,12 +2468,14 @@ app.get("/business-hours", async (req, res) => {
 
 app.put("/business-hours", async (req, res) => {
   try {
-    const { tenant_id, branch_id, hours } = req.body;
+    const { tenant_id, branch_id, scope, hours } = req.body;
 
     if (!tenant_id) return res.status(400).json({ error: "tenant_id es obligatorio" });
-    if (!branch_id) return res.status(400).json({ error: "branch_id es obligatorio" });
+    const isGlobalScope = scope === "global" || branch_id === null || branch_id === "null";
+    if (!isGlobalScope && !branch_id) return res.status(400).json({ error: "branch_id es obligatorio" });
     if (!Array.isArray(hours)) return res.status(400).json({ error: "hours debe ser un arreglo" });
 
+    const targetBranchId = isGlobalScope ? null : branch_id;
     const rows = [];
 
     for (const item of hours) {
@@ -2482,7 +2489,7 @@ app.put("/business-hours", async (req, res) => {
       if (!enabled) {
         rows.push({
           tenant_id,
-          branch_id,
+          branch_id: targetBranchId,
           day_of_week: dayOfWeek,
           enabled: false,
           start_time: null,
@@ -2497,7 +2504,7 @@ app.put("/business-hours", async (req, res) => {
 
         rows.push({
           tenant_id,
-          branch_id,
+          branch_id: targetBranchId,
           day_of_week: dayOfWeek,
           enabled: true,
           start_time: block.start_time,
@@ -2507,11 +2514,16 @@ app.put("/business-hours", async (req, res) => {
       }
     }
 
-    await supabase
+    let deleteQuery = supabase
       .from("business_hours")
       .delete()
-      .eq("tenant_id", tenant_id)
-      .eq("branch_id", branch_id);
+      .eq("tenant_id", tenant_id);
+
+    deleteQuery = isGlobalScope
+      ? deleteQuery.is("branch_id", null)
+      : deleteQuery.eq("branch_id", targetBranchId);
+
+    await deleteQuery;
 
     const { data, error } = await supabase
       .from("business_hours")
@@ -2538,23 +2550,28 @@ app.put("/business-hours", async (req, res) => {
 ====================================================== */
 app.get("/business-special-dates", async (req, res) => {
   try {
-    const { tenant_id, branch_id } = req.query;
+    const { tenant_id, branch_id, scope } = req.query;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
     }
 
-    if (!branch_id) {
+    const isGlobalScope = scope === "global" || branch_id === "null";
+
+    if (!isGlobalScope && !branch_id) {
       return res.status(400).json({ error: "branch_id es obligatorio" });
     }
 
-    const { data, error } = await supabase
+    let query = supabase
       .from("business_special_dates")
       .select("*")
       .eq("tenant_id", tenant_id)
-      .eq("branch_id", branch_id)
       .order("date", { ascending: true })
       .order("created_at", { ascending: true });
+
+    query = isGlobalScope ? query.is("branch_id", null) : query.eq("branch_id", branch_id);
+
+    const { data, error } = await query;
 
     if (error) throw error;
 
@@ -2573,6 +2590,7 @@ app.post("/business-special-dates", async (req, res) => {
     const {
       tenant_id,
       branch_id,
+      scope,
       date,
       label,
       is_closed,
@@ -2584,7 +2602,9 @@ app.post("/business-special-dates", async (req, res) => {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
     }
 
-    if (!branch_id) {
+    const isGlobalScope = scope === "global" || branch_id === null || branch_id === "null";
+
+    if (!isGlobalScope && !branch_id) {
       return res.status(400).json({ error: "branch_id es obligatorio" });
     }
 
@@ -2594,7 +2614,7 @@ app.post("/business-special-dates", async (req, res) => {
 
     const payload = {
       tenant_id,
-      branch_id,
+      branch_id: isGlobalScope ? null : branch_id,
       date,
       label: label || null,
       is_closed: !!is_closed,
@@ -2632,6 +2652,7 @@ app.put("/business-special-dates/:id", async (req, res) => {
     const {
       tenant_id,
       branch_id,
+      scope,
       label,
       date,
       is_closed,
@@ -2646,9 +2667,12 @@ app.put("/business-special-dates/:id", async (req, res) => {
     const payload = {
       updated_at: new Date().toISOString(),
     };
+    const isGlobalScope = scope === "global" || branch_id === null || branch_id === "null";
 
     if (tenant_id !== undefined) payload.tenant_id = tenant_id;
-    if (branch_id !== undefined) payload.branch_id = branch_id;
+    if (branch_id !== undefined || scope !== undefined) {
+      payload.branch_id = isGlobalScope ? null : branch_id;
+    }
     if (label !== undefined) payload.label = label || null;
     if (date !== undefined) payload.date = date;
     if (is_closed !== undefined) payload.is_closed = !!is_closed;
@@ -7846,6 +7870,8 @@ app.patch("/branches/:id", async (req, res) => {
       website_url,
       use_global_socials,
       use_global_contact,
+      use_global_hours,
+      use_global_special_dates,
     } = req.body;
 
     if (!id) {
@@ -7940,6 +7966,12 @@ app.patch("/branches/:id", async (req, res) => {
     }
     if (use_global_contact !== undefined) {
       updateData.use_global_contact = Boolean(use_global_contact);
+    }
+    if (use_global_hours !== undefined) {
+      updateData.use_global_hours = Boolean(use_global_hours);
+    }
+    if (use_global_special_dates !== undefined) {
+      updateData.use_global_special_dates = Boolean(use_global_special_dates);
     }
 
     if (updateData.use_global_contact === false && !normalizeNullableText(address)) {
