@@ -1145,6 +1145,30 @@ function filterSlotsForServiceDuration(slots, totalMinutes, baseSlotMinutes) {
   });
 }
 
+function filterSlotsByVisibleStep(slots, stepMinutes) {
+  if (!Array.isArray(slots) || slots.length === 0) return [];
+  if (!stepMinutes || stepMinutes <= 0) return slots;
+
+  const sortedSlots = [...slots].sort(
+    (a, b) => new Date(a.slot_start).getTime() - new Date(b.slot_start).getTime()
+  );
+  const visibleSlots = [];
+  let nextAllowedStart = null;
+
+  for (const slot of sortedSlots) {
+    const startMs = new Date(slot.slot_start).getTime();
+
+    if (Number.isNaN(startMs)) continue;
+
+    if (nextAllowedStart === null || startMs >= nextAllowedStart) {
+      visibleSlots.push(slot);
+      nextAllowedStart = startMs + stepMinutes * 60 * 1000;
+    }
+  }
+
+  return visibleSlots;
+}
+
 
 function filterPastSlots(slots, minNoticeMinutes = 0) {
   if (!Array.isArray(slots) || slots.length === 0) return [];
@@ -8703,16 +8727,21 @@ if (!candidateStaffIds.length) {
   });
 }
 
-      let staffSlots = buildSlotsFromWindows(
-        finalWindows,
-        date,
-        calendar.slot_minutes || 30
-      );
-
+      const baseSlotMinutes = calendar.slot_minutes || 30;
       const totalMinutes =
         (service.duration_minutes || 0) +
         (service.buffer_before_minutes || 0) +
         (service.buffer_after_minutes || 0);
+      const visibleStepMinutes = Math.max(
+        baseSlotMinutes,
+        totalMinutes || baseSlotMinutes
+      );
+
+      let staffSlots = buildSlotsFromWindows(
+        finalWindows,
+        date,
+        baseSlotMinutes
+      );
 
 staffSlots = filterSlotsByWindows(
   staffSlots,
@@ -8723,7 +8752,12 @@ staffSlots = filterSlotsByWindows(
 staffSlots = filterSlotsForServiceDuration(
   staffSlots,
   totalMinutes,
-  calendar.slot_minutes || 30
+  baseSlotMinutes
+);
+
+staffSlots = filterSlotsByVisibleStep(
+  staffSlots,
+  visibleStepMinutes
 ).map((slot) => ({
   ...slot,
   staff_id: currentStaffId,
