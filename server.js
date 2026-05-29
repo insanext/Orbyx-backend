@@ -919,15 +919,33 @@ async function getEffectiveBusinessAvailability({ tenant_id, branch_id, date }) 
     date,
   });
 
-  const branchHoursRows =
-    branch && !useGlobalHours
-      ? await getBusinessHoursRows({ tenant_id, branch_id: branch.id, date })
-      : [];
+  const branchHoursRows = branch
+    ? await getBusinessHoursRows({ tenant_id, branch_id: branch.id, date })
+    : [];
 
-  const shouldUseBranchHours =
-    branch && !useGlobalHours && branchHoursRows.length > 0;
-  const baseHoursRows = shouldUseBranchHours ? branchHoursRows : globalHoursRows;
-  const source = shouldUseBranchHours ? "branch" : "global";
+  let baseHoursRows = [];
+  let source = "none";
+
+  if (branch) {
+    if (useGlobalHours) {
+      if (globalHoursRows.length > 0) {
+        baseHoursRows = globalHoursRows;
+        source = "global";
+      } else if (branchHoursRows.length > 0) {
+        baseHoursRows = branchHoursRows;
+        source = "fallback_branch";
+      }
+    } else if (branchHoursRows.length > 0) {
+      baseHoursRows = branchHoursRows;
+      source = "branch";
+    } else if (globalHoursRows.length > 0) {
+      baseHoursRows = globalHoursRows;
+      source = "fallback_global";
+    }
+  } else if (globalHoursRows.length > 0) {
+    baseHoursRows = globalHoursRows;
+    source = "global";
+  }
 
   let windows = rowsToAvailabilityWindows(baseHoursRows);
 
@@ -967,7 +985,8 @@ async function getEffectiveBusinessAvailability({ tenant_id, branch_id, date }) 
       branch_hours_count: branchHoursRows.length,
       global_special_dates_count: globalSpecialDates.length,
       branch_special_dates_count: branchSpecialDates.length,
-      fell_back_to_global_hours: source === "global" && !useGlobalHours,
+      fell_back_to_branch_hours: source === "fallback_branch",
+      fell_back_to_global_hours: source === "fallback_global",
     },
   };
 }
@@ -1078,6 +1097,7 @@ async function getEffectiveStaffAvailability({
       staff_id,
       use_business_hours: Boolean(staffRow.use_business_hours),
       staff_hours_count: staffHoursRows.length,
+      business_source: businessAvailability.source,
       business: businessAvailability.debug,
       staff_special_dates_count: staffSpecialDates.length,
     },
@@ -8659,6 +8679,16 @@ if (!candidateStaffIds.length) {
         branch_id: resolvedBranchId,
         staff_id: currentStaffId,
         date,
+      });
+
+      console.log("PUBLIC SLOTS effective availability", {
+        slug,
+        branch_id: resolvedBranchId,
+        service_id,
+        staff_id: currentStaffId,
+        staff_source: staffAvailability.source,
+        business_source: staffAvailability.debug?.business_source,
+        windows: staffAvailability.windows,
       });
 
       let finalWindows = staffAvailability.windows;
