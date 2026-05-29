@@ -56,6 +56,16 @@ function isValidMime(mime) {
   return ["image/jpeg", "image/png", "image/webp"].includes(mime);
 }
 
+function normalizeNullableUrl(value) {
+  return value ? String(value).trim() : null;
+}
+
+function normalizeNullableNumber(value) {
+  if (value === "" || value === null || value === undefined) return null;
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : null;
+}
+
 function getPlanCapabilities(plan) {
   const normalizedPlan = String(plan || "pro").toLowerCase();
 
@@ -311,10 +321,19 @@ const PORT = process.env.PORT || 3000;
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI;
+const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID;
+const MICROSOFT_CLIENT_SECRET = process.env.MICROSOFT_CLIENT_SECRET;
+const MICROSOFT_REDIRECT_URI = process.env.MICROSOFT_REDIRECT_URI;
 
 const SCOPES = [
   "https://www.googleapis.com/auth/calendar.events",
   "https://www.googleapis.com/auth/userinfo.email",
+];
+
+const MICROSOFT_SCOPES = [
+  "offline_access",
+  "User.Read",
+  "Calendars.ReadWrite",
 ];
 
 // ✅ Compatibilidad
@@ -347,7 +366,7 @@ async function getMainBranchByTenantId(tenant_id) {
 async function getBranchById(branch_id) {
   const { data, error } = await supabase
     .from("branches")
-    .select("id, tenant_id, name, slug, address, phone, is_active, created_at")
+    .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, is_active, created_at")
     .eq("id", branch_id)
     .single();
 
@@ -1619,6 +1638,207 @@ return res.redirect(url);
    
   } catch (e) {
     res.status(500).send("Error en /auth: " + e.message);
+  }
+});
+
+async function getMicrosoftAccessTokenFromCode(code) {
+  const tokenParams = new URLSearchParams({
+    client_id: MICROSOFT_CLIENT_ID,
+    client_secret: MICROSOFT_CLIENT_SECRET,
+    code: String(code || ""),
+    redirect_uri: MICROSOFT_REDIRECT_URI,
+    grant_type: "authorization_code",
+    scope: MICROSOFT_SCOPES.join(" "),
+  });
+
+  const response = await fetch(
+    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: tokenParams,
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(
+      data?.error_description || data?.error || "No se pudo obtener token Microsoft"
+    );
+  }
+
+  return {
+    ...data,
+    expires_at: data.expires_in
+      ? new Date(Date.now() + Number(data.expires_in) * 1000).toISOString()
+      : null,
+  };
+}
+
+async function getMicrosoftUserProfile(accessToken) {
+  const response = await fetch(
+    "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName",
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(
+      data?.error?.message || "No se pudo obtener perfil Microsoft"
+    );
+  }
+
+  return data;
+}
+
+app.get("/auth/microsoft", async (req, res) => {
+  try {
+    if (!MICROSOFT_CLIENT_ID || !MICROSOFT_CLIENT_SECRET || !MICROSOFT_REDIRECT_URI) {
+      return res.status(500).send("Faltan variables ENV Microsoft OAuth.");
+    }
+
+    const { calendar_id, tenant_id, branch_id, staff_id, scope_level } = req.query;
+
+    const stateObj = {
+      provider: "microsoft",
+      calendar_id: calendar_id ? String(calendar_id) : null,
+      tenant_id: tenant_id ? String(tenant_id) : null,
+      branch_id: branch_id ? String(branch_id) : null,
+      staff_id: staff_id ? String(staff_id) : null,
+      scope_level: scope_level ? String(scope_level) : null,
+    };
+
+    const state = Buffer.from(JSON.stringify(stateObj)).toString("base64url");
+    const authParams = new URLSearchParams({
+      client_id: MICROSOFT_CLIENT_ID,
+      response_type: "code",
+      redirect_uri: MICROSOFT_REDIRECT_URI,
+      response_mode: "query",
+      scope: MICROSOFT_SCOPES.join(" "),
+      state,
+      prompt: "consent",
+    });
+
+    return res.redirect(
+      `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${authParams.toString()}`
+    );
+  } catch (e) {
+    res.status(500).send("Error en /auth/microsoft: " + e.message);
+  }
+});
+
+app.get("/oauth2callback/microsoft", async (req, res) => {
+  try {
+    const code = req.query.code;
+    const stateRaw = req.query.state;
+
+    let state = {};
+    try {
+      if (stateRaw) {
+        state = JSON.parse(
+          Buffer.from(String(stateRaw), "base64url").toString("utf8")
+        );
+      }
+    } catch (_) {
+      state = {};
+    }
+
+    if (state?.provider !== "microsoft") {
+      return res.status(400).send("State Microsoft inválido.");
+    }
+
+    const tenant_id = state.tenant_id ? String(state.tenant_id) : "";
+    const branch_id = state.branch_id ? String(state.branch_id) : null;
+    const staff_id = state.staff_id ? String(state.staff_id) : "";
+
+    if (!tenant_id || !staff_id) {
+      return res.status(400).send("Faltan tenant_id o staff_id para conectar calendario Microsoft.");
+    }
+
+    const tokens = await getMicrosoftAccessTokenFromCode(code);
+
+    if (!tokens.refresh_token) {
+      return res
+        .status(400)
+        .send("Microsoft no devolvió refresh_token. Reautoriza la conexión.");
+    }
+
+    const { data: tenantData, error: tenantErr } = await supabase
+      .from("tenants")
+      .select("id, slug")
+      .eq("id", tenant_id)
+      .single();
+
+    if (tenantErr || !tenantData) {
+      return res.status(404).send("Negocio no encontrado para conectar calendario Microsoft.");
+    }
+
+    const { data: staffData, error: staffErr } = await supabase
+      .from("staff")
+      .select("id, tenant_id, branch_id")
+      .eq("id", staff_id)
+      .eq("tenant_id", tenant_id)
+      .single();
+
+    if (staffErr || !staffData) {
+      return res.status(404).send("Staff no encontrado para conectar calendario Microsoft.");
+    }
+
+    if (branch_id && String(staffData.branch_id || "") !== branch_id) {
+      return res.status(400).send("El staff no pertenece a la sucursal indicada.");
+    }
+
+    const profile = await getMicrosoftUserProfile(tokens.access_token);
+    const accountEmail = profile?.mail || profile?.userPrincipalName || null;
+    const nowIso = new Date().toISOString();
+
+    const { error: deactivateErr } = await supabase
+      .from("calendar_connections")
+      .update({ is_active: false, updated_at: nowIso })
+      .eq("tenant_id", tenant_id)
+      .eq("staff_id", staff_id)
+      .eq("provider", "microsoft")
+      .eq("is_active", true);
+
+    if (deactivateErr) throw deactivateErr;
+
+    const { error: insertConnectionErr } = await supabase
+      .from("calendar_connections")
+      .insert({
+        tenant_id,
+        branch_id: branch_id || null,
+        staff_id,
+        provider: "microsoft",
+        provider_calendar_id: "primary",
+        account_email: accountEmail,
+        refresh_token: tokens.refresh_token,
+        access_token: tokens.access_token ?? null,
+        token_type: tokens.token_type ?? null,
+        scope: tokens.scope ?? MICROSOFT_SCOPES.join(" "),
+        expires_at: tokens.expires_at,
+        is_active: true,
+        updated_at: nowIso,
+      });
+
+    if (insertConnectionErr) throw insertConnectionErr;
+
+    const frontendUrl = "https://www.orbyx.cl";
+    if (tenantData.slug) {
+      return res.redirect(
+        `${frontendUrl}/dashboard/${tenantData.slug}/staff?calendar_connected=1`
+      );
+    }
+
+    return res.send("Calendario Microsoft conectado correctamente para el staff.");
+  } catch (error) {
+    console.error("Error en OAuth callback Microsoft:", error);
+    res.status(500).send("Error en OAuth callback Microsoft: " + error.message);
   }
 });
 
@@ -6949,6 +7169,7 @@ app.patch("/tenants/:id", async (req, res) => {
       address,
       email,
       whatsapp,
+      logo_url,
       instagram_url,
       facebook_url,
       description,
@@ -7110,6 +7331,7 @@ app.patch("/tenants/:id", async (req, res) => {
         address: address ? String(address).trim() : null,
         email: email ? String(email).trim() : null,
         whatsapp: whatsapp ? String(whatsapp).trim() : null,
+        logo_url: normalizeNullableUrl(logo_url),
         instagram_url: instagram_url ? String(instagram_url).trim() : null,
         facebook_url: facebook_url ? String(facebook_url).trim() : null,
         description: description ? String(description).trim() : null,
@@ -7171,7 +7393,26 @@ app.get("/branches", async (req, res) => {
 
 app.post("/branches", async (req, res) => {
   try {
-    const { tenant_id, name } = req.body;
+    const {
+      tenant_id,
+      name,
+      address,
+      phone,
+      whatsapp,
+      email,
+      description,
+      city,
+      commune,
+      map_url,
+      latitude,
+      longitude,
+      instagram_url,
+      facebook_url,
+      tiktok_url,
+      website_url,
+      use_global_socials = true,
+      use_global_contact = true,
+    } = req.body;
 
     if (!tenant_id || !name) {
       return res.status(400).json({
@@ -7196,6 +7437,22 @@ app.post("/branches", async (req, res) => {
       .insert({
         tenant_id,
         name: String(name).trim(),
+        address: normalizeNullableText(address),
+        phone: normalizeNullableText(phone),
+        whatsapp: normalizeNullableText(whatsapp),
+        email: normalizeNullableText(email),
+        description: normalizeNullableText(description),
+        city: normalizeNullableText(city),
+        commune: normalizeNullableText(commune),
+        map_url: normalizeNullableUrl(map_url),
+        latitude: normalizeNullableNumber(latitude),
+        longitude: normalizeNullableNumber(longitude),
+        instagram_url: normalizeNullableUrl(instagram_url),
+        facebook_url: normalizeNullableUrl(facebook_url),
+        tiktok_url: normalizeNullableUrl(tiktok_url),
+        website_url: normalizeNullableUrl(website_url),
+        use_global_socials: Boolean(use_global_socials),
+        use_global_contact: Boolean(use_global_contact),
         is_active: true,
       })
       .select()
@@ -7222,7 +7479,28 @@ app.post("/branches", async (req, res) => {
 app.patch("/branches/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { tenant_id, name, slug, is_active } = req.body;
+    const {
+      tenant_id,
+      name,
+      slug,
+      is_active,
+      address,
+      phone,
+      whatsapp,
+      email,
+      description,
+      city,
+      commune,
+      map_url,
+      latitude,
+      longitude,
+      instagram_url,
+      facebook_url,
+      tiktok_url,
+      website_url,
+      use_global_socials,
+      use_global_contact,
+    } = req.body;
 
     if (!id) {
       return res.status(400).json({ error: "id es obligatorio" });
@@ -7295,6 +7573,27 @@ app.patch("/branches/:id", async (req, res) => {
       }
 
       updateData.is_active = Boolean(is_active);
+    }
+
+    if (address !== undefined) updateData.address = normalizeNullableText(address);
+    if (phone !== undefined) updateData.phone = normalizeNullableText(phone);
+    if (whatsapp !== undefined) updateData.whatsapp = normalizeNullableText(whatsapp);
+    if (email !== undefined) updateData.email = normalizeNullableText(email);
+    if (description !== undefined) updateData.description = normalizeNullableText(description);
+    if (city !== undefined) updateData.city = normalizeNullableText(city);
+    if (commune !== undefined) updateData.commune = normalizeNullableText(commune);
+    if (map_url !== undefined) updateData.map_url = normalizeNullableUrl(map_url);
+    if (latitude !== undefined) updateData.latitude = normalizeNullableNumber(latitude);
+    if (longitude !== undefined) updateData.longitude = normalizeNullableNumber(longitude);
+    if (instagram_url !== undefined) updateData.instagram_url = normalizeNullableUrl(instagram_url);
+    if (facebook_url !== undefined) updateData.facebook_url = normalizeNullableUrl(facebook_url);
+    if (tiktok_url !== undefined) updateData.tiktok_url = normalizeNullableUrl(tiktok_url);
+    if (website_url !== undefined) updateData.website_url = normalizeNullableUrl(website_url);
+    if (use_global_socials !== undefined) {
+      updateData.use_global_socials = Boolean(use_global_socials);
+    }
+    if (use_global_contact !== undefined) {
+      updateData.use_global_contact = Boolean(use_global_contact);
     }
 
     const { data, error } = await supabase
@@ -7592,7 +7891,7 @@ app.get("/public/services/:slug", async (req, res) => {
 
     const { data: branch, error: branchError } = await supabase
       .from("branches")
-      .select("id, tenant_id, name, slug, address, phone, is_active")
+      .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, is_active")
       .eq("id", resolvedBranchId)
       .eq("tenant_id", tenant.id)
       .single();
@@ -7682,6 +7981,7 @@ app.get("/public/business/:slug", async (req, res) => {
   address,
   email,
   whatsapp,
+  logo_url,
   instagram_url,
   facebook_url,
   description,
@@ -7766,7 +8066,7 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
 
     const { data: branch, error: branchError } = await supabase
       .from("branches")
-      .select("id, tenant_id, name, slug, is_active")
+      .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, is_active")
       .eq("id", resolvedBranchId)
       .eq("tenant_id", tenant.id)
       .single();
@@ -7881,7 +8181,7 @@ app.get("/public/slots/:slug/:service_id", async (req, res) => {
 
     const { data: branch, error: branchError } = await supabase
       .from("branches")
-      .select("id, tenant_id, name, slug, address, phone, is_active")
+      .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, is_active")
       .eq("id", resolvedBranchId)
       .eq("tenant_id", tenant.id)
       .single();
