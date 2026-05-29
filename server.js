@@ -7064,6 +7064,8 @@ app.post("/billing/change-plan", async (req, res) => {
       });
     }
 
+    console.log("PATCH /tenants/:id logo_url payload:", logo_url || null);
+
     const { data, error } = await supabase
       .from("tenants")
       .update({
@@ -7352,6 +7354,8 @@ app.patch("/tenants/:id", async (req, res) => {
     if (error) {
       return res.status(500).json({ error: error.message });
     }
+
+    console.log("PATCH /tenants/:id logo_url saved:", data?.logo_url || null);
 
     return res.json({
       ok: true,
