@@ -2619,6 +2619,10 @@ app.post("/staff", async (req, res) => {
       return res.status(400).json({ error: "name es obligatorio" });
     }
 
+    if (!address || !String(address).trim()) {
+      return res.status(400).json({ error: "address es obligatorio" });
+    }
+
     const resolvedBranchId = await resolveBranchId({
       tenant_id,
       branch_id: branch_id || null,
@@ -7594,6 +7598,12 @@ app.patch("/branches/:id", async (req, res) => {
     }
     if (use_global_contact !== undefined) {
       updateData.use_global_contact = Boolean(use_global_contact);
+    }
+
+    if (updateData.use_global_contact === false && !normalizeNullableText(address)) {
+      return res.status(400).json({
+        error: "address es obligatorio cuando la sucursal usa contacto propio",
+      });
     }
 
     const { data, error } = await supabase
