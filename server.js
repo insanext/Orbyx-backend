@@ -804,6 +804,286 @@ windows = validWeeklyRows
   return windows.sort((a, b) => a.start - b.start);
 }
 
+function rowsToAvailabilityWindows(rows) {
+  return (rows || [])
+    .filter((row) => row.enabled && row.start_time && row.end_time)
+    .map((row) => {
+      const start = timeToMinutes(row.start_time);
+      const end = timeToMinutes(row.end_time);
+
+      if (start !== null && end !== null && end > start) {
+        return { start, end };
+      }
+
+      return null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.start - b.start);
+}
+
+function applySpecialDatesToWindows(windows, specialDates) {
+  const dates = specialDates || [];
+  const fullDayClosed = dates.some(
+    (row) => row.is_closed && !row.start_time && !row.end_time
+  );
+
+  if (fullDayClosed) {
+    return { windows: [], isClosed: true };
+  }
+
+  let nextWindows = [...(windows || [])];
+
+  const openWindows = dates
+    .filter((row) => !row.is_closed && row.start_time && row.end_time)
+    .map((row) => ({
+      start: timeToMinutes(row.start_time),
+      end: timeToMinutes(row.end_time),
+    }))
+    .filter(
+      (row) => row.start !== null && row.end !== null && row.end > row.start
+    );
+
+  if (openWindows.length > 0) {
+    nextWindows = openWindows;
+  }
+
+  const partialClosedWindows = dates
+    .filter((row) => row.is_closed && row.start_time && row.end_time)
+    .map((row) => ({
+      start: timeToMinutes(row.start_time),
+      end: timeToMinutes(row.end_time),
+    }))
+    .filter(
+      (row) => row.start !== null && row.end !== null && row.end > row.start
+    );
+
+  for (const blocked of partialClosedWindows) {
+    nextWindows = subtractRange(nextWindows, blocked.start, blocked.end);
+  }
+
+  return {
+    windows: nextWindows.sort((a, b) => a.start - b.start),
+    isClosed: nextWindows.length === 0,
+  };
+}
+
+async function getBusinessHoursRows({ tenant_id, branch_id, date }) {
+  const weekday = parseDateToWeekday(date);
+
+  let query = supabase
+    .from("business_hours")
+    .select("*")
+    .eq("tenant_id", tenant_id)
+    .eq("day_of_week", weekday)
+    .order("day_of_week", { ascending: true });
+
+  query = branch_id ? query.eq("branch_id", branch_id) : query.is("branch_id", null);
+
+  const { data, error } = await query;
+  if (error) throw error;
+
+  return data || [];
+}
+
+async function getBusinessSpecialDateRows({ tenant_id, branch_id, date }) {
+  let query = supabase
+    .from("business_special_dates")
+    .select("*")
+    .eq("tenant_id", tenant_id)
+    .eq("date", date)
+    .order("created_at", { ascending: true });
+
+  query = branch_id ? query.eq("branch_id", branch_id) : query.is("branch_id", null);
+
+  const { data, error } = await query;
+  if (error) throw error;
+
+  return data || [];
+}
+
+async function getEffectiveBusinessAvailability({ tenant_id, branch_id, date }) {
+  const branch = branch_id ? await getBranchById(branch_id) : null;
+
+  if (branch && branch.tenant_id !== tenant_id) {
+    throw new Error("La sucursal no pertenece al tenant enviado");
+  }
+
+  const useGlobalHours = branch ? branch.use_global_hours !== false : true;
+  const useGlobalSpecialDates = branch
+    ? branch.use_global_special_dates !== false
+    : true;
+
+  const globalHoursRows = await getBusinessHoursRows({
+    tenant_id,
+    branch_id: null,
+    date,
+  });
+
+  const branchHoursRows =
+    branch && !useGlobalHours
+      ? await getBusinessHoursRows({ tenant_id, branch_id: branch.id, date })
+      : [];
+
+  const shouldUseBranchHours =
+    branch && !useGlobalHours && branchHoursRows.length > 0;
+  const baseHoursRows = shouldUseBranchHours ? branchHoursRows : globalHoursRows;
+  const source = shouldUseBranchHours ? "branch" : "global";
+
+  let windows = rowsToAvailabilityWindows(baseHoursRows);
+
+  const globalSpecialDates = await getBusinessSpecialDateRows({
+    tenant_id,
+    branch_id: null,
+    date,
+  });
+
+  const branchSpecialDates =
+    branch && !useGlobalSpecialDates
+      ? await getBusinessSpecialDateRows({
+          tenant_id,
+          branch_id: branch.id,
+          date,
+        })
+      : [];
+
+  const appliedSpecialDates = [
+    ...globalSpecialDates.map((row) => ({ ...row, scope: "global" })),
+    ...branchSpecialDates.map((row) => ({ ...row, scope: "branch" })),
+  ];
+
+  const specialResult = applySpecialDatesToWindows(windows, appliedSpecialDates);
+
+  return {
+    windows: specialResult.windows,
+    isClosed: specialResult.isClosed,
+    source,
+    appliedSpecialDates,
+    debug: {
+      tenant_id,
+      branch_id: branch?.id || null,
+      use_global_hours: useGlobalHours,
+      use_global_special_dates: useGlobalSpecialDates,
+      global_hours_count: globalHoursRows.length,
+      branch_hours_count: branchHoursRows.length,
+      global_special_dates_count: globalSpecialDates.length,
+      branch_special_dates_count: branchSpecialDates.length,
+      fell_back_to_global_hours: source === "global" && !useGlobalHours,
+    },
+  };
+}
+
+async function getStaffHoursRows({ tenant_id, branch_id, staff_id, date }) {
+  const weekday = parseDateToWeekday(date);
+
+  const { data, error } = await supabase
+    .from("staff_hours")
+    .select("*")
+    .eq("tenant_id", tenant_id)
+    .eq("branch_id", branch_id)
+    .eq("staff_id", staff_id)
+    .eq("day_of_week", weekday);
+
+  if (error) throw error;
+
+  return data || [];
+}
+
+async function getStaffSpecialDateRows({ tenant_id, branch_id, staff_id, date }) {
+  const { data, error } = await supabase
+    .from("staff_special_dates")
+    .select("*")
+    .eq("tenant_id", tenant_id)
+    .eq("branch_id", branch_id)
+    .eq("staff_id", staff_id)
+    .eq("date", date)
+    .order("created_at", { ascending: true });
+
+  if (error) throw error;
+
+  return data || [];
+}
+
+async function getEffectiveStaffAvailability({
+  tenant_id,
+  branch_id,
+  staff_id,
+  date,
+}) {
+  const { data: staffRow, error: staffError } = await supabase
+    .from("staff")
+    .select("id, tenant_id, branch_id, use_business_hours, is_active")
+    .eq("tenant_id", tenant_id)
+    .eq("branch_id", branch_id)
+    .eq("id", staff_id)
+    .single();
+
+  if (staffError) throw staffError;
+
+  if (!staffRow || !staffRow.is_active) {
+    return {
+      windows: [],
+      isClosed: true,
+      source: "staff_inactive",
+      appliedSpecialDates: [],
+      debug: { tenant_id, branch_id, staff_id, staff_active: false },
+    };
+  }
+
+  const businessAvailability = await getEffectiveBusinessAvailability({
+    tenant_id,
+    branch_id,
+    date,
+  });
+
+  let windows = businessAvailability.windows;
+  let source = "effective_business";
+  let staffHoursRows = [];
+
+  if (!staffRow.use_business_hours) {
+    staffHoursRows = await getStaffHoursRows({
+      tenant_id,
+      branch_id,
+      staff_id,
+      date,
+    });
+
+    const staffWindows = rowsToAvailabilityWindows(staffHoursRows);
+    windows = intersectWindows(businessAvailability.windows, staffWindows);
+    source = "staff";
+  }
+
+  const staffSpecialDates = await getStaffSpecialDateRows({
+    tenant_id,
+    branch_id,
+    staff_id,
+    date,
+  });
+
+  const staffSpecialResult = applySpecialDatesToWindows(
+    windows,
+    staffSpecialDates
+  );
+
+  return {
+    windows: staffSpecialResult.windows,
+    isClosed: staffSpecialResult.isClosed,
+    source,
+    appliedSpecialDates: [
+      ...businessAvailability.appliedSpecialDates,
+      ...staffSpecialDates.map((row) => ({ ...row, scope: "staff" })),
+    ],
+    debug: {
+      tenant_id,
+      branch_id,
+      staff_id,
+      use_business_hours: Boolean(staffRow.use_business_hours),
+      staff_hours_count: staffHoursRows.length,
+      business: businessAvailability.debug,
+      staff_special_dates_count: staffSpecialDates.length,
+    },
+  };
+}
+
 function filterSlotsByWindows(slots, windows, date) {
   if (!Array.isArray(slots) || slots.length === 0) return [];
   if (!Array.isArray(windows) || windows.length === 0) return [];
