@@ -366,7 +366,7 @@ async function getMainBranchByTenantId(tenant_id) {
 async function getBranchById(branch_id) {
   const { data, error } = await supabase
     .from("branches")
-    .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, is_active, created_at")
+    .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, use_global_hours, use_global_special_dates, is_active, created_at")
     .eq("id", branch_id)
     .single();
 
@@ -3976,20 +3976,14 @@ const slotDateStr = String(date).slice(0, 10);
     let validSlots = [];
 
     if (staff_id) {
-      const businessWindows = await getBusinessAvailabilityWindows({
-        tenant_id: cal.tenant_id,
-        branch_id: resolvedBranchId,
-        date: slotDateStr,
-      });
-
-      const staffWindows = await getStaffAvailabilityWindows({
+      const staffAvailability = await getEffectiveStaffAvailability({
         tenant_id: cal.tenant_id,
         branch_id: resolvedBranchId,
         staff_id,
         date: slotDateStr,
       });
 
-      let finalWindows = intersectWindows(businessWindows, staffWindows);
+      let finalWindows = staffAvailability.windows;
 
       if (!isGroup) {
         finalWindows = await subtractAppointmentsFromWindows({
@@ -4016,46 +4010,66 @@ const slotDateStr = String(date).slice(0, 10);
         staff_id,
       }));
     } else {
-      const { data: rawSlots, error: slotsErr } = await supabase.rpc(
-        "get_available_slots",
-        {
-          _calendar_id: calendar_id,
-          _day: date,
-        }
-      );
+      const serviceStaffIds = service_id
+        ? await getServiceStaffIds({
+            tenant_id: cal.tenant_id,
+            branch_id: resolvedBranchId,
+            service_id,
+          })
+        : [];
 
-      if (slotsErr) {
-        return res.status(500).json({ error: slotsErr.message });
+      let mergedSlots = [];
+
+      for (const currentStaffId of serviceStaffIds) {
+        const staffAvailability = await getEffectiveStaffAvailability({
+          tenant_id: cal.tenant_id,
+          branch_id: resolvedBranchId,
+          staff_id: currentStaffId,
+          date: slotDateStr,
+        });
+
+        let finalWindows = staffAvailability.windows;
+
+        if (!isGroup) {
+          finalWindows = await subtractAppointmentsFromWindows({
+            tenant_id: cal.tenant_id,
+            branch_id: resolvedBranchId,
+            staff_id: currentStaffId,
+            date: slotDateStr,
+            windows: finalWindows,
+          });
+        }
+
+        const staffSlots = filterSlotsForServiceDuration(
+          buildSlotsFromWindows(
+            finalWindows,
+            slotDateStr,
+            slotMinutes
+          ),
+          totalMinutes,
+          slotMinutes
+        ).map((slot) => ({
+          ...slot,
+          staff_id: currentStaffId,
+        }));
+
+        mergedSlots.push(...staffSlots);
       }
 
-      const windows = await getBusinessAvailabilityWindows({
-        tenant_id: cal.tenant_id,
-        branch_id: resolvedBranchId,
-        date,
-      });
-
-      validSlots = filterSlotsByWindows(rawSlots || [], windows, date);
-
-      validSlots = filterSlotsForServiceDuration(
-        validSlots,
-        totalMinutes,
-        slotMinutes
-      );
+      validSlots = mergedSlots;
     }
 
     const wantedStart = slot_start.slice(0, 16); // "YYYY-MM-DDTHH:mm"
 
-if (!isGroup) {
-  const ok = validSlots.some(
-    (s) => s.slot_start.slice(0, 16) === wantedStart
-  );
+    const ok = validSlots.some(
+      (s) => s.slot_start.slice(0, 16) === wantedStart
+    );
 
-  if (!ok) {
-    return res.status(409).json({
-      error: "Ese horario ya no está disponible.",
-    });
-  }
-}
+    if (!ok) {
+      return res.status(409).json({
+        error: "Ese horario ya no está disponible.",
+      });
+    }
 
     const end = new Date(
       start.getTime() + (duration + bufferBefore + bufferAfter) * 60 * 1000
@@ -8621,46 +8635,6 @@ async function attachCapacityToSlots(slotsToCheck) {
       });
     }
 
-    const businessWindows = await getBusinessAvailabilityWindows({
-      tenant_id: tenant.id,
-      branch_id: resolvedBranchId,
-      date,
-    });
-
-const weekday = parseDateToWeekday(date);
-
-const { data: businessWeeklyRows, error: businessWeeklyError } = await supabase
-  .from("business_hours")
-  .select("id")
-  .eq("tenant_id", tenant.id)
-  .eq("branch_id", resolvedBranchId)
-  .eq("day_of_week", weekday)
-  .limit(1);
-
-if (businessWeeklyError) {
-  throw businessWeeklyError;
-}
-
-const { data: businessSpecialRows, error: businessSpecialError } = await supabase
-  .from("business_special_dates")
-  .select("id")
-  .eq("tenant_id", tenant.id)
-  .eq("branch_id", resolvedBranchId)
-  .eq("date", date)
-  .limit(1);
-
-if (businessSpecialError) {
-  throw businessSpecialError;
-}
-
-const hasBusinessConfig =
-  (businessWeeklyRows && businessWeeklyRows.length > 0) ||
-  (businessSpecialRows && businessSpecialRows.length > 0);
-
-
-
-
-
 if (!candidateStaffIds.length) {
   return res.json({
     business: {
@@ -8680,16 +8654,14 @@ if (!candidateStaffIds.length) {
     let mergedSlots = [];
 
     for (const currentStaffId of candidateStaffIds) {
-      const staffWindows = await getStaffAvailabilityWindows({
+      const staffAvailability = await getEffectiveStaffAvailability({
         tenant_id: tenant.id,
         branch_id: resolvedBranchId,
         staff_id: currentStaffId,
         date,
       });
 
-      let finalWindows = hasBusinessConfig
-  ? intersectWindows(businessWindows, staffWindows)
-  : staffWindows;
+      let finalWindows = staffAvailability.windows;
 
       if (!isGroup) {
   finalWindows = await subtractAppointmentsFromWindows({
