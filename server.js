@@ -2967,10 +2967,6 @@ app.post("/staff", async (req, res) => {
       return res.status(400).json({ error: "name es obligatorio" });
     }
 
-    if (!address || !String(address).trim()) {
-      return res.status(400).json({ error: "address es obligatorio" });
-    }
-
     const resolvedBranchId = await resolveBranchId({
       tenant_id,
       branch_id: branch_id || null,
@@ -7425,8 +7421,6 @@ app.post("/billing/change-plan", async (req, res) => {
         message: "Upgrade aplicado de inmediato con prorrateo",
       });
     }
-
-    console.log("PATCH /tenants/:id logo_url payload:", logo_url || null);
 
     const { data, error } = await supabase
       .from("tenants")
