@@ -3488,8 +3488,8 @@ app.post("/staff-special-dates", async (req, res) => {
       date,
       label: normalizeNullableText(label),
       is_closed: Boolean(is_closed),
-      start_time: is_closed ? null : start_time || null,
-      end_time: is_closed ? null : end_time || null,
+      start_time: start_time || null,
+      end_time: end_time || null,
       updated_at: new Date().toISOString(),
     };
 
@@ -3568,13 +3568,8 @@ app.put("/staff-special-dates/:id", async (req, res) => {
     if (label !== undefined) payload.label = normalizeNullableText(label);
     if (is_closed !== undefined) payload.is_closed = Boolean(is_closed);
 
-    if (is_closed !== undefined) {
-      payload.start_time = Boolean(is_closed) ? null : start_time || null;
-      payload.end_time = Boolean(is_closed) ? null : end_time || null;
-    } else {
-      if (start_time !== undefined) payload.start_time = start_time || null;
-      if (end_time !== undefined) payload.end_time = end_time || null;
-    }
+    if (start_time !== undefined) payload.start_time = start_time || null;
+    if (end_time !== undefined) payload.end_time = end_time || null;
 
     const { data, error } = await supabase
       .from("staff_special_dates")
