@@ -6095,6 +6095,118 @@ app.post("/pets", async (req, res) => {
 });
 
 /* ======================================================
+   ✅ PATCH /pets/:id
+   Editar datos de una mascota existente
+====================================================== */
+app.patch("/pets/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      slug,
+      name,
+      species_base,
+      species_custom,
+      breed,
+      sex,
+      weight_kg,
+      is_sterilized,
+      notes,
+    } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    if (!id) {
+      return res.status(400).json({ error: "id es obligatorio" });
+    }
+
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "name es obligatorio" });
+    }
+
+    const normalizedSpeciesBase = String(species_base || "").trim().toLowerCase();
+
+    if (!["perro", "gato", "otro"].includes(normalizedSpeciesBase)) {
+      return res.status(400).json({
+        error: "species_base inválido. Usa: perro, gato u otro",
+      });
+    }
+
+    if (
+      normalizedSpeciesBase === "otro" &&
+      !String(species_custom || "").trim()
+    ) {
+      return res.status(400).json({
+        error: "species_custom es obligatorio cuando species_base es 'otro'",
+      });
+    }
+
+    // Validar tenant por slug
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    // Validar que la mascota pertenece al tenant
+    const { data: existing, error: existingError } = await supabase
+      .from("pets")
+      .select("id, tenant_id")
+      .eq("id", id)
+      .eq("tenant_id", tenant.id)
+      .single();
+
+    if (existingError || !existing) {
+      return res.status(404).json({ error: "Mascota no encontrada para este negocio" });
+    }
+
+    let normalizedWeight = null;
+    if (weight_kg !== undefined && weight_kg !== null && String(weight_kg).trim() !== "") {
+      normalizedWeight = Number(weight_kg);
+      if (Number.isNaN(normalizedWeight) || normalizedWeight < 0) {
+        return res.status(400).json({ error: "weight_kg debe ser un número válido" });
+      }
+    }
+
+    const payload = {
+      name: String(name).trim(),
+      species_base: normalizedSpeciesBase,
+      species_custom:
+        normalizedSpeciesBase === "otro"
+          ? normalizeNullablePetText(species_custom)
+          : null,
+      breed: normalizeNullablePetText(breed),
+      sex: normalizeNullablePetText(sex),
+      weight_kg: normalizedWeight,
+      is_sterilized: Boolean(is_sterilized),
+      notes: normalizeNullablePetText(notes),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from("pets")
+      .update(payload)
+      .eq("id", id)
+      .eq("tenant_id", tenant.id)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.status(200).json({ ok: true, pet: data });
+  } catch (err) {
+    console.error("PATCH /pets/:id error:", err.message);
+    return res.status(500).json({ error: err.message || "Error actualizando mascota" });
+  }
+});
+
+/* ======================================================
    ✅ POST /campaigns/send-email
    Envío real por email usando audiencia curada desde frontend
 ====================================================== */
