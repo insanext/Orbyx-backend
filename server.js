@@ -9,7 +9,7 @@ const cors = require("cors");
 const { google } = require("googleapis");
 const crypto = require("crypto");
 const PDFDocument = require("pdfkit");
-const { sendBookingEmail } = require("./email");
+const { sendBookingEmail, sendInvitationEmail } = require("./email");
 
 const app = express();
 
@@ -4477,6 +4477,8 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
     const {
       reason,
       notes,
+      diagnosis,
+      treatment,
       control_type,
       control_note,
       next_control_at,
@@ -4488,7 +4490,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
 
     const { data: appointment, error: appointmentError } = await supabase
       .from("appointments")
-      .select("id, tenant_id, customer_id, pet_id, staff_id")
+      .select("id, tenant_id, branch_id, customer_id, pet_id, staff_id, start_at")
       .eq("id", id)
       .single();
 
@@ -4512,6 +4514,46 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
 
     if (error) {
       return res.status(500).json({ error: error.message });
+    }
+
+    try {
+      const { data: existingNote } = await supabase
+        .from("clinical_notes")
+        .select("id")
+        .eq("appointment_id", id)
+        .maybeSingle();
+
+      if (existingNote) {
+        await supabase
+          .from("clinical_notes")
+          .update({
+            reason:          normalizedReason ?? null,
+            diagnosis:       normalizeNullablePetText(diagnosis),
+            treatment:       normalizeNullablePetText(treatment),
+            observations:    normalizedNotes ?? null,
+            next_control_at: next_control_at ?? null,
+            updated_at:      new Date().toISOString(),
+          })
+          .eq("id", existingNote.id);
+      } else if (appointment.pet_id) {
+        await supabase.from("clinical_notes").insert({
+          tenant_id:       appointment.tenant_id,
+          branch_id:       appointment.branch_id ?? null,
+          pet_id:          appointment.pet_id,
+          appointment_id:  id,
+          staff_id:        appointment.staff_id ?? null,
+          date:            appointment.start_at
+                             ? appointment.start_at.split("T")[0]
+                             : new Date().toISOString().split("T")[0],
+          reason:          normalizedReason ?? null,
+          diagnosis:       normalizeNullablePetText(diagnosis),
+          treatment:       normalizeNullablePetText(treatment),
+          observations:    normalizedNotes ?? null,
+          next_control_at: next_control_at ?? null,
+        });
+      }
+    } catch (cnErr) {
+      console.error("[clinical_notes] upsert failed on clinical patch:", cnErr.message);
     }
 
     await supabase
@@ -5203,6 +5245,18 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
 
     if (appointmentsError) throw appointmentsError;
 
+    const { data: clinicalNotesRows } = await supabase
+      .from("clinical_notes")
+      .select("id, appointment_id, diagnosis, treatment, observations, control_type")
+      .eq("tenant_id", tenant.id)
+      .eq("pet_id", pet.id);
+
+    const clinicalNotesMap = Object.fromEntries(
+      (clinicalNotesRows || [])
+        .filter((n) => n.appointment_id)
+        .map((n) => [n.appointment_id, n])
+    );
+
     const doc = new PDFDocument({ margin: 48, size: "A4" });
 
     res.setHeader("Content-Type", "application/pdf");
@@ -5344,10 +5398,17 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
           doc.y = 42;
         }
 
+        const clinNote = clinicalNotesMap[appt.id];
         const cardY = doc.y;
-        const noteText = appt.notes || "Sin notas clínicas.";
-        const noteHeight = doc.heightOfString(noteText, { width: contentWidth - 190 });
-        const cardHeight = Math.max(88, 64 + noteHeight);
+        const reasonText = appt.reason || "Sin motivo registrado";
+        const noteText = clinNote?.observations || appt.notes || "Sin notas clínicas.";
+        const diagText = clinNote?.diagnosis || "";
+        const treatText = clinNote?.treatment || "";
+        const reasonHeight = doc.heightOfString(reasonText, { width: contentWidth - 206 });
+        const noteHeight = doc.heightOfString(noteText, { width: contentWidth - 206 });
+        const diagHeight = diagText ? doc.heightOfString(diagText, { width: contentWidth - 206 }) : 0;
+        const treatHeight = treatText ? doc.heightOfString(treatText, { width: contentWidth - 206 }) : 0;
+        const cardHeight = Math.max(120, 64 + reasonHeight + noteHeight + (diagText ? diagHeight + 22 : 0) + (treatText ? treatHeight + 22 : 0) + 28);
 
         doc
           .moveTo(left, cardY)
@@ -5376,7 +5437,7 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
           .font("Helvetica-Bold")
           .fontSize(10)
           .fillColor("#0f172a")
-          .text(appt.reason || "Sin motivo registrado", left + 190, cardY + 16, {
+          .text(reasonText, left + 190, cardY + 16, {
             width: contentWidth - 206,
           });
 
@@ -5401,7 +5462,38 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
 // ESPACIO
 doc.moveDown(0.6);
 
+        if (diagText) {
+          doc.moveDown(0.5);
+          doc
+            .font("Helvetica-Bold")
+            .fontSize(8)
+            .fillColor("#64748b")
+            .text("DIAGNÓSTICO", left + 190, doc.y);
+          doc.moveDown(0.3);
+          doc
+            .font("Helvetica")
+            .fontSize(9.5)
+            .fillColor("#334155")
+            .text(diagText, left + 190, doc.y, { width: contentWidth - 206 });
+        }
+
+        if (treatText) {
+          doc.moveDown(0.5);
+          doc
+            .font("Helvetica-Bold")
+            .fontSize(8)
+            .fillColor("#64748b")
+            .text("TRATAMIENTO", left + 190, doc.y);
+          doc.moveDown(0.3);
+          doc
+            .font("Helvetica")
+            .fontSize(9.5)
+            .fillColor("#334155")
+            .text(treatText, left + 190, doc.y, { width: contentWidth - 206 });
+        }
+
 // PRÓXIMO CONTROL (más discreto)
+doc.moveDown(0.6);
 doc
   .font("Helvetica")
   .fontSize(8.5)
@@ -5853,6 +5945,74 @@ app.get("/pet-followups/:slug", async (req, res) => {
     return res.status(500).json({
       error: err.message || "Error obteniendo seguimientos",
     });
+  }
+});
+
+/* ======================================================
+   ✅ GET /clinical-notes/:slug
+   Notas clínicas veterinarias por mascota o appointment
+====================================================== */
+app.get("/clinical-notes/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { pet_id, appointment_id, from, to, limit = 50 } = req.query;
+
+    if (!slug) return res.status(400).json({ error: "slug requerido" });
+
+    const { data: tenant, error: tenantErr } = await supabase
+      .from("tenants")
+      .select("id, business_category")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantErr || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const vetCategories = ["veterinaria", "vet"];
+    if (!vetCategories.includes(String(tenant.business_category || "").toLowerCase())) {
+      return res.status(403).json({ error: "No disponible para este tipo de negocio" });
+    }
+
+    let query = supabase
+      .from("clinical_notes")
+      .select(`
+        id,
+        pet_id,
+        appointment_id,
+        staff_id,
+        date,
+        control_type,
+        reason,
+        diagnosis,
+        treatment,
+        observations,
+        next_control_at,
+        next_control_label,
+        created_at,
+        updated_at
+      `)
+      .eq("tenant_id", tenant.id)
+      .order("date", { ascending: false })
+      .limit(Number(limit));
+
+    if (pet_id)         query = query.eq("pet_id", pet_id);
+    if (appointment_id) query = query.eq("appointment_id", appointment_id);
+    if (from)           query = query.gte("date", from);
+    if (to)             query = query.lte("date", to);
+
+    const { data: notes, error: notesErr } = await query;
+
+    if (notesErr) {
+      console.error("[clinical-notes] query error:", notesErr.message);
+      return res.status(500).json({ error: "Error al obtener notas clínicas" });
+    }
+
+    return res.json({ notes: notes ?? [] });
+  } catch (err) {
+    console.error("[clinical-notes] unexpected error:", err.message);
+    return res.status(500).json({ error: "Error interno" });
   }
 });
 
@@ -6744,6 +6904,8 @@ app.post("/appointments/:id/close", async (req, res) => {
     const {
       control_type,
       control_note,
+      diagnosis,
+      treatment,
 next_control_mode = "none",
 next_control_exact_date = null,
 next_control_custom_value = null,
@@ -6767,6 +6929,7 @@ next_control_custom_unit = null,
       .select(`
         id,
         tenant_id,
+        branch_id,
         customer_id,
         pet_id,
         staff_id,
@@ -6857,6 +7020,26 @@ const nextControl = resolveNextControlDate({
 
     if (updateAppointmentError) {
       throw updateAppointmentError;
+    }
+
+    try {
+      await supabase.from("clinical_notes").insert({
+        tenant_id:          appointment.tenant_id,
+        branch_id:          appointment.branch_id ?? null,
+        pet_id:             appointment.pet_id,
+        appointment_id:     appointment.id,
+        staff_id:           appointment.staff_id ?? null,
+        date:               appointment.start_at.split("T")[0],
+        control_type:       normalizedControlType,
+        reason:             normalizedControlType,
+        diagnosis:          normalizeNullablePetText(diagnosis),
+        treatment:          normalizeNullablePetText(treatment),
+        observations:       normalizeNullablePetText(control_note),
+        next_control_at:    nextControl.next_control_at ?? null,
+        next_control_label: nextControl.next_control_label ?? null,
+      });
+    } catch (cnErr) {
+      console.error("[clinical_notes] insert failed on close:", cnErr.message);
     }
 
     return res.json({
@@ -8726,16 +8909,6 @@ if (!candidateStaffIds.length) {
         date,
       });
 
-      console.log("PUBLIC SLOTS effective availability", {
-        slug,
-        branch_id: resolvedBranchId,
-        service_id,
-        staff_id: currentStaffId,
-        staff_source: staffAvailability.source,
-        business_source: staffAvailability.debug?.business_source,
-        windows: staffAvailability.windows,
-      });
-
       let finalWindows = staffAvailability.windows;
 
       if (!isGroup) {
@@ -9336,5 +9509,524 @@ app.get("/api/pets/:slug", async (req, res) => {
   } catch (error) {
     console.error("Error pets:", error);
     res.status(500).json({ error: "Error interno" });
+  }
+});
+
+/* ======================================================
+   ✅ INVITACIONES — POST /invitations
+   Crea una invitación pendiente y envía email al invitado.
+   Body: { tenant_id, email, role, branch_id?, invited_by? }
+====================================================== */
+app.post("/invitations", async (req, res) => {
+  try {
+    const { tenant_id, email, role, branch_id, invited_by } = req.body;
+
+    if (!tenant_id || !email || !role) {
+      return res.status(400).json({ error: "Faltan campos: tenant_id, email, role" });
+    }
+
+    const validRoles = ["admin", "branch", "readonly"];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: "role inválido. Valores permitidos: admin, branch, readonly" });
+    }
+
+    if (role === "branch" && !branch_id) {
+      return res.status(400).json({ error: "branch_id es obligatorio para el rol branch" });
+    }
+
+    // Validar que el tenant existe y está activo
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, name, slug")
+      .eq("id", tenant_id)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    // Validar branch_id pertenece al tenant
+    if (role === "branch") {
+      const { data: branch, error: branchError } = await supabase
+        .from("branches")
+        .select("id")
+        .eq("id", branch_id)
+        .eq("tenant_id", tenant_id)
+        .single();
+
+      if (branchError || !branch) {
+        return res.status(404).json({ error: "Sucursal no encontrada en este tenant" });
+      }
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+
+    // Verificar que no existe invitación pending para este email en este tenant
+    const { data: existingInvitation } = await supabase
+      .from("tenant_invitations")
+      .select("id")
+      .eq("tenant_id", tenant_id)
+      .eq("email", normalizedEmail)
+      .eq("status", "pending")
+      .maybeSingle();
+
+    if (existingInvitation) {
+      return res.status(409).json({ error: "Ya existe una invitación pendiente para este email en este tenant" });
+    }
+
+    // Verificar que el email no es ya miembro activo
+    // Buscar el user_id correspondiente al email en auth.users
+    const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+    const matchingAuthUser = authList?.users?.find(
+      (u) => String(u.email || "").toLowerCase() === normalizedEmail
+    );
+
+    if (matchingAuthUser) {
+      const { data: existingMember } = await supabase
+        .from("tenant_users")
+        .select("id")
+        .eq("tenant_id", tenant_id)
+        .eq("user_id", matchingAuthUser.id)
+        .eq("is_active", true)
+        .maybeSingle();
+
+      if (existingMember) {
+        return res.status(409).json({ error: "Este email ya es miembro activo del tenant" });
+      }
+    }
+
+    // Generar token único
+    const token = crypto.randomBytes(32).toString("hex");
+
+    // expires_at = ahora + 7 días
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    const insertPayload = {
+      tenant_id,
+      email: normalizedEmail,
+      role,
+      token,
+      status: "pending",
+      expires_at: expiresAt,
+    };
+
+    if (branch_id) insertPayload.branch_id = branch_id;
+    if (invited_by) insertPayload.invited_by = invited_by;
+
+    const { data: invitation, error: insertError } = await supabase
+      .from("tenant_invitations")
+      .insert(insertPayload)
+      .select()
+      .single();
+
+    if (insertError) throw insertError;
+
+    // Enviar email de invitación (no bloquea respuesta si falla)
+    sendInvitationEmail({
+      email: normalizedEmail,
+      businessName: tenant.name,
+      role,
+      token,
+    }).catch((err) => console.error("sendInvitationEmail error:", err));
+
+    return res.status(201).json({ ok: true, invitation });
+  } catch (err) {
+    console.error("POST /invitations error:", err.message);
+    return res.status(500).json({ error: "Error creando invitación", detail: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ INVITACIONES — GET /invitations
+   Lista todas las invitaciones del tenant.
+   Query: { tenant_id }
+====================================================== */
+app.get("/invitations", async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    const { data: invitations, error } = await supabase
+      .from("tenant_invitations")
+      .select("id, email, role, branch_id, status, invited_by, expires_at, accepted_at, created_at")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    return res.json({ ok: true, invitations: invitations || [] });
+  } catch (err) {
+    console.error("GET /invitations error:", err.message);
+    return res.status(500).json({ error: "Error obteniendo invitaciones", detail: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ INVITACIONES — DELETE /invitations/:id
+   Cancela una invitación (cambia status a canceled, no elimina).
+   Body: { tenant_id }
+====================================================== */
+app.delete("/invitations/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tenant_id } = req.body;
+
+    if (!id || !tenant_id) {
+      return res.status(400).json({ error: "Faltan campos: id (param), tenant_id (body)" });
+    }
+
+    // Validar que la invitación pertenece al tenant
+    const { data: invitation, error: fetchError } = await supabase
+      .from("tenant_invitations")
+      .select("id, status")
+      .eq("id", id)
+      .eq("tenant_id", tenant_id)
+      .single();
+
+    if (fetchError || !invitation) {
+      return res.status(404).json({ error: "Invitación no encontrada en este tenant" });
+    }
+
+    if (invitation.status !== "pending") {
+      return res.status(400).json({ error: `No se puede cancelar una invitación con status: ${invitation.status}` });
+    }
+
+    const { error: updateError } = await supabase
+      .from("tenant_invitations")
+      .update({ status: "canceled" })
+      .eq("id", id);
+
+    if (updateError) throw updateError;
+
+    return res.json({ ok: true, message: "Invitación cancelada correctamente" });
+  } catch (err) {
+    console.error("DELETE /invitations/:id error:", err.message);
+    return res.status(500).json({ error: "Error cancelando invitación", detail: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ INVITACIONES — POST /invitations/accept/:token
+   Acepta una invitación: crea el miembro en tenant_users
+   y opcionalmente en branch_access si role === 'branch'.
+====================================================== */
+app.post("/invitations/accept/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    if (!token) {
+      return res.status(400).json({ error: "token es obligatorio" });
+    }
+
+    // Buscar invitación por token
+    const { data: invitation, error: fetchError } = await supabase
+      .from("tenant_invitations")
+      .select("id, tenant_id, branch_id, email, role, status, expires_at")
+      .eq("token", token)
+      .single();
+
+    if (fetchError || !invitation) {
+      return res.status(404).json({ error: "Token de invitación no válido" });
+    }
+
+    // Validar status
+    if (invitation.status !== "pending") {
+      return res.status(400).json({
+        error: `Esta invitación ya fue ${invitation.status === "accepted" ? "aceptada" : invitation.status}`,
+      });
+    }
+
+    // Validar expiración
+    const now = new Date();
+    const expiresAt = new Date(invitation.expires_at);
+    if (now > expiresAt) {
+      // Marcar como expirada
+      await supabase
+        .from("tenant_invitations")
+        .update({ status: "expired" })
+        .eq("id", invitation.id);
+
+      return res.status(410).json({ error: "Esta invitación ha expirado. Solicita una nueva al administrador." });
+    }
+
+    // Buscar usuario en auth.users por email
+    const normalizedEmail = String(invitation.email).toLowerCase();
+    const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+    const authUser = authList?.users?.find(
+      (u) => String(u.email || "").toLowerCase() === normalizedEmail
+    );
+
+    if (!authUser) {
+      return res.status(404).json({
+        error: "No existe una cuenta de Orbyx con este email. Crea tu cuenta primero y luego acepta la invitación.",
+        email: invitation.email,
+      });
+    }
+
+    // Verificar que no sea ya miembro activo
+    const { data: existingMember } = await supabase
+      .from("tenant_users")
+      .select("id")
+      .eq("tenant_id", invitation.tenant_id)
+      .eq("user_id", authUser.id)
+      .eq("is_active", true)
+      .maybeSingle();
+
+    if (existingMember) {
+      // Si ya es miembro, marcar invitación como aceptada igual y retornar ok
+      await supabase
+        .from("tenant_invitations")
+        .update({ status: "accepted", accepted_at: new Date().toISOString() })
+        .eq("id", invitation.id);
+
+      const { data: tenantData } = await supabase
+        .from("tenants")
+        .select("slug")
+        .eq("id", invitation.tenant_id)
+        .single();
+
+      return res.json({ ok: true, tenant_slug: tenantData?.slug, role: invitation.role });
+    }
+
+    // Insertar en tenant_users
+    const { error: memberError } = await supabase
+      .from("tenant_users")
+      .insert({
+        user_id: authUser.id,
+        tenant_id: invitation.tenant_id,
+        role: invitation.role,
+        is_active: true,
+      });
+
+    if (memberError) throw memberError;
+
+    // Si rol es branch, insertar en branch_access
+    if (invitation.role === "branch" && invitation.branch_id) {
+      const { error: branchAccessError } = await supabase
+        .from("branch_access")
+        .insert({
+          user_id: authUser.id,
+          tenant_id: invitation.tenant_id,
+          branch_id: invitation.branch_id,
+          role: "operator",
+          is_active: true,
+        });
+
+      if (branchAccessError) {
+        console.error("branch_access insert error:", branchAccessError.message);
+        // No lanzamos — el miembro ya fue creado, esto es secundario
+      }
+    }
+
+    // Marcar invitación como aceptada
+    await supabase
+      .from("tenant_invitations")
+      .update({ status: "accepted", accepted_at: new Date().toISOString() })
+      .eq("id", invitation.id);
+
+    // Obtener slug del tenant para redirección
+    const { data: tenantData } = await supabase
+      .from("tenants")
+      .select("slug")
+      .eq("id", invitation.tenant_id)
+      .single();
+
+    return res.json({ ok: true, tenant_slug: tenantData?.slug, role: invitation.role });
+  } catch (err) {
+    console.error("POST /invitations/accept/:token error:", err.message);
+    return res.status(500).json({ error: "Error aceptando invitación", detail: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ MIEMBROS — GET /members
+   Lista miembros activos del tenant con email y sucursal.
+   Query: { tenant_id }
+====================================================== */
+app.get("/members", async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    const { data: members, error: membersError } = await supabase
+      .from("tenant_users")
+      .select("id, user_id, tenant_id, role, is_active, created_at")
+      .eq("tenant_id", tenant_id)
+      .eq("is_active", true)
+      .order("created_at", { ascending: true });
+
+    if (membersError) throw membersError;
+
+    if (!members || members.length === 0) {
+      return res.json({ ok: true, members: [] });
+    }
+
+    // Obtener emails desde auth.users
+    const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+    const authUsersMap = {};
+    if (authList?.users) {
+      for (const u of authList.users) {
+        authUsersMap[u.id] = u.email || null;
+      }
+    }
+
+    // Obtener branch_access para miembros con rol branch
+    const branchMemberIds = members
+      .filter((m) => m.role === "branch")
+      .map((m) => m.user_id);
+
+    let branchAccessMap = {};
+    if (branchMemberIds.length > 0) {
+      const { data: branchAccesses } = await supabase
+        .from("branch_access")
+        .select("user_id, branch_id, role, branches(id, name)")
+        .eq("tenant_id", tenant_id)
+        .eq("is_active", true)
+        .in("user_id", branchMemberIds);
+
+      if (branchAccesses) {
+        for (const ba of branchAccesses) {
+          branchAccessMap[ba.user_id] = {
+            branch_id: ba.branch_id,
+            branch_role: ba.role,
+            branch_name: ba.branches?.name || null,
+          };
+        }
+      }
+    }
+
+    // Enriquecer cada miembro
+    const enrichedMembers = members.map((m) => ({
+      ...m,
+      email: authUsersMap[m.user_id] || null,
+      branch_access: m.role === "branch" ? (branchAccessMap[m.user_id] || null) : null,
+    }));
+
+    return res.json({ ok: true, members: enrichedMembers });
+  } catch (err) {
+    console.error("GET /members error:", err.message);
+    return res.status(500).json({ error: "Error obteniendo miembros", detail: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ MIEMBROS — PATCH /members/:id
+   Actualiza rol, branch_id o is_active de un miembro.
+   No permite modificar al owner.
+   Body: { tenant_id, role?, branch_id?, is_active? }
+====================================================== */
+app.patch("/members/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tenant_id, role, branch_id, is_active } = req.body;
+
+    if (!id || !tenant_id) {
+      return res.status(400).json({ error: "Faltan campos: id (param), tenant_id (body)" });
+    }
+
+    // Buscar el miembro
+    const { data: member, error: fetchError } = await supabase
+      .from("tenant_users")
+      .select("id, user_id, tenant_id, role, is_active")
+      .eq("id", id)
+      .eq("tenant_id", tenant_id)
+      .single();
+
+    if (fetchError || !member) {
+      return res.status(404).json({ error: "Miembro no encontrado en este tenant" });
+    }
+
+    // No permitir modificar al owner
+    if (member.role === "owner") {
+      return res.status(403).json({ error: "No se puede modificar al owner del tenant" });
+    }
+
+    const validRoles = ["admin", "branch", "readonly"];
+
+    if (role !== undefined && !validRoles.includes(role)) {
+      return res.status(400).json({ error: "role inválido. Valores permitidos: admin, branch, readonly" });
+    }
+
+    const newRole = role !== undefined ? role : member.role;
+
+    // Si el nuevo rol es branch, requerir branch_id
+    if (newRole === "branch" && !branch_id) {
+      return res.status(400).json({ error: "branch_id es obligatorio para el rol branch" });
+    }
+
+    // Validar branch_id pertenece al tenant si se proveyó
+    if (newRole === "branch" && branch_id) {
+      const { data: branch, error: branchError } = await supabase
+        .from("branches")
+        .select("id")
+        .eq("id", branch_id)
+        .eq("tenant_id", tenant_id)
+        .single();
+
+      if (branchError || !branch) {
+        return res.status(404).json({ error: "Sucursal no encontrada en este tenant" });
+      }
+    }
+
+    // Construir payload de actualización
+    const updatePayload = {};
+    if (role !== undefined) updatePayload.role = role;
+    if (is_active !== undefined) updatePayload.is_active = Boolean(is_active);
+
+    const { data: updated, error: updateError } = await supabase
+      .from("tenant_users")
+      .update(updatePayload)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (updateError) throw updateError;
+
+    // Gestionar branch_access si el rol es branch
+    if (newRole === "branch" && branch_id) {
+      const { data: existingAccess } = await supabase
+        .from("branch_access")
+        .select("id")
+        .eq("user_id", member.user_id)
+        .eq("tenant_id", tenant_id)
+        .maybeSingle();
+
+      if (existingAccess) {
+        await supabase
+          .from("branch_access")
+          .update({ branch_id, is_active: updatePayload.is_active ?? true })
+          .eq("id", existingAccess.id);
+      } else {
+        await supabase
+          .from("branch_access")
+          .insert({
+            user_id: member.user_id,
+            tenant_id,
+            branch_id,
+            role: "operator",
+            is_active: true,
+          });
+      }
+    }
+
+    // Si se desactiva el miembro, desactivar también su branch_access
+    if (updatePayload.is_active === false) {
+      await supabase
+        .from("branch_access")
+        .update({ is_active: false })
+        .eq("user_id", member.user_id)
+        .eq("tenant_id", tenant_id);
+    }
+
+    return res.json({ ok: true, member: updated });
+  } catch (err) {
+    console.error("PATCH /members/:id error:", err.message);
+    return res.status(500).json({ error: "Error actualizando miembro", detail: err.message });
   }
 });
