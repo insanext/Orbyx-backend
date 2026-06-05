@@ -7792,6 +7792,8 @@ app.patch("/tenants/:id", async (req, res) => {
       business_subtype_config,
       min_booking_notice_minutes,
       max_booking_days_ahead,
+      business_category,
+      business_subcategory,
     } = req.body;
 
     if (!id) {
@@ -7955,6 +7957,12 @@ app.patch("/tenants/:id", async (req, res) => {
         business_subtype_config: normalizedBusinessSubtypeConfig,
         min_booking_notice_minutes: normalizedMinBookingNoticeMinutes,
         max_booking_days_ahead: normalizedMaxBookingDaysAhead,
+        ...(business_category !== undefined && {
+          business_category: business_category ? String(business_category).trim().toLowerCase() : null,
+        }),
+        ...(business_subcategory !== undefined && {
+          business_subcategory: business_subcategory ? String(business_subcategory).trim().toLowerCase() : null,
+        }),
       })
       .eq("id", id)
       .select()
