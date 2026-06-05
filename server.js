@@ -5257,7 +5257,17 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
         .map((n) => [n.appointment_id, n])
     );
 
-    const doc = new PDFDocument({ margin: 48, size: "A4" });
+    // ── PALETA ────────────────────────────────────────────
+    const TEAL_DARK  = "#0F6E56";
+    const TEAL_MID   = "#1D9E75";
+    const TEAL_LIGHT = "#E1F5EE";
+    const SLATE_900  = "#0f172a";
+    const SLATE_600  = "#475569";
+    const SLATE_400  = "#94a3b8";
+    const SLATE_100  = "#f1f5f9";
+    const BORDER     = "#e2e8f0";
+
+    const doc = new PDFDocument({ margin: 40, size: "A4" });
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
@@ -5267,261 +5277,214 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
 
     doc.pipe(res);
 
-    const pageWidth = doc.page.width;
-    const left = 48;
-    const right = pageWidth - 48;
-    const contentWidth = right - left;
+    const PAGE_W = doc.page.width;
+    const PAGE_H = doc.page.height;
+    const L  = 40;
+    const R  = PAGE_W - 40;
+    const CW = R - L;
 
     function formatLongDate(value) {
-      if (!value) return "No definido";
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return "No definido";
-
-      return date.toLocaleDateString("es-CL", {
-        weekday: "long",
-        day: "numeric",
-        month: "long",
-        year: "numeric",
+      if (!value) return "—";
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return "—";
+      const s = d.toLocaleDateString("es-CL", {
+        weekday: "long", day: "numeric", month: "long", year: "numeric",
       });
+      return s.charAt(0).toUpperCase() + s.slice(1);
     }
 
-    function safe(value) {
-      return String(value || "").trim();
+    // ── HELPER: sección label + línea ─────────────────────
+    function drawSectionLabel(title, y) {
+      doc.font("Helvetica-Bold").fontSize(8).fillColor(SLATE_400)
+        .text(title.toUpperCase(), L, y, { width: CW });
+      doc.moveTo(L, y + 12).lineTo(R, y + 12)
+        .strokeColor(BORDER).lineWidth(0.5).stroke();
+      return y + 20;
     }
 
-    function drawSectionTitle(title) {
-      doc.moveDown(1);
-      doc.font("Helvetica-Bold").fontSize(11).fillColor("#0f172a").text(String(title).toUpperCase());
-      doc.moveDown(0.35);
-      doc.moveTo(left, doc.y).lineTo(right, doc.y).strokeColor("#e2e8f0").stroke();
-      doc.moveDown(0.7);
-    }
-
-    function drawInfoGrid(items) {
-      const cleanItems = items.filter((item) => item.value);
-      const colWidth = contentWidth / 2 - 8;
-      let startY = doc.y;
-
-      cleanItems.forEach((item, index) => {
-        const col = index % 2;
-        const row = Math.floor(index / 2);
-        const x = left + col * (colWidth + 16);
-        const y = startY + row * 42;
-
-        doc
-          .roundedRect(x, y, colWidth, 32, 4)
-          .fillAndStroke("#ffffff", "#cbd5e1");
-
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(7)
-          .fillColor("#64748b")
-          .text(item.label.toUpperCase(), x + 10, y + 7, { width: colWidth - 20 });
-
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(9.5)
-          .fillColor("#0f172a")
-          .text(item.value, x + 10, y + 18, { width: colWidth - 20 });
+    // ── HELPER: fila de 3 columnas ─────────────────────────
+    function draw3ColRow(items, y) {
+      const gap  = 6;
+      const colW = Math.floor((CW - gap * 2) / 3);
+      items.forEach((item, i) => {
+        const x = L + i * (colW + gap);
+        doc.font("Helvetica").fontSize(8).fillColor(SLATE_400)
+          .text(String(item.label), x, y, { width: colW });
+        doc.font("Helvetica-Bold").fontSize(10).fillColor(SLATE_900)
+          .text(String(item.value || "—"), x, y + 12, { width: colW });
       });
-
-      doc.y = startY + Math.ceil(cleanItems.length / 2) * 42;
+      return y + 30;
     }
 
-    // Header
-    doc
-      .moveTo(left, 112)
-      .lineTo(right, 112)
-      .strokeColor("#cbd5e1")
-      .lineWidth(1)
-      .stroke();
+    // ── HEADER BAND ───────────────────────────────────────
+    doc.rect(0, 0, PAGE_W, 56).fill(TEAL_DARK);
+    doc.font("Helvetica-Bold").fontSize(16).fillColor("#ffffff")
+      .text("Ficha clínica veterinaria", L, 16, { width: CW });
+    doc.font("Helvetica").fontSize(9).fillColor("rgba(255,255,255,0.75)")
+      .text(tenant.name || "Veterinaria", L, 36, { width: CW });
 
-    doc
-      .font("Helvetica-Bold")
-      .fontSize(21)
-      .fillColor("#0f172a")
-      .text("Ficha clínica veterinaria", left + 24, 58);
+    // ── METADATA ──────────────────────────────────────────
+    const todayStr = new Date().toLocaleDateString("es-CL");
+    doc.font("Helvetica").fontSize(8).fillColor(SLATE_400)
+      .text(`Fecha de emisión: ${todayStr}`, L, 66);
+    doc.font("Helvetica").fontSize(8).fillColor(SLATE_400)
+      .text("Generado por Orbyx", L, 66, { width: CW, align: "right" });
 
-    doc
-      .font("Helvetica")
-      .fontSize(10)
-      .fillColor("#475569")
-      .text(tenant.name || "Veterinaria", left + 24, 88);
-
-    doc
-      .font("Helvetica")
-      .fontSize(9)
-      .fillColor("#64748b")
-      .text(`Fecha de emisión: ${new Date().toLocaleDateString("es-CL")}`, left + 24, 106);
-
-    doc.y = 140;
-
-    drawSectionTitle("Cliente");
-    drawInfoGrid([
-      { label: "Nombre", value: customer?.name },
+    // ── SECCIÓN CLIENTE ───────────────────────────────────
+    let curY = drawSectionLabel("Cliente", 82);
+    curY = draw3ColRow([
+      { label: "Nombre",   value: customer?.name },
       { label: "Teléfono", value: customer?.phone },
-      { label: "Email", value: customer?.email },
-    ]);
+      { label: "Email",    value: customer?.email },
+    ], curY);
 
-    drawSectionTitle("Mascota");
-    drawInfoGrid([
-      { label: "Nombre", value: pet.name },
-      {
-        label: "Especie",
-        value:
-          pet.species_base === "otro"
-            ? pet.species_custom || "Otro"
-            : pet.species_base,
-      },
-      { label: "Raza", value: pet.breed },
-      { label: "Sexo", value: pet.sex },
-      { label: "Peso", value: pet.weight_kg ? `${pet.weight_kg} kg` : "" },
+    curY += 10;
+
+    // ── SECCIÓN MASCOTA ───────────────────────────────────
+    curY = drawSectionLabel("Mascota", curY);
+    const speciesLabel =
+      pet.species_base === "otro" ? (pet.species_custom || "Otro") : pet.species_base;
+    curY = draw3ColRow([
+      { label: "Nombre",  value: pet.name },
+      { label: "Especie", value: speciesLabel },
+      { label: "Raza",    value: pet.breed },
+    ], curY);
+    curY = draw3ColRow([
+      { label: "Sexo",        value: pet.sex },
+      { label: "Peso",        value: pet.weight_kg ? `${pet.weight_kg} kg` : null },
       { label: "Esterilizado", value: pet.is_sterilized ? "Sí" : "No" },
-    ]);
+    ], curY);
 
-    drawSectionTitle("Historial clínico");
+    curY += 10;
+
+    // ── HISTORIAL CLÍNICO ─────────────────────────────────
+    curY = drawSectionLabel("Historial clínico", curY);
 
     if (!appointments || appointments.length === 0) {
-      doc
-        .roundedRect(left, doc.y, contentWidth, 52, 12)
-        .fillAndStroke("#f8fafc", "#e2e8f0");
-
-      doc
-        .font("Helvetica")
-        .fontSize(10)
-        .fillColor("#64748b")
-        .text("Sin atenciones registradas.", left + 16, doc.y + 18);
+      doc.roundedRect(L, curY, CW, 40, 4).fill(SLATE_100);
+      doc.font("Helvetica").fontSize(10).fillColor(SLATE_400)
+        .text("Sin atenciones registradas.", L + 16, curY + 14, { width: CW - 32 });
+      curY += 52;
     } else {
       for (const appt of appointments) {
-        if (doc.y > 680) {
+        if (curY > PAGE_H - 110) {
           doc.addPage();
-          doc.y = 42;
+          doc.rect(0, 0, PAGE_W, 8).fill(TEAL_DARK);
+          curY = 24;
         }
 
-        const clinNote = clinicalNotesMap[appt.id];
-        const cardY = doc.y;
-        const reasonText = appt.reason || "Sin motivo registrado";
-        const noteText = clinNote?.observations || appt.notes || "Sin notas clínicas.";
-        const diagText = clinNote?.diagnosis || "";
-        const treatText = clinNote?.treatment || "";
-        const reasonHeight = doc.heightOfString(reasonText, { width: contentWidth - 206 });
-        const noteHeight = doc.heightOfString(noteText, { width: contentWidth - 206 });
-        const diagHeight = diagText ? doc.heightOfString(diagText, { width: contentWidth - 206 }) : 0;
-        const treatHeight = treatText ? doc.heightOfString(treatText, { width: contentWidth - 206 }) : 0;
-        const cardHeight = Math.max(120, 64 + reasonHeight + noteHeight + (diagText ? diagHeight + 22 : 0) + (treatText ? treatHeight + 22 : 0) + 28);
+        const clinNote    = clinicalNotesMap[appt.id];
+        const reasonText  = appt.reason || "";
+        const noteText    = clinNote?.observations || appt.notes || "";
+        const diagText    = clinNote?.diagnosis || "";
+        const treatText   = clinNote?.treatment  || "";
+        const controlType = clinNote?.control_type || appt.service_name_snapshot || "Atención";
+        const hasNextCtrl = !!(appt.next_control_at);
 
-        doc
-          .moveTo(left, cardY)
-          .lineTo(right, cardY)
-          .strokeColor("#e2e8f0")
-          .lineWidth(0.8)
-          .stroke();
+        const colHalf = Math.floor((CW - 28) / 2);
 
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(9.5)
-          .fillColor("#0f172a")
-          .text(formatLongDate(appt.start_at), left + 16, cardY + 16, {
-            width: 150,
-          });
+        // Medir alturas
+        const rH  = reasonText ? doc.heightOfString(reasonText, { width: CW - 24 }) : 0;
+        const nH  = noteText   ? doc.heightOfString(noteText,   { width: CW - 24 }) : 0;
+        const dH  = diagText   ? doc.heightOfString(diagText,   { width: colHalf  }) : 0;
+        const tH  = treatText  ? doc.heightOfString(treatText,  { width: colHalf  }) : 0;
+        const dnH = (diagText || treatText) ? Math.max(dH, tH) + 26 : 0;
+        const ctH = hasNextCtrl ? 20 : 0;
 
-        doc
-          .font("Helvetica")
-          .fontSize(8.5)
-          .fillColor("#64748b")
-          .text(appt.service_name_snapshot || "Atención", left + 16, cardY + 33, {
-            width: 150,
-          });
+        const innerH = 30
+          + (rH  ? rH  + 6  : 0)
+          + (nH  ? nH  + 22 : 0)
+          + dnH
+          + ctH
+          + 12;
+        const cardH = Math.max(52, innerH);
 
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(10)
-          .fillColor("#0f172a")
-          .text(reasonText, left + 190, cardY + 16, {
-            width: contentWidth - 206,
-          });
+        // Fondo tarjeta
+        doc.roundedRect(L, curY, CW, cardH, 4).fill(SLATE_100);
 
-        // NOTAS CLÍNICAS
-	doc
- 	 .font("Helvetica-Bold")
-  	.fontSize(8)
- 	 .fillColor("#64748b")
-  	.text("NOTAS CLÍNICAS", left + 190, cardY + 34);
+        // Barra de acento izquierda
+        const accentColor =
+          controlType === "Vacuna"          ? SLATE_400 :
+          controlType === "Desparasitación" ? "#EF9F27"  :
+          TEAL_MID;
+        doc.rect(L, curY, 3, cardH).fill(accentColor);
 
-	doc
-  	.moveDown(0.3);
+        let rowY = curY + 10;
 
-	doc
-  	.font("Helvetica")
-  	.fontSize(9.5)
-  	.fillColor("#334155")
-  	.text(noteText, left + 190, doc.y, {
-   	 width: contentWidth - 206,
-  	});
+        // ── Fila superior: fecha + badge tipo ──
+        doc.font("Helvetica-Bold").fontSize(9).fillColor(SLATE_900)
+          .text(formatLongDate(appt.start_at), L + 10, rowY, { width: CW - 100 });
 
-// ESPACIO
-doc.moveDown(0.6);
+        const badgeText = String(controlType).slice(0, 24);
+        const badgeW    = Math.min(
+          doc.widthOfString(badgeText, { fontSize: 8, font: "Helvetica" }) + 14,
+          120
+        );
+        doc.roundedRect(R - badgeW - 4, rowY - 2, badgeW, 14, 3).fill(TEAL_LIGHT);
+        doc.font("Helvetica").fontSize(8).fillColor(TEAL_DARK)
+          .text(badgeText, R - badgeW + 3, rowY, { width: badgeW - 6 });
 
-        if (diagText) {
-          doc.moveDown(0.5);
-          doc
-            .font("Helvetica-Bold")
-            .fontSize(8)
-            .fillColor("#64748b")
-            .text("DIAGNÓSTICO", left + 190, doc.y);
-          doc.moveDown(0.3);
-          doc
-            .font("Helvetica")
-            .fontSize(9.5)
-            .fillColor("#334155")
-            .text(diagText, left + 190, doc.y, { width: contentWidth - 206 });
+        rowY += 18;
+
+        // ── Motivo ──
+        if (reasonText) {
+          doc.font("Helvetica-Bold").fontSize(10).fillColor(SLATE_900)
+            .text(reasonText, L + 10, rowY, { width: CW - 24 });
+          rowY += rH + 8;
         }
 
-        if (treatText) {
-          doc.moveDown(0.5);
-          doc
-            .font("Helvetica-Bold")
-            .fontSize(8)
-            .fillColor("#64748b")
-            .text("TRATAMIENTO", left + 190, doc.y);
-          doc.moveDown(0.3);
-          doc
-            .font("Helvetica")
-            .fontSize(9.5)
-            .fillColor("#334155")
-            .text(treatText, left + 190, doc.y, { width: contentWidth - 206 });
+        // ── Diagnóstico + Tratamiento en 2 columnas ──
+        if (diagText || treatText) {
+          if (diagText) {
+            doc.font("Helvetica").fontSize(7.5).fillColor(SLATE_400)
+              .text("DIAGNÓSTICO", L + 10, rowY, { width: colHalf });
+            doc.font("Helvetica").fontSize(9).fillColor(SLATE_600)
+              .text(diagText, L + 10, rowY + 12, { width: colHalf });
+          }
+          if (treatText) {
+            const tx = diagText ? L + 14 + colHalf : L + 10;
+            doc.font("Helvetica").fontSize(7.5).fillColor(SLATE_400)
+              .text("TRATAMIENTO", tx, rowY, { width: colHalf });
+            doc.font("Helvetica").fontSize(9).fillColor(SLATE_600)
+              .text(treatText, tx, rowY + 12, { width: colHalf });
+          }
+          rowY += Math.max(dH, tH) + 26;
         }
 
-// PRÓXIMO CONTROL (más discreto)
-doc.moveDown(0.6);
-doc
-  .font("Helvetica")
-  .fontSize(8.5)
-  .fillColor("#64748b")
-  .text(
-    `Próximo control: ${
-      appt.next_control_at
-        ? formatLongDate(appt.next_control_at)
-        : "No definido"
-    }`,
-    left + 190,
-    doc.y,
-    { width: contentWidth - 206 }
-    );
+        // ── Observaciones ──
+        if (noteText) {
+          doc.font("Helvetica").fontSize(7.5).fillColor(SLATE_400)
+            .text("OBSERVACIONES", L + 10, rowY, { width: CW - 24 });
+          rowY += 12;
+          doc.font("Helvetica").fontSize(9).fillColor(SLATE_600)
+            .text(noteText, L + 10, rowY, { width: CW - 24 });
+          rowY += nH + 8;
+        }
 
-        doc.y = cardY + cardHeight + 14;
+        // ── Próximo control ──
+        if (hasNextCtrl) {
+          const ctrlStr = `Próximo control: ${formatLongDate(appt.next_control_at)}`;
+          const ctrlW   = Math.min(
+            doc.widthOfString(ctrlStr, { fontSize: 8, font: "Helvetica" }) + 16,
+            CW - 20
+          );
+          doc.roundedRect(L + 10, rowY, ctrlW, 14, 3).fill(TEAL_LIGHT);
+          doc.font("Helvetica").fontSize(8).fillColor(TEAL_DARK)
+            .text(ctrlStr, L + 17, rowY + 3, { width: ctrlW - 14 });
+        }
+
+        curY += cardH + 8;
       }
     }
 
-    doc
-      .font("Helvetica")
-      .fontSize(7.5)
-      .fillColor("#94a3b8")
+    // ── FOOTER ────────────────────────────────────────────
+    doc.moveTo(L, PAGE_H - 28).lineTo(R, PAGE_H - 28)
+      .strokeColor(BORDER).lineWidth(0.5).stroke();
+    doc.font("Helvetica").fontSize(7.5).fillColor(SLATE_400)
       .text(
         `Documento generado por Orbyx · ${tenant.name || "Veterinaria"}`,
-        left,
-        doc.page.height - 34,
-        { width: contentWidth, align: "center" }
+        L, PAGE_H - 22,
+        { width: CW, align: "center" }
       );
 
     doc.end();
