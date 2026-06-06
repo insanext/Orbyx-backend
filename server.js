@@ -7159,6 +7159,7 @@ const nextControl = resolveNextControlDate({
     reason: normalizedControlType,
     notes: normalizeNullablePetText(control_note),
     next_control_at: nextControl.next_control_at,
+    clinical_note_pending: false,
   })
       .eq("id", appointment.id)
       .select("*")
@@ -7196,6 +7197,93 @@ const nextControl = resolveNextControlDate({
   } catch (err) {
     console.error("POST /appointments/:id/close error:", err.message);
     return res.status(500).json({ error: err.message || "Error cerrando atención" });
+  }
+});
+
+/* ======================================================
+   ✅ GET /appointments/clinical-pending/:slug
+====================================================== */
+app.get("/appointments/clinical-pending/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { branch_id, staff_id } = req.query;
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    let query = supabase
+      .from("appointments")
+      .select("*")
+      .eq("tenant_id", tenant.id)
+      .eq("status", "completed")
+      .eq("clinical_note_pending", true)
+      .order("start_at", { ascending: false });
+
+    if (branch_id) query = query.eq("branch_id", branch_id);
+    if (staff_id) query = query.eq("staff_id", staff_id);
+
+    const { data, error } = await query;
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    return res.json({ total: data?.length || 0, appointments: data || [] });
+  } catch (error) {
+    console.error("Error en /appointments/clinical-pending/:slug", error);
+    return res.status(500).json({ error: "Error obteniendo fichas pendientes" });
+  }
+});
+
+/* ======================================================
+   ✅ PATCH /appointments/:id/clinical-pending
+====================================================== */
+app.patch("/appointments/:id/clinical-pending", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { pending, slug } = req.body || {};
+
+    if (!id || typeof pending !== "boolean" || !slug) {
+      return res.status(400).json({ error: "id, pending y slug son obligatorios" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data: appointment, error: appointmentError } = await supabase
+      .from("appointments")
+      .select("id, tenant_id")
+      .eq("id", id)
+      .eq("tenant_id", tenant.id)
+      .single();
+
+    if (appointmentError || !appointment) {
+      return res.status(404).json({ error: "Reserva no encontrada" });
+    }
+
+    const { error: updateError } = await supabase
+      .from("appointments")
+      .update({ clinical_note_pending: pending })
+      .eq("id", id);
+
+    if (updateError) throw updateError;
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PATCH /appointments/:id/clinical-pending error:", err.message);
+    return res.status(500).json({ error: err.message || "Error actualizando ficha pendiente" });
   }
 });
 
