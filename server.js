@@ -5772,7 +5772,24 @@ const isInactive =
 ====================================================== */
 app.post("/customers", async (req, res) => {
   try {
-    const { slug, name, phone, email, rut, birth_date, sex, intake_notes } = req.body || {};
+    const {
+      slug,
+      name,
+      phone,
+      email,
+      rut,
+      birth_date,
+      sex,
+      intake_notes,
+      occupation,
+      health_insurance,
+      emergency_contact_name,
+      emergency_contact_phone,
+      known_allergies,
+      chronic_conditions,
+      family_history,
+      habits,
+    } = req.body || {};
 
     if (!slug) return res.status(400).json({ error: "slug es obligatorio" });
     if (!name || !String(name).trim()) return res.status(400).json({ error: "name es obligatorio" });
@@ -5800,6 +5817,14 @@ app.post("/customers", async (req, res) => {
       birth_date: normalizedBirthDate,
       sex: sex ? String(sex).trim() : null,
       intake_notes: intake_notes ? String(intake_notes).trim() : null,
+      occupation: occupation ? String(occupation).trim() : null,
+      health_insurance: health_insurance ? String(health_insurance).trim() : null,
+      emergency_contact_name: emergency_contact_name ? String(emergency_contact_name).trim() : null,
+      emergency_contact_phone: emergency_contact_phone ? String(emergency_contact_phone).trim() : null,
+      known_allergies: known_allergies ? String(known_allergies).trim() : null,
+      chronic_conditions: chronic_conditions ? String(chronic_conditions).trim() : null,
+      family_history: family_history ? String(family_history).trim() : null,
+      habits: habits ? String(habits).trim() : null,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
@@ -5822,7 +5847,24 @@ app.post("/customers", async (req, res) => {
 app.patch("/customers/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { slug, name, phone, email, rut, birth_date } = req.body;
+    const {
+      slug,
+      name,
+      phone,
+      email,
+      rut,
+      birth_date,
+      sex,
+      intake_notes,
+      occupation,
+      health_insurance,
+      emergency_contact_name,
+      emergency_contact_phone,
+      known_allergies,
+      chronic_conditions,
+      family_history,
+      habits,
+    } = req.body;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
@@ -5867,6 +5909,16 @@ app.patch("/customers/:id", async (req, res) => {
       email: email ? String(email).trim() : null,
       rut: rut ? String(rut).trim() : null,
       birth_date: normalizedBirthDate,
+      sex: sex ? String(sex).trim() : null,
+      intake_notes: intake_notes ? String(intake_notes).trim() : null,
+      occupation: occupation ? String(occupation).trim() : null,
+      health_insurance: health_insurance ? String(health_insurance).trim() : null,
+      emergency_contact_name: emergency_contact_name ? String(emergency_contact_name).trim() : null,
+      emergency_contact_phone: emergency_contact_phone ? String(emergency_contact_phone).trim() : null,
+      known_allergies: known_allergies ? String(known_allergies).trim() : null,
+      chronic_conditions: chronic_conditions ? String(chronic_conditions).trim() : null,
+      family_history: family_history ? String(family_history).trim() : null,
+      habits: habits ? String(habits).trim() : null,
       updated_at: new Date().toISOString(),
     };
 
