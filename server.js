@@ -4479,6 +4479,10 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
       notes,
       diagnosis,
       treatment,
+      symptoms,
+      medications,
+      referrals,
+      follow_up_notes,
       control_type,
       control_note,
       next_control_at,
@@ -4527,29 +4531,37 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
         await supabase
           .from("clinical_notes")
           .update({
-            reason:          normalizedReason ?? null,
-            diagnosis:       normalizeNullablePetText(diagnosis),
-            treatment:       normalizeNullablePetText(treatment),
-            observations:    normalizedNotes ?? null,
-            next_control_at: next_control_at ?? null,
-            updated_at:      new Date().toISOString(),
+            reason:           normalizedReason ?? null,
+            diagnosis:        normalizeNullablePetText(diagnosis),
+            treatment:        normalizeNullablePetText(treatment),
+            symptoms:         String(symptoms || "").trim() || null,
+            medications:      String(medications || "").trim() || null,
+            referrals:        String(referrals || "").trim() || null,
+            follow_up_notes:  String(follow_up_notes || "").trim() || null,
+            observations:     normalizedNotes ?? null,
+            next_control_at:  next_control_at ?? null,
+            updated_at:       new Date().toISOString(),
           })
           .eq("id", existingNote.id);
       } else if (appointment.pet_id) {
         await supabase.from("clinical_notes").insert({
-          tenant_id:       appointment.tenant_id,
-          branch_id:       appointment.branch_id ?? null,
-          pet_id:          appointment.pet_id,
-          appointment_id:  id,
-          staff_id:        appointment.staff_id ?? null,
-          date:            appointment.start_at
-                             ? appointment.start_at.split("T")[0]
-                             : new Date().toISOString().split("T")[0],
-          reason:          normalizedReason ?? null,
-          diagnosis:       normalizeNullablePetText(diagnosis),
-          treatment:       normalizeNullablePetText(treatment),
-          observations:    normalizedNotes ?? null,
-          next_control_at: next_control_at ?? null,
+          tenant_id:        appointment.tenant_id,
+          branch_id:        appointment.branch_id ?? null,
+          pet_id:           appointment.pet_id,
+          appointment_id:   id,
+          staff_id:         appointment.staff_id ?? null,
+          date:             appointment.start_at
+                              ? appointment.start_at.split("T")[0]
+                              : new Date().toISOString().split("T")[0],
+          reason:           normalizedReason ?? null,
+          diagnosis:        normalizeNullablePetText(diagnosis),
+          treatment:        normalizeNullablePetText(treatment),
+          symptoms:         String(symptoms || "").trim() || null,
+          medications:      String(medications || "").trim() || null,
+          referrals:        String(referrals || "").trim() || null,
+          follow_up_notes:  String(follow_up_notes || "").trim() || null,
+          observations:     normalizedNotes ?? null,
+          next_control_at:  next_control_at ?? null,
         });
       }
     } catch (cnErr) {
@@ -6083,6 +6095,96 @@ app.get("/pet-followups/:slug", async (req, res) => {
     return res.status(500).json({
       error: err.message || "Error obteniendo seguimientos",
     });
+  }
+});
+
+/* ======================================================
+   ✅ POST /clinical-notes/:slug
+====================================================== */
+app.post("/clinical-notes/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const {
+      customer_id,
+      branch_id,
+      date,
+      control_type,
+      reason,
+      symptoms,
+      diagnosis,
+      treatment,
+      medications,
+      referrals,
+      observations,
+      follow_up_notes,
+      next_control_at,
+      next_control_label,
+      staff_id,
+    } = req.body || {};
+
+    if (!slug) return res.status(400).json({ error: "slug requerido" });
+    if (!customer_id) return res.status(400).json({ error: "customer_id es obligatorio" });
+    if (!date) return res.status(400).json({ error: "date es obligatorio" });
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data: customer, error: customerError } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("id", customer_id)
+      .eq("tenant_id", tenant.id)
+      .single();
+
+    if (customerError || !customer) {
+      return res.status(404).json({ error: "Cliente no encontrado para este negocio" });
+    }
+
+    const n = (v) => String(v || "").trim() || null;
+
+    const payload = {
+      tenant_id:          tenant.id,
+      branch_id:          n(branch_id),
+      customer_id,
+      pet_id:             null,
+      appointment_id:     null,
+      staff_id:           n(staff_id),
+      date:               String(date).trim(),
+      control_type:       n(control_type),
+      reason:             n(reason),
+      symptoms:           n(symptoms),
+      diagnosis:          n(diagnosis),
+      treatment:          n(treatment),
+      medications:        n(medications),
+      referrals:          n(referrals),
+      observations:       n(observations),
+      follow_up_notes:    n(follow_up_notes),
+      next_control_at:    n(next_control_at),
+      next_control_label: n(next_control_label),
+      created_at:         new Date().toISOString(),
+      updated_at:         new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from("clinical_notes")
+      .insert(payload)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.status(201).json({ ok: true, note: data });
+  } catch (err) {
+    console.error("POST /clinical-notes/:slug error:", err.message);
+    return res.status(500).json({ error: err.message || "Error creando nota clínica" });
   }
 });
 
