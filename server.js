@@ -5767,6 +5767,58 @@ const isInactive =
    ✅ PATCH /customers/:id
    Editar datos de un cliente existente
 ====================================================== */
+/* ======================================================
+   ✅ POST /customers
+====================================================== */
+app.post("/customers", async (req, res) => {
+  try {
+    const { slug, name, phone, email, rut, birth_date, sex, intake_notes } = req.body || {};
+
+    if (!slug) return res.status(400).json({ error: "slug es obligatorio" });
+    if (!name || !String(name).trim()) return res.status(400).json({ error: "name es obligatorio" });
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const normalizedBirthDate =
+      birth_date && String(birth_date).trim() ? String(birth_date).trim() : null;
+
+    const payload = {
+      tenant_id: tenant.id,
+      name: String(name).trim(),
+      phone: phone ? String(phone).trim() : null,
+      email: email ? String(email).trim() : null,
+      rut: rut ? String(rut).trim() : null,
+      birth_date: normalizedBirthDate,
+      sex: sex ? String(sex).trim() : null,
+      intake_notes: intake_notes ? String(intake_notes).trim() : null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from("customers")
+      .insert(payload)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.status(201).json({ ok: true, customer: data });
+  } catch (err) {
+    console.error("POST /customers error:", err.message);
+    return res.status(500).json({ error: err.message || "Error creando cliente" });
+  }
+});
+
 app.patch("/customers/:id", async (req, res) => {
   try {
     const { id } = req.params;
