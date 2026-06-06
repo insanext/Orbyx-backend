@@ -5763,6 +5763,77 @@ const isInactive =
   }
 });
 
+/* ======================================================
+   ✅ PATCH /customers/:id
+   Editar datos de un cliente existente
+====================================================== */
+app.patch("/customers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { slug, name, phone, email, rut, birth_date } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+    if (!id) {
+      return res.status(400).json({ error: "id es obligatorio" });
+    }
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "name es obligatorio" });
+    }
+
+    // Validar tenant por slug
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    // Validar ownership: el customer debe pertenecer al tenant
+    const { data: existing, error: existingError } = await supabase
+      .from("customers")
+      .select("id, tenant_id")
+      .eq("id", id)
+      .eq("tenant_id", tenant.id)
+      .single();
+
+    if (existingError || !existing) {
+      return res.status(404).json({ error: "Cliente no encontrado para este negocio" });
+    }
+
+    const normalizedBirthDate =
+      birth_date && String(birth_date).trim() ? String(birth_date).trim() : null;
+
+    const payload = {
+      name: String(name).trim(),
+      phone: phone ? String(phone).trim() : null,
+      email: email ? String(email).trim() : null,
+      rut: rut ? String(rut).trim() : null,
+      birth_date: normalizedBirthDate,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from("customers")
+      .update(payload)
+      .eq("id", id)
+      .eq("tenant_id", tenant.id)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    return res.status(200).json({ ok: true, customer: data });
+  } catch (err) {
+    console.error("PATCH /customers/:id error:", err.message);
+    return res.status(500).json({ error: err.message || "Error actualizando cliente" });
+  }
+});
 
 /* ======================================================
    ✅ GET /pets/:slug
