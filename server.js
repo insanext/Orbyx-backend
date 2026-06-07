@@ -6200,7 +6200,7 @@ app.post("/clinical-notes/:slug", async (req, res) => {
 app.get("/clinical-notes/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
-    const { pet_id, appointment_id, from, to, limit = 50 } = req.query;
+    const { pet_id, appointment_id, customer_id, from, to, limit = 50 } = req.query;
 
     if (!slug) return res.status(400).json({ error: "slug requerido" });
 
@@ -6232,6 +6232,10 @@ app.get("/clinical-notes/:slug", async (req, res) => {
         reason,
         diagnosis,
         treatment,
+        symptoms,
+        medications,
+        referrals,
+        follow_up_notes,
         observations,
         next_control_at,
         next_control_label,
@@ -6244,6 +6248,16 @@ app.get("/clinical-notes/:slug", async (req, res) => {
 
     if (pet_id)         query = query.eq("pet_id", pet_id);
     if (appointment_id) query = query.eq("appointment_id", appointment_id);
+    if (customer_id) {
+      const { data: customerAppts } = await supabase
+        .from("appointments")
+        .select("id")
+        .eq("tenant_id", tenant.id)
+        .eq("customer_id", customer_id);
+      const apptIds = (customerAppts || []).map((a) => a.id);
+      if (apptIds.length === 0) return res.json({ notes: [] });
+      query = query.in("appointment_id", apptIds);
+    }
     if (from)           query = query.gte("date", from);
     if (to)             query = query.lte("date", to);
 
