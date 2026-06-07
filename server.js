@@ -6251,6 +6251,7 @@ app.get("/clinical-notes/:slug", async (req, res) => {
         observations,
         next_control_at,
         next_control_label,
+        extra_fields,
         created_at,
         updated_at
       `)
