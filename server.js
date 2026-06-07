@@ -4529,7 +4529,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
         .maybeSingle();
 
       if (existingNote) {
-        await supabase
+        const { error: updateErr } = await supabase
           .from("clinical_notes")
           .update({
             reason:              normalizedReason ?? null,
@@ -4546,8 +4546,9 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
             updated_at:          new Date().toISOString(),
           })
           .eq("id", existingNote.id);
+        if (updateErr) console.error("[clinical_notes] update error:", updateErr.message);
       } else {
-        await supabase.from("clinical_notes").insert({
+        const { error: insertErr } = await supabase.from("clinical_notes").insert({
           tenant_id:           appointment.tenant_id,
           branch_id:           appointment.branch_id ?? null,
           pet_id:              appointment.pet_id || null,
@@ -4568,6 +4569,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
           next_control_label:  String(next_control_label || "").trim() || null,
           control_type:        String(control_type || "").trim() || null,
         });
+        if (insertErr) console.error("[clinical_notes] insert error:", insertErr.message);
       }
     } catch (cnErr) {
       console.error("[clinical_notes] upsert failed on clinical patch:", cnErr.message);
