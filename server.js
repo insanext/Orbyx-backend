@@ -4521,13 +4521,13 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    let clinicalNoteError = null;
     try {
       const { data: existingNote } = await supabase
         .from("clinical_notes")
         .select("id")
         .eq("appointment_id", id)
         .maybeSingle();
-
       if (existingNote) {
         const { error: updateErr } = await supabase
           .from("clinical_notes")
@@ -4546,7 +4546,10 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
             updated_at:          new Date().toISOString(),
           })
           .eq("id", existingNote.id);
-        if (updateErr) console.error("[clinical_notes] update error:", updateErr.message);
+        if (updateErr) {
+          console.error("[clinical_notes] update error:", updateErr.message);
+          clinicalNoteError = updateErr.message;
+        }
       } else {
         const { error: insertErr } = await supabase.from("clinical_notes").insert({
           tenant_id:           appointment.tenant_id,
@@ -4569,7 +4572,10 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
           next_control_label:  String(next_control_label || "").trim() || null,
           control_type:        String(control_type || "").trim() || null,
         });
-        if (insertErr) console.error("[clinical_notes] insert error:", insertErr.message);
+        if (insertErr) {
+          console.error("[clinical_notes] insert error:", insertErr.message);
+          clinicalNoteError = insertErr.message;
+        }
       }
     } catch (cnErr) {
       console.error("[clinical_notes] upsert failed on clinical patch:", cnErr.message);
@@ -4612,6 +4618,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
     return res.status(200).json({
       ok: true,
       appointment: data,
+      clinicalNoteError: clinicalNoteError ?? null,
     });
   } catch (err) {
     return res.status(500).json({
