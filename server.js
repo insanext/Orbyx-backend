@@ -4486,6 +4486,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
       control_type,
       control_note,
       next_control_at,
+      next_control_label,
     } = req.body;
 
     if (!id) {
@@ -4531,37 +4532,41 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
         await supabase
           .from("clinical_notes")
           .update({
-            reason:           normalizedReason ?? null,
-            diagnosis:        normalizeNullablePetText(diagnosis),
-            treatment:        normalizeNullablePetText(treatment),
-            symptoms:         String(symptoms || "").trim() || null,
-            medications:      String(medications || "").trim() || null,
-            referrals:        String(referrals || "").trim() || null,
-            follow_up_notes:  String(follow_up_notes || "").trim() || null,
-            observations:     normalizedNotes ?? null,
-            next_control_at:  next_control_at ?? null,
-            updated_at:       new Date().toISOString(),
+            reason:              normalizedReason ?? null,
+            diagnosis:           normalizeNullablePetText(diagnosis),
+            treatment:           normalizeNullablePetText(treatment),
+            symptoms:            String(symptoms || "").trim() || null,
+            medications:         String(medications || "").trim() || null,
+            referrals:           String(referrals || "").trim() || null,
+            follow_up_notes:     String(follow_up_notes || "").trim() || null,
+            observations:        normalizedNotes ?? null,
+            next_control_at:     next_control_at ?? null,
+            next_control_label:  String(next_control_label || "").trim() || null,
+            control_type:        String(control_type || "").trim() || null,
+            updated_at:          new Date().toISOString(),
           })
           .eq("id", existingNote.id);
-      } else if (appointment.pet_id) {
+      } else {
         await supabase.from("clinical_notes").insert({
-          tenant_id:        appointment.tenant_id,
-          branch_id:        appointment.branch_id ?? null,
-          pet_id:           appointment.pet_id,
-          appointment_id:   id,
-          staff_id:         appointment.staff_id ?? null,
-          date:             appointment.start_at
-                              ? appointment.start_at.split("T")[0]
-                              : new Date().toISOString().split("T")[0],
-          reason:           normalizedReason ?? null,
-          diagnosis:        normalizeNullablePetText(diagnosis),
-          treatment:        normalizeNullablePetText(treatment),
-          symptoms:         String(symptoms || "").trim() || null,
-          medications:      String(medications || "").trim() || null,
-          referrals:        String(referrals || "").trim() || null,
-          follow_up_notes:  String(follow_up_notes || "").trim() || null,
-          observations:     normalizedNotes ?? null,
-          next_control_at:  next_control_at ?? null,
+          tenant_id:           appointment.tenant_id,
+          branch_id:           appointment.branch_id ?? null,
+          pet_id:              appointment.pet_id || null,
+          appointment_id:      id,
+          staff_id:            appointment.staff_id ?? null,
+          date:                appointment.start_at
+                                 ? appointment.start_at.split("T")[0]
+                                 : new Date().toISOString().split("T")[0],
+          reason:              normalizedReason ?? null,
+          diagnosis:           normalizeNullablePetText(diagnosis),
+          treatment:           normalizeNullablePetText(treatment),
+          symptoms:            String(symptoms || "").trim() || null,
+          medications:         String(medications || "").trim() || null,
+          referrals:           String(referrals || "").trim() || null,
+          follow_up_notes:     String(follow_up_notes || "").trim() || null,
+          observations:        normalizedNotes ?? null,
+          next_control_at:     next_control_at ?? null,
+          next_control_label:  String(next_control_label || "").trim() || null,
+          control_type:        String(control_type || "").trim() || null,
         });
       }
     } catch (cnErr) {
