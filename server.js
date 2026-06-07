@@ -6210,7 +6210,7 @@ app.get("/clinical-notes/:slug", async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    const vetCategories = ["veterinaria", "vet"];
+    const vetCategories = ["veterinaria", "vet", "clinica"];
     if (!vetCategories.includes(String(tenant.business_category || "").toLowerCase())) {
       return res.status(403).json({ error: "No disponible para este tipo de negocio" });
     }
@@ -7309,7 +7309,7 @@ next_control_custom_unit = null,
       .trim()
       .toLowerCase();
 
-    if (!["veterinaria", "vet"].includes(businessCategory)) {
+    if (!["veterinaria", "vet", "clinica"].includes(businessCategory)) {
       return res.status(400).json({
         error: "Este cierre con control solo está disponible para negocios veterinaria",
       });
