@@ -4540,7 +4540,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
             referrals:           String(referrals || "").trim() || null,
             follow_up_notes:     String(follow_up_notes || "").trim() || null,
             observations:        normalizedNotes ?? null,
-            next_control_at:     next_control_at ?? null,
+            next_control_at:     next_control_at || null,
             next_control_label:  String(next_control_label || "").trim() || null,
             control_type:        String(control_type || "").trim() || null,
             updated_at:          new Date().toISOString(),
@@ -4568,7 +4568,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
           referrals:           String(referrals || "").trim() || null,
           follow_up_notes:     String(follow_up_notes || "").trim() || null,
           observations:        normalizedNotes ?? null,
-          next_control_at:     next_control_at ?? null,
+          next_control_at:     next_control_at || null,
           next_control_label:  String(next_control_label || "").trim() || null,
           control_type:        String(control_type || "").trim() || null,
         });
