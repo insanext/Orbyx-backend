@@ -4487,6 +4487,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
       control_note,
       next_control_at,
       next_control_label,
+      extra_fields,
     } = req.body;
 
     if (!id) {
@@ -4543,6 +4544,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
             next_control_at:     next_control_at || null,
             next_control_label:  String(next_control_label || "").trim() || null,
             control_type:        String(control_type || "").trim() || null,
+            extra_fields:        extra_fields ?? null,
             updated_at:          new Date().toISOString(),
           })
           .eq("id", existingNote.id);
@@ -4571,6 +4573,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
           next_control_at:     next_control_at || null,
           next_control_label:  String(next_control_label || "").trim() || null,
           control_type:        String(control_type || "").trim() || null,
+          extra_fields:        extra_fields ?? null,
         });
         if (insertErr) {
           console.error("[clinical_notes] insert error:", insertErr.message);
