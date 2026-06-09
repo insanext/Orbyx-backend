@@ -8198,6 +8198,7 @@ app.patch("/tenants/:id", async (req, res) => {
 
     const {
       name,
+      business_name,
       phone,
       address,
       email,
@@ -8220,6 +8221,29 @@ app.patch("/tenants/:id", async (req, res) => {
 
     if (!name || !String(name).trim()) {
       return res.status(400).json({ error: "name es obligatorio" });
+    }
+
+    // Generar slug desde business_name si se recibe
+    let newSlug = null;
+    if (business_name && String(business_name).trim()) {
+      const baseSlug = String(business_name)
+        .trim()
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[̀-ͯ]/g, "")
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 30) || "negocio";
+
+      const { data: existing } = await supabase
+        .from("tenants")
+        .select("id")
+        .eq("slug", baseSlug)
+        .neq("id", id)
+        .maybeSingle();
+
+      const suffix = Math.random().toString(16).slice(2, 6);
+      newSlug = existing ? `${baseSlug}-${suffix}` : baseSlug;
     }
 
     const normalizedMinBookingNoticeMinutes = Math.max(
@@ -8381,6 +8405,7 @@ app.patch("/tenants/:id", async (req, res) => {
         ...(business_subcategory !== undefined && {
           business_subcategory: business_subcategory ? String(business_subcategory).trim().toLowerCase() : null,
         }),
+        ...(newSlug ? { slug: newSlug } : {}),
       })
       .eq("id", id)
       .select()
@@ -8395,6 +8420,7 @@ app.patch("/tenants/:id", async (req, res) => {
     return res.json({
       ok: true,
       tenant: data,
+      ...(newSlug ? { slug: newSlug } : {}),
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
