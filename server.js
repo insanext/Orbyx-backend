@@ -7929,10 +7929,27 @@ const { data: tenant, error: tenantError } = await supabase
 
     if (calendarError) throw calendarError;
 
+    const { data: branch, error: branchError } = await supabase
+      .from("branches")
+      .insert({
+        tenant_id: tenant.id,
+        name: "Principal",
+        is_active: true,
+        use_global_hours: true,
+        use_global_special_dates: true,
+        use_global_socials: true,
+        use_global_contact: true,
+      })
+      .select()
+      .single();
+
+    if (branchError) throw branchError;
+
     return res.json({
       ok: true,
       tenant_id: tenant.id,
       calendar_id: calendar.id,
+      branch_id: branch.id,
     });
   } catch (err) {
     console.error("Provision failed:", err);
