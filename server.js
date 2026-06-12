@@ -112,10 +112,10 @@ function getPlanCapabilities(plan) {
 }
 
 const PLAN_PRICES = {
-  pro: 24990,
-  premium: 44990,
-  vip: 79990,
-  platinum: 229990,
+  pro: 12990,
+  premium: 29990,
+  vip: 54990,
+  platinum: 149990,
 };
 
 const PLAN_ORDER = {
@@ -127,6 +127,41 @@ const PLAN_ORDER = {
 
 const BILLING_CYCLE_DAYS = 30;
 
+// Ciclos de facturación. mensual se preserva tal cual; semestral y anual
+// aplican descuento sobre precio mensual × meses.
+const BILLING_CYCLES = {
+  mensual: { months: 1, discount: 1 },
+  semestral: { months: 6, discount: 0.9 },
+  anual: { months: 12, discount: 0.85 },
+};
+
+const BILLING_CYCLE_ALIASES = {
+  monthly: "mensual",
+  "1month": "mensual",
+  "6months": "semestral",
+  semiannual: "semestral",
+  "12months": "anual",
+  annual: "anual",
+  yearly: "anual",
+};
+
+function normalizeBillingCycle(cycle) {
+  const normalized = String(cycle || "mensual").toLowerCase();
+  if (BILLING_CYCLES[normalized]) return normalized;
+  return BILLING_CYCLE_ALIASES[normalized] || "mensual";
+}
+
+// El ciclo no se persiste en una columna propia: se infiere de la duración
+// entre billing_cycle_start y billing_cycle_end (mensual ~30d, semestral ~180d, anual ~360d).
+function inferBillingCycle(billingStart, billingEnd) {
+  const ms = new Date(billingEnd).getTime() - new Date(billingStart).getTime();
+  const days = ms / (1000 * 60 * 60 * 24);
+
+  if (days >= 300) return "anual";
+  if (days >= 150) return "semestral";
+  return "mensual";
+}
+
 function normalizePlanSlug(plan) {
   const normalized = String(plan || "pro").toLowerCase();
   if (normalized === "starter") return "pro";
@@ -136,6 +171,116 @@ function normalizePlanSlug(plan) {
 
 function getPlanPrice(plan) {
   return PLAN_PRICES[normalizePlanSlug(plan)] || PLAN_PRICES.pro;
+}
+
+// Total del ciclo: mensual = precio; semestral = precio × 6 × 0.90; anual = precio × 12 × 0.85
+function getPlanCyclePrice(plan, cycle) {
+  const config = BILLING_CYCLES[normalizeBillingCycle(cycle)];
+  return Math.round(getPlanPrice(plan) * config.months * config.discount);
+}
+
+/* ======================================================
+   Catálogo de add-ons (mismo patrón que PLAN_PRICES /
+   getPlanCapabilities). Acumulables: cada unidad contratada
+   suma `grants` al límite base del plan del tenant.
+   min_plan define disponibilidad: premium = Premium/VIP/Platinum,
+   vip = VIP/Platinum. Pro no puede contratar ninguno.
+====================================================== */
+const ADDON_CATALOG = {
+  staff: {
+    key: "staff",
+    name: "+ 1 Profesional",
+    price: 6000,
+    pack_size: 1,
+    grants: { max_staff: 1 },
+    min_plan: "premium",
+  },
+  branches: {
+    key: "branches",
+    name: "+ 1 Sucursal",
+    price: 15000,
+    pack_size: 1,
+    grants: { max_branches: 1 },
+    min_plan: "premium",
+  },
+  reminders: {
+    key: "reminders",
+    name: "+ Recordatorios WhatsApp",
+    price: 4900,
+    pack_size: 200,
+    grants: { max_wa_reminders_per_month: 200 },
+    min_plan: "premium",
+  },
+  campaigns: {
+    key: "campaigns",
+    name: "+ Campañas WhatsApp",
+    price: 9900,
+    pack_size: 100,
+    grants: { max_wa_campaign_msgs_per_month: 100 },
+    min_plan: "vip",
+  },
+  ai: {
+    key: "ai",
+    name: "+ Conversaciones IA WhatsApp",
+    price: 14900,
+    pack_size: 500,
+    grants: { max_ai_wa_conversations_per_month: 500 },
+    min_plan: "vip",
+  },
+};
+
+function isAddonAvailableForPlan(addonKey, plan) {
+  const addon = ADDON_CATALOG[addonKey];
+  if (!addon) return false;
+  return getPlanLevel(plan) >= getPlanLevel(addon.min_plan);
+}
+
+function getAddonsForPlan(plan) {
+  return Object.values(ADDON_CATALOG).filter((addon) =>
+    isAddonAvailableForPlan(addon.key, plan)
+  );
+}
+
+// Cancela los add-ons activos que el plan destino no soporta.
+// Tolerante a que la tabla tenant_addons aún no exista: en ese caso
+// solo deja un warning y no interrumpe el cambio de plan.
+async function cancelUnsupportedAddons(tenant_id, newPlan) {
+  try {
+    const { data, error } = await supabase
+      .from("tenant_addons")
+      .select("id, addon_key")
+      .eq("tenant_id", tenant_id)
+      .eq("status", "active");
+
+    if (error) throw error;
+
+    const toCancel = (data || []).filter(
+      (row) => !isAddonAvailableForPlan(row.addon_key, newPlan)
+    );
+
+    if (toCancel.length === 0) return [];
+
+    const { error: updateError } = await supabase
+      .from("tenant_addons")
+      .update({
+        status: "canceled",
+        canceled_at: new Date().toISOString(),
+      })
+      .in(
+        "id",
+        toCancel.map((row) => row.id)
+      );
+
+    if (updateError) throw updateError;
+
+    return toCancel.map((row) => row.addon_key);
+  } catch (err) {
+    console.warn(
+      "cancelUnsupportedAddons: no se pudieron cancelar add-ons (¿tabla tenant_addons no existe?):",
+      err.message
+    );
+    return [];
+  }
 }
 
 function getPlanLevel(plan) {
@@ -170,6 +315,20 @@ function addOneMonth(date) {
   return d;
 }
 
+// Generalización de addOneMonth para ciclos semestral/anual (mismo clamp de día)
+function addMonths(date, months) {
+  const d = new Date(date);
+  const day = d.getDate();
+
+  d.setMonth(d.getMonth() + months);
+
+  if (d.getDate() < day) {
+    d.setDate(0);
+  }
+
+  return d;
+}
+
 function ensureBillingDates(row) {
   const now = new Date();
 
@@ -191,16 +350,21 @@ function calculateProration({
   currentPlan,
   newPlan,
   billingEnd,
+  billingCycle = "mensual",
   now = new Date(),
 }) {
-  const currentPrice = getPlanPrice(currentPlan);
-  const newPrice = getPlanPrice(newPlan);
+  // Para ciclo mensual el cálculo es idéntico al original (precio mensual / 30).
+  const cycle = normalizeBillingCycle(billingCycle);
+  const cycleDays = BILLING_CYCLE_DAYS * BILLING_CYCLES[cycle].months;
+
+  const currentPrice = getPlanCyclePrice(currentPlan, cycle);
+  const newPrice = getPlanCyclePrice(newPlan, cycle);
 
   const msRemaining = Math.max(0, billingEnd.getTime() - now.getTime());
   const daysRemainingExact = msRemaining / (1000 * 60 * 60 * 24);
 
-  const currentDaily = currentPrice / BILLING_CYCLE_DAYS;
-  const newDaily = newPrice / BILLING_CYCLE_DAYS;
+  const currentDaily = currentPrice / cycleDays;
+  const newDaily = newPrice / cycleDays;
 
   const credit = Math.round(currentDaily * daysRemainingExact);
   const charge = Math.round(newDaily * daysRemainingExact);
@@ -7875,11 +8039,14 @@ app.get("/_ping", (req, res) => {
 ====================================================== */
 app.post("/tenants/provision", async (req, res) => {
   try {
-    const { user_id, email, plan } = req.body;
+    const { user_id, email, plan, billing_cycle } = req.body;
 
     if (!user_id || !email || !plan) {
       return res.status(400).json({ error: "Faltan campos: user_id, email, plan" });
     }
+
+    // billing_cycle opcional: mensual (default), semestral o anual
+    const provisionCycle = normalizeBillingCycle(billing_cycle);
 
     const baseSlug = String(email).split("@")[0] || "tenant";
     const cleanBase =
@@ -7893,7 +8060,10 @@ app.post("/tenants/provision", async (req, res) => {
     const slug = `${cleanBase}-${suffix}`;
 
 const billing_cycle_start = new Date().toISOString();
-const billing_cycle_end = addOneMonth(new Date()).toISOString();
+const billing_cycle_end = addMonths(
+  new Date(),
+  BILLING_CYCLES[provisionCycle].months
+).toISOString();
 
 const { data: tenant, error: tenantError } = await supabase
   .from("tenants")
@@ -7982,6 +8152,10 @@ app.get("/billing/preview-change", async (req, res) => {
 
     const subscription = await getTenantSubscriptionRow(tenant_id);
     const targetPlan = normalizePlanSlug(new_plan);
+    const tenantCycle = inferBillingCycle(
+      subscription.billingStart,
+      subscription.billingEnd
+    );
 
     if (subscription.currentPlan === targetPlan) {
       return res.json({
@@ -7989,6 +8163,7 @@ app.get("/billing/preview-change", async (req, res) => {
         change_type: "same_plan",
         current_plan: subscription.currentPlan,
         new_plan: targetPlan,
+        billing_cycle: tenantCycle,
         amount_today: 0,
         message: "Ya estás en este plan",
         billing_cycle_end: subscription.billingEnd.toISOString(),
@@ -8000,6 +8175,7 @@ app.get("/billing/preview-change", async (req, res) => {
         currentPlan: subscription.currentPlan,
         newPlan: targetPlan,
         billingEnd: subscription.billingEnd,
+        billingCycle: tenantCycle,
       });
 
       return res.json({
@@ -8007,6 +8183,7 @@ app.get("/billing/preview-change", async (req, res) => {
         change_type: "upgrade",
         current_plan: subscription.currentPlan,
         new_plan: targetPlan,
+        billing_cycle: tenantCycle,
         amount_today: proration.amount_today,
         credit: proration.credit,
         charge: proration.charge,
@@ -8021,6 +8198,7 @@ app.get("/billing/preview-change", async (req, res) => {
       change_type: "downgrade",
       current_plan: subscription.currentPlan,
       new_plan: targetPlan,
+      billing_cycle: tenantCycle,
       amount_today: 0,
       billing_cycle_end: subscription.billingEnd.toISOString(),
       scheduled_change_at: subscription.billingEnd.toISOString(),
@@ -8037,7 +8215,7 @@ app.get("/billing/preview-change", async (req, res) => {
 ====================================================== */
 app.post("/billing/change-plan", async (req, res) => {
   try {
-    const { tenant_id, new_plan } = req.body;
+    const { tenant_id, new_plan, billing_cycle } = req.body;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -8049,6 +8227,15 @@ app.post("/billing/change-plan", async (req, res) => {
 
     const subscription = await getTenantSubscriptionRow(tenant_id);
     const targetPlan = normalizePlanSlug(new_plan);
+    const tenantCycle = inferBillingCycle(
+      subscription.billingStart,
+      subscription.billingEnd
+    );
+    // billing_cycle opcional: solo en upgrades permite cambiar de ciclo.
+    // Sin el parámetro, el comportamiento es idéntico al original.
+    const requestedCycle = billing_cycle
+      ? normalizeBillingCycle(billing_cycle)
+      : null;
 
     if (subscription.currentPlan === targetPlan) {
       return res.status(400).json({
@@ -8057,22 +8244,47 @@ app.post("/billing/change-plan", async (req, res) => {
     }
 
     if (isUpgradePlanChange(subscription.currentPlan, targetPlan)) {
+      const isCycleSwitch = Boolean(
+        requestedCycle && requestedCycle !== tenantCycle
+      );
+
       const proration = calculateProration({
         currentPlan: subscription.currentPlan,
         newPlan: targetPlan,
         billingEnd: subscription.billingEnd,
+        billingCycle: tenantCycle,
       });
+
+      // Con cambio de ciclo: se acredita lo no usado del ciclo vigente y se
+      // cobra el ciclo nuevo completo, que parte hoy.
+      const newCycleCharge = isCycleSwitch
+        ? getPlanCyclePrice(targetPlan, requestedCycle)
+        : proration.charge;
+      const amountToday = isCycleSwitch
+        ? Math.max(0, newCycleCharge - proration.credit)
+        : proration.amount_today;
+
+      const updatePayload = {
+        plan_slug: targetPlan,
+        scheduled_plan_slug: null,
+        scheduled_change_at: null,
+        pending_change_type: null,
+        proration_credit: proration.credit,
+        proration_charge: newCycleCharge,
+      };
+
+      if (isCycleSwitch) {
+        const newStart = new Date();
+        updatePayload.billing_cycle_start = newStart.toISOString();
+        updatePayload.billing_cycle_end = addMonths(
+          newStart,
+          BILLING_CYCLES[requestedCycle].months
+        ).toISOString();
+      }
 
       const { data, error } = await supabase
         .from("tenants")
-        .update({
-          plan_slug: targetPlan,
-          scheduled_plan_slug: null,
-          scheduled_change_at: null,
-          pending_change_type: null,
-          proration_credit: proration.credit,
-          proration_charge: proration.charge,
-        })
+        .update(updatePayload)
         .eq("id", tenant_id)
         .select(`
           id,
@@ -8093,9 +8305,10 @@ app.post("/billing/change-plan", async (req, res) => {
         ok: true,
         applied: true,
         change_type: "upgrade",
-        amount_today: proration.amount_today,
+        billing_cycle: isCycleSwitch ? requestedCycle : tenantCycle,
+        amount_today: amountToday,
         credit: proration.credit,
-        charge: proration.charge,
+        charge: newCycleCharge,
         tenant: data,
         message: "Upgrade aplicado de inmediato con prorrateo",
       });
@@ -8137,6 +8350,33 @@ app.post("/billing/change-plan", async (req, res) => {
 });
 
 /* ======================================================
+   ✅ GET /billing/addons
+   Catálogo de add-ons. Con ?plan= incluye flag de disponibilidad.
+====================================================== */
+app.get("/billing/addons", (req, res) => {
+  try {
+    const { plan } = req.query;
+    const normalizedPlan = plan ? normalizePlanSlug(plan) : null;
+
+    const addons = Object.values(ADDON_CATALOG).map((addon) => ({
+      ...addon,
+      ...(normalizedPlan
+        ? { available: isAddonAvailableForPlan(addon.key, normalizedPlan) }
+        : {}),
+    }));
+
+    return res.json({
+      ok: true,
+      ...(normalizedPlan ? { plan: normalizedPlan } : {}),
+      addons,
+    });
+  } catch (err) {
+    console.error("GET /billing/addons error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    ✅ POST /billing/apply-scheduled-changes
    Lo puedes disparar manualmente o desde cron
 ====================================================== */
@@ -8164,13 +8404,21 @@ app.post("/billing/apply-scheduled-changes", async (req, res) => {
     let applied = 0;
 
     for (const tenant of tenantsToApply || []) {
+      const newPlan = normalizePlanSlug(tenant.scheduled_plan_slug);
+
+      // El nuevo ciclo conserva la duración del ciclo anterior del tenant
+      // (mensual renueva igual que antes con addOneMonth-equivalente).
+      const tenantCycle = inferBillingCycle(
+        tenant.billing_cycle_start,
+        tenant.billing_cycle_end
+      );
       const newStart = new Date();
-      const newEnd = addOneMonth(newStart);
+      const newEnd = addMonths(newStart, BILLING_CYCLES[tenantCycle].months);
 
       const { error: updateError } = await supabase
         .from("tenants")
         .update({
-          plan_slug: normalizePlanSlug(tenant.scheduled_plan_slug),
+          plan_slug: newPlan,
           billing_cycle_start: newStart.toISOString(),
           billing_cycle_end: newEnd.toISOString(),
           scheduled_plan_slug: null,
@@ -8182,6 +8430,15 @@ app.post("/billing/apply-scheduled-changes", async (req, res) => {
         .eq("id", tenant.id);
 
       if (updateError) throw updateError;
+
+      // Downgrade efectivo: cancelar add-ons que el plan nuevo no soporta
+      const canceledAddons = await cancelUnsupportedAddons(tenant.id, newPlan);
+
+      if (canceledAddons.length > 0) {
+        console.log(
+          `Downgrade tenant ${tenant.id} a ${newPlan}: add-ons cancelados → ${canceledAddons.join(", ")}`
+        );
+      }
 
       applied++;
     }
