@@ -241,6 +241,28 @@ function getAddonsForPlan(plan) {
   );
 }
 
+// Add-ons activos contratados por un tenant (tabla tenant_addons)
+async function getActiveAddons(tenant_id) {
+  const { data, error } = await supabase
+    .from("tenant_addons")
+    .select("id, addon_key, quantity, billing_cycle, status, activated_at")
+    .eq("tenant_id", tenant_id)
+    .eq("status", "active");
+
+  if (error) throw error;
+
+  return data || [];
+}
+
+// Errores de PostgREST cuando la tabla tenant_addons todavía no fue migrada
+function isMissingAddonsTableError(err) {
+  return Boolean(
+    err &&
+      (err.code === "PGRST205" ||
+        String(err.message || "").includes("tenant_addons"))
+  );
+}
+
 // Cancela los add-ons activos que el plan destino no soporta.
 // Tolerante a que la tabla tenant_addons aún no exista: en ese caso
 // solo deja un warning y no interrumpe el cambio de plan.
@@ -265,6 +287,7 @@ async function cancelUnsupportedAddons(tenant_id, newPlan) {
       .update({
         status: "canceled",
         canceled_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       })
       .in(
         "id",
@@ -8352,11 +8375,27 @@ app.post("/billing/change-plan", async (req, res) => {
 /* ======================================================
    ✅ GET /billing/addons
    Catálogo de add-ons. Con ?plan= incluye flag de disponibilidad.
+   Con ?tenant_id= incluye además los add-ons activos del tenant
+   (campos aditivos; el shape original se preserva).
 ====================================================== */
-app.get("/billing/addons", (req, res) => {
+app.get("/billing/addons", async (req, res) => {
   try {
-    const { plan } = req.query;
-    const normalizedPlan = plan ? normalizePlanSlug(plan) : null;
+    const { plan, tenant_id } = req.query;
+
+    let normalizedPlan = plan ? normalizePlanSlug(plan) : null;
+
+    let active = null;
+    if (tenant_id) {
+      // El plan real del tenant manda sobre el query param
+      normalizedPlan = await getPlan(tenant_id);
+
+      try {
+        active = await getActiveAddons(tenant_id);
+      } catch (err) {
+        if (!isMissingAddonsTableError(err)) throw err;
+        active = [];
+      }
+    }
 
     const addons = Object.values(ADDON_CATALOG).map((addon) => ({
       ...addon,
@@ -8369,9 +8408,175 @@ app.get("/billing/addons", (req, res) => {
       ok: true,
       ...(normalizedPlan ? { plan: normalizedPlan } : {}),
       addons,
+      ...(active !== null ? { active_addons: active } : {}),
     });
   } catch (err) {
     console.error("GET /billing/addons error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /billing/addons/activate
+   body: { tenant_id, addon_key, quantity?, billing_cycle? }
+   Valida tenant, catálogo y disponibilidad por plan.
+   Acumulable: si ya hay un addon activo, suma quantity.
+====================================================== */
+app.post("/billing/addons/activate", async (req, res) => {
+  try {
+    const { tenant_id, addon_key, quantity, billing_cycle } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!addon_key || !ADDON_CATALOG[addon_key]) {
+      return res.status(400).json({
+        error: `addon_key inválido. Válidos: ${Object.keys(ADDON_CATALOG).join(", ")}`,
+      });
+    }
+
+    const qty = Math.max(1, parseInt(quantity, 10) || 1);
+    const cycle = normalizeBillingCycle(billing_cycle);
+
+    // Ownership: el tenant debe existir (getPlan lanza error si no);
+    // el service role solo opera sobre filas de ese tenant_id.
+    let tenantPlan;
+    try {
+      tenantPlan = await getPlan(tenant_id);
+    } catch {
+      return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    if (!isAddonAvailableForPlan(addon_key, tenantPlan)) {
+      return res.status(403).json({
+        error: `El plan ${tenantPlan} no permite contratar este add-on`,
+        upgrade_required: true,
+      });
+    }
+
+    const { data: existing, error: existingError } = await supabase
+      .from("tenant_addons")
+      .select("id, quantity")
+      .eq("tenant_id", tenant_id)
+      .eq("addon_key", addon_key)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (existingError) throw existingError;
+
+    let row;
+
+    if (existing) {
+      const { data, error } = await supabase
+        .from("tenant_addons")
+        .update({
+          quantity: existing.quantity + qty,
+          billing_cycle: cycle,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", existing.id)
+        .select()
+        .single();
+
+      if (error) throw error;
+      row = data;
+    } else {
+      const { data, error } = await supabase
+        .from("tenant_addons")
+        .insert({
+          tenant_id,
+          addon_key,
+          quantity: qty,
+          billing_cycle: cycle,
+          status: "active",
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+      row = data;
+    }
+
+    return res.json({
+      ok: true,
+      addon: row,
+    });
+  } catch (err) {
+    console.error("POST /billing/addons/activate error:", err.message);
+
+    if (isMissingAddonsTableError(err)) {
+      return res.status(503).json({
+        error:
+          "La tabla tenant_addons no existe aún. Ejecuta tenant_addons.sql en el SQL editor de Supabase.",
+      });
+    }
+
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /billing/addons/cancel
+   body: { tenant_id, addon_key }
+====================================================== */
+app.post("/billing/addons/cancel", async (req, res) => {
+  try {
+    const { tenant_id, addon_key } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!addon_key || !ADDON_CATALOG[addon_key]) {
+      return res.status(400).json({
+        error: `addon_key inválido. Válidos: ${Object.keys(ADDON_CATALOG).join(", ")}`,
+      });
+    }
+
+    // Ownership: el tenant debe existir; la mutación filtra por tenant_id.
+    try {
+      await getPlan(tenant_id);
+    } catch {
+      return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    const now = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from("tenant_addons")
+      .update({
+        status: "canceled",
+        canceled_at: now,
+        updated_at: now,
+      })
+      .eq("tenant_id", tenant_id)
+      .eq("addon_key", addon_key)
+      .eq("status", "active")
+      .select();
+
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
+      return res.status(404).json({
+        error: "El tenant no tiene ese add-on activo",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      addon: data[0],
+    });
+  } catch (err) {
+    console.error("POST /billing/addons/cancel error:", err.message);
+
+    if (isMissingAddonsTableError(err)) {
+      return res.status(503).json({
+        error:
+          "La tabla tenant_addons no existe aún. Ejecuta tenant_addons.sql en el SQL editor de Supabase.",
+      });
+    }
+
     return res.status(500).json({ error: err.message });
   }
 });
