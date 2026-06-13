@@ -69,38 +69,55 @@ function normalizeNullableNumber(value) {
 function getPlanCapabilities(plan) {
   const normalizedPlan = String(plan || "pro").toLowerCase();
 
+  // max_services = 999999: los servicios son ilimitados en todos los planes
   const plans = {
     pro: {
       max_staff: 2,
-      max_services: 10,
+      max_services: 999999,
       max_branches: 1,
       max_campaign_emails_per_send: 200,
       max_wa_reminders_per_month: 0,
       max_ai_wa_conversations_per_month: 0,
+      max_group_capacity: 10,
+      max_wa_confirmacion: 100,
+      max_campanas_wa: 0,
+      max_ia_wa: 0,
     },
     premium: {
       max_staff: 5,
-      max_services: 25,
+      max_services: 999999,
       max_branches: 2,
       max_campaign_emails_per_send: 1000,
       max_wa_reminders_per_month: 100,
       max_ai_wa_conversations_per_month: 0,
+      max_group_capacity: 25,
+      max_wa_confirmacion: 200,
+      max_campanas_wa: 0,
+      max_ia_wa: 0,
     },
     vip: {
       max_staff: 10,
-      max_services: 50,
+      max_services: 999999,
       max_branches: 3,
       max_campaign_emails_per_send: 2000,
       max_wa_reminders_per_month: 200,
       max_ai_wa_conversations_per_month: 500,
+      max_group_capacity: 50,
+      max_wa_confirmacion: 300,
+      max_campanas_wa: 0,
+      max_ia_wa: 500,
     },
     platinum: {
       max_staff: 25,
-      max_services: 100,
+      max_services: 999999,
       max_branches: 10,
       max_campaign_emails_per_send: 5000,
       max_wa_reminders_per_month: 400,
       max_ai_wa_conversations_per_month: 1500,
+      max_group_capacity: 100,
+      max_wa_confirmacion: 500,
+      max_campanas_wa: 0,
+      max_ia_wa: 1500,
     },
   };
 
@@ -180,52 +197,109 @@ function getPlanCyclePrice(plan, cycle) {
 }
 
 /* ======================================================
-   Catálogo de add-ons (mismo patrón que PLAN_PRICES /
-   getPlanCapabilities). Acumulables: cada unidad contratada
-   suma `grants` al límite base del plan del tenant.
-   min_plan define disponibilidad: premium = Premium/VIP/Platinum,
-   vip = VIP/Platinum. Pro no puede contratar ninguno.
+   Catálogo de add-ons. Precios escalonados: pack1 = precio normal,
+   pack2 (−10%), pack3+ (−15%). resets_monthly = true indica que el
+   uso se resetea mensualmente (last_reset_at). Pro puede contratar
+   wa_confirmacion y emails_campana; los demás requieren premium+.
 ====================================================== */
 const ADDON_CATALOG = {
+  wa_confirmacion: {
+    key: "wa_confirmacion",
+    name: "WA confirmación+recordatorio",
+    description: "50 msgs WA adicionales/mes",
+    price: 2990,
+    price_pack2: 2691,
+    price_pack3: 2542,
+    pack_size: 50,
+    grants: { wa_confirmacion: 50 },
+    min_plan: "pro",
+    available_for: ["pro", "premium", "vip", "platinum"],
+    resets_monthly: true,
+    accumulates: false,
+  },
+  campanas_wa: {
+    key: "campanas_wa",
+    name: "Campañas WhatsApp",
+    description: "50 msgs campaña marketing adicionales/mes",
+    price: 6990,
+    price_pack2: 6291,
+    price_pack3: 5942,
+    pack_size: 50,
+    grants: { campanas_wa: 50 },
+    min_plan: "vip",
+    available_for: ["vip", "platinum"],
+    resets_monthly: true,
+    accumulates: false,
+  },
+  ia_wa: {
+    key: "ia_wa",
+    name: "IA WhatsApp",
+    description: "500 conversaciones IA adicionales/mes",
+    price: 14990,
+    price_pack2: 13491,
+    price_pack3: 12742,
+    pack_size: 500,
+    grants: { ia_wa: 500 },
+    min_plan: "vip",
+    available_for: ["vip", "platinum"],
+    resets_monthly: true,
+    accumulates: false,
+  },
+  emails_campana: {
+    key: "emails_campana",
+    name: "Pack emails campaña",
+    description: "2.000 correos campaña adicionales/mes",
+    price: 1990,
+    price_pack2: 1990,
+    price_pack3: 1990,
+    pack_size: 2000,
+    grants: { emails_campana: 2000 },
+    min_plan: "pro",
+    available_for: ["pro", "premium", "vip", "platinum"],
+    resets_monthly: true,
+    accumulates: false,
+  },
   staff: {
     key: "staff",
     name: "+ 1 Profesional",
-    price: 6000,
+    description: "1 staff adicional sobre límite del plan",
+    price: 5990,
+    price_pack2: 5990,
+    price_pack3: 5990,
     pack_size: 1,
-    grants: { max_staff: 1 },
+    grants: { staff: 1 },
     min_plan: "premium",
+    available_for: ["premium", "vip", "platinum"],
+    resets_monthly: false,
+    accumulates: false,
   },
-  branches: {
-    key: "branches",
+  sucursal: {
+    key: "sucursal",
     name: "+ 1 Sucursal",
-    price: 15000,
+    description: "1 sucursal adicional sobre límite del plan",
+    price: 9990,
+    price_pack2: 9990,
+    price_pack3: 9990,
     pack_size: 1,
-    grants: { max_branches: 1 },
+    grants: { sucursal: 1 },
     min_plan: "premium",
+    available_for: ["premium", "vip", "platinum"],
+    resets_monthly: false,
+    accumulates: false,
   },
-  reminders: {
-    key: "reminders",
-    name: "+ Recordatorios WhatsApp",
+  group_capacity: {
+    key: "group_capacity",
+    name: "+ Cupos grupales",
+    description: "25 cupos adicionales por slot grupal",
     price: 4900,
-    pack_size: 200,
-    grants: { max_wa_reminders_per_month: 200 },
+    price_pack2: 4900,
+    price_pack3: 4900,
+    pack_size: 25,
+    grants: { group_capacity: 25 },
     min_plan: "premium",
-  },
-  campaigns: {
-    key: "campaigns",
-    name: "+ Campañas WhatsApp",
-    price: 9900,
-    pack_size: 100,
-    grants: { max_wa_campaign_msgs_per_month: 100 },
-    min_plan: "vip",
-  },
-  ai: {
-    key: "ai",
-    name: "+ Conversaciones IA WhatsApp",
-    price: 14900,
-    pack_size: 500,
-    grants: { max_ai_wa_conversations_per_month: 500 },
-    min_plan: "vip",
+    available_for: ["premium", "vip", "platinum"],
+    resets_monthly: false,
+    accumulates: false,
   },
 };
 
@@ -245,13 +319,41 @@ function getAddonsForPlan(plan) {
 async function getActiveAddons(tenant_id) {
   const { data, error } = await supabase
     .from("tenant_addons")
-    .select("id, addon_key, quantity, billing_cycle, status, activated_at")
+    .select("id, addon_key, quantity, billing_cycle, status, activated_at, unit_price, last_reset_at")
     .eq("tenant_id", tenant_id)
     .eq("status", "active");
 
   if (error) throw error;
 
   return data || [];
+}
+
+// Capacidad grupal efectiva = base del plan + (packs activos × 25).
+// Tolerante a la ausencia de tenant_addons: retorna la base del plan.
+async function getEffectiveGroupCapacity(tenant_id) {
+  const plan = await getPlan(tenant_id);
+  const baseCapacity = getPlanCapabilities(plan).max_group_capacity || 10;
+
+  try {
+    const { data, error } = await supabase
+      .from("tenant_addons")
+      .select("quantity")
+      .eq("tenant_id", tenant_id)
+      .eq("addon_key", "group_capacity")
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const packs = Number(data?.quantity) || 0;
+    return baseCapacity + packs * ADDON_CATALOG.group_capacity.pack_size;
+  } catch (err) {
+    console.warn(
+      "getEffectiveGroupCapacity: usando capacidad base del plan:",
+      err.message
+    );
+    return baseCapacity;
+  }
 }
 
 // Errores de PostgREST cuando la tabla tenant_addons todavía no fue migrada
@@ -303,6 +405,46 @@ async function cancelUnsupportedAddons(tenant_id, newPlan) {
       err.message
     );
     return [];
+  }
+}
+
+// Resetea add-ons con resets_monthly:true cuando han pasado ≥30 días desde el último reset.
+// No cancela el add-on — solo actualiza last_reset_at para que el contador de uso vuelva a cero.
+async function resetMonthlyAddons(tenant_id) {
+  try {
+    const { data, error } = await supabase
+      .from("tenant_addons")
+      .select("id, addon_key, activated_at, last_reset_at")
+      .eq("tenant_id", tenant_id)
+      .eq("status", "active");
+
+    if (error) throw error;
+    if (!data || data.length === 0) return;
+
+    const now = new Date();
+    const toReset = data.filter((row) => {
+      const addon = ADDON_CATALOG[row.addon_key];
+      if (!addon?.resets_monthly) return false;
+      const ref = row.last_reset_at || row.activated_at;
+      if (!ref) return false;
+      const daysSince = (now - new Date(ref)) / (1000 * 60 * 60 * 24);
+      return daysSince >= 30;
+    });
+
+    if (toReset.length === 0) return;
+
+    const { error: updateError } = await supabase
+      .from("tenant_addons")
+      .update({ last_reset_at: now.toISOString() })
+      .in("id", toReset.map((r) => r.id));
+
+    if (updateError) throw updateError;
+
+    console.log(
+      `resetMonthlyAddons tenant ${tenant_id}: ${toReset.length} add-on(s) reseteados → ${toReset.map((r) => r.addon_key).join(", ")}`
+    );
+  } catch (err) {
+    console.warn("resetMonthlyAddons error:", err.message);
   }
 }
 
@@ -8389,6 +8531,9 @@ app.get("/billing/addons", async (req, res) => {
       // El plan real del tenant manda sobre el query param
       normalizedPlan = await getPlan(tenant_id);
 
+      // Verificar resets pendientes antes de retornar
+      await resetMonthlyAddons(tenant_id);
+
       try {
         active = await getActiveAddons(tenant_id);
       } catch (err) {
@@ -8465,6 +8610,12 @@ app.post("/billing/addons/activate", async (req, res) => {
 
     if (existingError) throw existingError;
 
+    // Precio escalonado según cantidad actual antes de agregar
+    const currentQty = existing ? Number(existing.quantity) : 0;
+    let unitPrice = addon.price;
+    if (currentQty >= 2) unitPrice = addon.price_pack3 ?? addon.price;
+    else if (currentQty >= 1) unitPrice = addon.price_pack2 ?? addon.price;
+
     let row;
 
     if (existing) {
@@ -8473,6 +8624,7 @@ app.post("/billing/addons/activate", async (req, res) => {
         .update({
           quantity: existing.quantity + qty,
           billing_cycle: cycle,
+          unit_price: unitPrice,
           updated_at: new Date().toISOString(),
         })
         .eq("id", existing.id)
@@ -8489,6 +8641,7 @@ app.post("/billing/addons/activate", async (req, res) => {
           addon_key,
           quantity: qty,
           billing_cycle: cycle,
+          unit_price: unitPrice,
           status: "active",
         })
         .select()
@@ -8501,9 +8654,120 @@ app.post("/billing/addons/activate", async (req, res) => {
     return res.json({
       ok: true,
       addon: row,
+      unit_price: unitPrice,
     });
   } catch (err) {
     console.error("POST /billing/addons/activate error:", err.message);
+
+    if (isMissingAddonsTableError(err)) {
+      return res.status(503).json({
+        error:
+          "La tabla tenant_addons no existe aún. Ejecuta tenant_addons.sql en el SQL editor de Supabase.",
+      });
+    }
+
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ PATCH /billing/addons/quantity
+   body: { tenant_id, addon_key, quantity }
+   quantity > 0 → actualiza cantidad; quantity = 0 → cancela.
+====================================================== */
+app.patch("/billing/addons/quantity", async (req, res) => {
+  try {
+    const { tenant_id, addon_key, quantity } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!addon_key || !ADDON_CATALOG[addon_key]) {
+      return res.status(400).json({
+        error: `addon_key inválido. Válidos: ${Object.keys(ADDON_CATALOG).join(", ")}`,
+      });
+    }
+
+    const qty = Number(quantity);
+
+    if (!Number.isInteger(qty) || qty < 0) {
+      return res.status(400).json({
+        error: "quantity debe ser un número entero mayor o igual a 0",
+      });
+    }
+
+    // Ownership: el tenant debe existir; la mutación filtra por tenant_id.
+    try {
+      await getPlan(tenant_id);
+    } catch {
+      return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    const { data: existing, error: existingError } = await supabase
+      .from("tenant_addons")
+      .select("id, quantity")
+      .eq("tenant_id", tenant_id)
+      .eq("addon_key", addon_key)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (existingError) throw existingError;
+
+    if (!existing) {
+      return res.status(404).json({
+        error: "El tenant no tiene ese add-on activo",
+      });
+    }
+
+    const now = new Date().toISOString();
+
+    if (qty === 0) {
+      const { data, error } = await supabase
+        .from("tenant_addons")
+        .update({
+          status: "canceled",
+          canceled_at: now,
+          updated_at: now,
+        })
+        .eq("id", existing.id)
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      return res.json({
+        ok: true,
+        addon_key,
+        quantity: 0,
+        status: data.status,
+        canceled_at: data.canceled_at,
+        addon: data,
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("tenant_addons")
+      .update({
+        quantity: qty,
+        updated_at: now,
+      })
+      .eq("id", existing.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      addon_key,
+      quantity: data.quantity,
+      status: data.status,
+      updated_at: data.updated_at,
+      addon: data,
+    });
+  } catch (err) {
+    console.error("PATCH /billing/addons/quantity error:", err.message);
 
     if (isMissingAddonsTableError(err)) {
       return res.status(503).json({
@@ -8638,6 +8902,9 @@ app.post("/billing/apply-scheduled-changes", async (req, res) => {
 
       // Downgrade efectivo: cancelar add-ons que el plan nuevo no soporta
       const canceledAddons = await cancelUnsupportedAddons(tenant.id, newPlan);
+
+      // Resetear add-ons mensuales con facturación vencida
+      await resetMonthlyAddons(tenant.id);
 
       if (canceledAddons.length > 0) {
         console.log(
@@ -9261,6 +9528,18 @@ const {
       });
     }
 
+    // Capacidad grupal: aplica solo al configurar el servicio, nunca al reservar
+    if (Boolean(is_group)) {
+      const maxGroupCapacity = await getEffectiveGroupCapacity(tenant_id);
+
+      if (Number(capacity || 1) > maxGroupCapacity) {
+        return res.status(400).json({
+          error: `La capacidad del servicio excede el límite de tu plan (máx ${maxGroupCapacity} personas)`,
+          upgrade_required: true,
+        });
+      }
+    }
+
     const { data, error } = await supabase
       .from("services")
       .insert({
@@ -9321,7 +9600,7 @@ const {
 
     const { data: existingService, error: existingError } = await supabase
       .from("services")
-      .select("id, tenant_id, branch_id")
+      .select("id, tenant_id, branch_id, is_group, capacity")
       .eq("id", id)
       .single();
 
@@ -9330,6 +9609,32 @@ const {
     }
 
     const effectiveTenantId = tenant_id || existingService.tenant_id;
+
+    // Capacidad grupal: solo se valida cuando la edición toca is_group o
+    // capacity. Servicios legados sobre el límite no bloquean otras ediciones
+    // ni el booking (la validación nunca corre al reservar).
+    if (is_group !== undefined || capacity !== undefined) {
+      const effectiveIsGroup =
+        is_group !== undefined
+          ? Boolean(is_group)
+          : Boolean(existingService.is_group);
+      const effectiveCapacity =
+        capacity !== undefined
+          ? Number(capacity)
+          : Number(existingService.capacity || 1);
+
+      if (effectiveIsGroup) {
+        const maxGroupCapacity =
+          await getEffectiveGroupCapacity(effectiveTenantId);
+
+        if (effectiveCapacity > maxGroupCapacity) {
+          return res.status(400).json({
+            error: `La capacidad del servicio excede el límite de tu plan (máx ${maxGroupCapacity} personas)`,
+            upgrade_required: true,
+          });
+        }
+      }
+    }
 
     const updateData = {};
 
