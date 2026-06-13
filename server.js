@@ -66,7 +66,7 @@ function normalizeNullableNumber(value) {
   return Number.isFinite(numberValue) ? numberValue : null;
 }
 
-function getPlanCapabilities(plan) {
+function getPlanCapabilities(plan, opts = {}) {
   const normalizedPlan = String(plan || "pro").toLowerCase();
 
   // max_services = 999999: los servicios son ilimitados en todos los planes
@@ -125,7 +125,14 @@ function getPlanCapabilities(plan) {
     return plans.pro;
   }
 
-  return plans[normalizedPlan] || plans.pro;
+  const caps = plans[normalizedPlan] || plans.pro;
+
+  // Durante versión de prueba Pro: wa_confirmacion no incluido
+  if (opts.is_trial && normalizedPlan === "pro") {
+    return { ...caps, max_wa_confirmacion: 0 };
+  }
+
+  return caps;
 }
 
 const PLAN_PRICES = {
@@ -445,6 +452,84 @@ async function resetMonthlyAddons(tenant_id) {
     );
   } catch (err) {
     console.warn("resetMonthlyAddons error:", err.message);
+  }
+}
+
+// Mapa resource → clave en getPlanCapabilities
+const MONTHLY_RESOURCE_CAP_KEY = {
+  wa_confirmacion: "max_wa_confirmacion",
+  campanas_wa: "max_campanas_wa",
+  ia_wa: "max_ia_wa",
+  emails_campana: "max_campaign_emails_per_send",
+};
+
+async function checkMonthlyUsage(tenant_id, resource) {
+  const plan = await getPlan(tenant_id);
+  const caps = getPlanCapabilities(plan);
+  const capKey = MONTHLY_RESOURCE_CAP_KEY[resource];
+  if (!capKey) return { allowed: false, limit: 0, base: 0, addon: 0, used: 0, remaining: 0 };
+
+  const baseCap = caps[capKey] || 0;
+
+  // Capacidad de add-ons activos para este recurso
+  let addonCap = 0;
+  const addonDef = ADDON_CATALOG[resource];
+  if (addonDef) {
+    try {
+      const { data: addonRow } = await supabase
+        .from("tenant_addons")
+        .select("quantity")
+        .eq("tenant_id", tenant_id)
+        .eq("addon_key", resource)
+        .eq("status", "active")
+        .maybeSingle();
+      const qty = Number(addonRow?.quantity) || 0;
+      addonCap = qty * (addonDef.grants[resource] || 0);
+    } catch (_) {}
+  }
+
+  const total = baseCap + addonCap;
+  const period = new Date().toISOString().slice(0, 7);
+
+  let used = 0;
+  try {
+    const { data: usageRow } = await supabase
+      .from("tenant_monthly_usage")
+      .select("used")
+      .eq("tenant_id", tenant_id)
+      .eq("resource", resource)
+      .eq("period", period)
+      .maybeSingle();
+    used = Number(usageRow?.used) || 0;
+  } catch (_) {}
+
+  const remaining = Math.max(0, total - used);
+  return { allowed: total > 0 && used < total, limit: total, base: baseCap, addon: addonCap, used, remaining };
+}
+
+async function incrementMonthlyUsage(tenant_id, resource, amount = 1) {
+  const period = new Date().toISOString().slice(0, 7);
+  try {
+    const { data: existing } = await supabase
+      .from("tenant_monthly_usage")
+      .select("id, used")
+      .eq("tenant_id", tenant_id)
+      .eq("resource", resource)
+      .eq("period", period)
+      .maybeSingle();
+
+    if (existing) {
+      await supabase
+        .from("tenant_monthly_usage")
+        .update({ used: existing.used + amount, updated_at: new Date().toISOString() })
+        .eq("id", existing.id);
+    } else {
+      await supabase
+        .from("tenant_monthly_usage")
+        .insert({ tenant_id, resource, period, used: amount });
+    }
+  } catch (err) {
+    console.warn("incrementMonthlyUsage error:", err.message);
   }
 }
 
@@ -7355,6 +7440,11 @@ app.post("/campaigns/send-email", async (req, res) => {
       })
       .eq("id", campaignHistoryId);
 
+    // Registrar uso mensual de emails_campana
+    if (sent > 0) {
+      await incrementMonthlyUsage(tenant.id, "emails_campana", sent);
+    }
+
     return res.json({
       ok: true,
       campaign_history_id: campaignHistoryId,
@@ -8204,10 +8294,10 @@ app.get("/_ping", (req, res) => {
 ====================================================== */
 app.post("/tenants/provision", async (req, res) => {
   try {
-    const { user_id, email, plan, billing_cycle } = req.body;
+    const { user_id, email, plan = "pro", billing_cycle } = req.body;
 
-    if (!user_id || !email || !plan) {
-      return res.status(400).json({ error: "Faltan campos: user_id, email, plan" });
+    if (!user_id || !email) {
+      return res.status(400).json({ error: "Faltan campos: user_id, email" });
     }
 
     // billing_cycle opcional: mensual (default), semestral o anual
@@ -8230,12 +8320,14 @@ const billing_cycle_end = addMonths(
   BILLING_CYCLES[provisionCycle].months
 ).toISOString();
 
+const normalizedProvisionPlan = normalizePlanSlug(plan);
 const { data: tenant, error: tenantError } = await supabase
   .from("tenants")
   .insert({
     name: email,
     slug,
-    plan_slug: normalizePlanSlug(plan),
+    plan_slug: normalizedProvisionPlan,
+    is_trial: normalizedProvisionPlan === "pro",
     billing_cycle_start,
     billing_cycle_end,
     scheduled_plan_slug: null,
@@ -8549,9 +8641,74 @@ app.get("/billing/addons", async (req, res) => {
         : {}),
     }));
 
+    // Construir limits cuando hay tenant_id
+    let limits = null;
+    if (tenant_id && normalizedPlan) {
+      try {
+        const caps = getPlanCapabilities(normalizedPlan);
+        const period = new Date().toISOString().slice(0, 7);
+
+        // Cantidades de add-ons activos (una sola query)
+        const { data: addonRows } = await supabase
+          .from("tenant_addons")
+          .select("addon_key, quantity")
+          .eq("tenant_id", tenant_id)
+          .eq("status", "active");
+        const addonQty = {};
+        for (const row of addonRows || []) {
+          addonQty[row.addon_key] = Number(row.quantity) || 0;
+        }
+
+        // Uso mensual actual (una sola query)
+        const { data: usageRows } = await supabase
+          .from("tenant_monthly_usage")
+          .select("resource, used")
+          .eq("tenant_id", tenant_id)
+          .eq("period", period);
+        const usageMap = {};
+        for (const row of usageRows || []) {
+          usageMap[row.resource] = Number(row.used) || 0;
+        }
+
+        const addonTotal = (key) =>
+          (addonQty[key] || 0) * (ADDON_CATALOG[key]?.grants?.[key] || 0);
+        const usageEntry = (base, addonKey) => {
+          const addon = addonTotal(addonKey);
+          const total = base + addon;
+          const used = usageMap[addonKey] || 0;
+          return { base, addon, total, used, remaining: Math.max(0, total - used) };
+        };
+
+        limits = {
+          staff: {
+            base: caps.max_staff,
+            addon: addonQty.staff || 0,
+            total: caps.max_staff + (addonQty.staff || 0),
+          },
+          sucursales: {
+            base: caps.max_branches,
+            addon: addonQty.sucursal || 0,
+            total: caps.max_branches + (addonQty.sucursal || 0),
+          },
+          wa_confirmacion: usageEntry(caps.max_wa_confirmacion, "wa_confirmacion"),
+          campanas_wa: usageEntry(caps.max_campanas_wa || 0, "campanas_wa"),
+          ia_wa: usageEntry(caps.max_ia_wa, "ia_wa"),
+          emails_campana: usageEntry(caps.max_campaign_emails_per_send, "emails_campana"),
+          group_capacity: {
+            base: caps.max_group_capacity,
+            addon: addonTotal("group_capacity"),
+            total: caps.max_group_capacity + addonTotal("group_capacity"),
+          },
+        };
+      } catch (limitsErr) {
+        console.warn("GET /billing/addons limits error:", limitsErr.message);
+      }
+    }
+
     return res.json({
       ok: true,
       ...(normalizedPlan ? { plan: normalizedPlan } : {}),
+      ...(limits ? { limits } : {}),
       addons,
       ...(active !== null ? { active_addons: active } : {}),
     });
