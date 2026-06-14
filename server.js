@@ -4674,6 +4674,30 @@ await supabase
   .eq("id", apptCreated.id);
 await recalculateCustomerStats(customer.id);
 
+// Consolidar campos extra del booking en customers.extra_data (campos personalizados del tenant)
+if (customerData && typeof customerData === "object" && Object.keys(customerData).length > 0) {
+  const extraFields = { ...customerData };
+  // Excluir campos internos de mascotas que no son datos del cliente
+  delete extraFields.pet_id;
+  delete extraFields.pet_name;
+  delete extraFields.pet_species;
+  delete extraFields.pet_breed;
+  if (Object.keys(extraFields).length > 0) {
+    const { data: existingCustomer } = await supabase
+      .from("customers")
+      .select("id, extra_data")
+      .eq("id", customer.id)
+      .single();
+    if (existingCustomer) {
+      const mergedExtra = { ...(existingCustomer.extra_data ?? {}), ...extraFields };
+      await supabase
+        .from("customers")
+        .update({ extra_data: mergedExtra })
+        .eq("id", existingCustomer.id);
+    }
+  }
+}
+
     let apptUpdated = appt;
     let googleCalendarId = null;
     let eventId = null;
@@ -6387,6 +6411,54 @@ app.patch("/customers/:id", async (req, res) => {
   } catch (err) {
     console.error("PATCH /customers/:id error:", err.message);
     return res.status(500).json({ error: err.message || "Error actualizando cliente" });
+  }
+});
+
+/* ======================================================
+   ✅ PATCH /customers/:id/extra-data
+   Merge de campos personalizados (RUT, empresa, etc.) en customers.extra_data
+====================================================== */
+app.patch("/customers/:id/extra-data", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { extra_data, slug } = req.body;
+
+    if (!slug) return res.status(400).json({ error: "slug es obligatorio" });
+    if (!extra_data || typeof extra_data !== "object") return res.status(400).json({ error: "extra_data debe ser un objeto" });
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    if (tenantError || !tenant) return res.status(404).json({ error: "Negocio no encontrado" });
+
+    const { data: existing, error: findErr } = await supabase
+      .from("customers")
+      .select("id, extra_data")
+      .eq("id", id)
+      .eq("tenant_id", tenant.id)
+      .single();
+
+    if (findErr || !existing) return res.status(404).json({ error: "Cliente no encontrado" });
+
+    const merged = { ...(existing.extra_data ?? {}), ...extra_data };
+
+    const { data, error } = await supabase
+      .from("customers")
+      .update({ extra_data: merged, updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .eq("tenant_id", tenant.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, customer: data });
+  } catch (err) {
+    console.error("PATCH /customers/:id/extra-data error:", err.message);
+    return res.status(500).json({ error: err.message || "Error guardando datos extra" });
   }
 });
 
@@ -8231,6 +8303,34 @@ app.patch("/appointments/:id", async (req, res) => {
   } catch (err) {
     console.error("UPDATE appointment error:", err.message);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ PATCH /appointments/:id/session-notes
+   Guarda nota de sesión en appointments.notes (negocios genéricos)
+====================================================== */
+app.patch("/appointments/:id/session-notes", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { notes, tenant_id } = req.body;
+
+    if (!tenant_id) return res.status(400).json({ error: "tenant_id es obligatorio" });
+
+    const { data, error } = await supabase
+      .from("appointments")
+      .update({ notes: notes ?? null, updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .eq("tenant_id", tenant_id)
+      .select("id, notes")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, appointment: data });
+  } catch (err) {
+    console.error("PATCH /appointments/:id/session-notes error:", err.message);
+    return res.status(500).json({ error: err.message || "Error guardando nota" });
   }
 });
 
