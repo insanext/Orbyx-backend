@@ -6303,6 +6303,7 @@ app.patch("/customers/:id", async (req, res) => {
       name,
       phone,
       email,
+      notes,
       rut,
       birth_date,
       sex,
@@ -6323,8 +6324,8 @@ app.patch("/customers/:id", async (req, res) => {
     if (!id) {
       return res.status(400).json({ error: "id es obligatorio" });
     }
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ error: "name es obligatorio" });
+    if (name !== undefined && !String(name).trim()) {
+      return res.status(400).json({ error: "name no puede estar vacío" });
     }
 
     // Validar tenant por slug
@@ -6354,24 +6355,23 @@ app.patch("/customers/:id", async (req, res) => {
     const normalizedBirthDate =
       birth_date && String(birth_date).trim() ? String(birth_date).trim() : null;
 
-    const payload = {
-      name: String(name).trim(),
-      phone: phone ? String(phone).trim() : null,
-      email: email ? String(email).trim() : null,
-      rut: rut ? String(rut).trim() : null,
-      birth_date: normalizedBirthDate,
-      sex: sex ? String(sex).trim() : null,
-      intake_notes: intake_notes ? String(intake_notes).trim() : null,
-      occupation: occupation ? String(occupation).trim() : null,
-      health_insurance: health_insurance ? String(health_insurance).trim() : null,
-      emergency_contact_name: emergency_contact_name ? String(emergency_contact_name).trim() : null,
-      emergency_contact_phone: emergency_contact_phone ? String(emergency_contact_phone).trim() : null,
-      known_allergies: known_allergies ? String(known_allergies).trim() : null,
-      chronic_conditions: chronic_conditions ? String(chronic_conditions).trim() : null,
-      family_history: family_history ? String(family_history).trim() : null,
-      habits: habits ? String(habits).trim() : null,
-      updated_at: new Date().toISOString(),
-    };
+    const payload = { updated_at: new Date().toISOString() };
+    if (name !== undefined) payload.name = String(name).trim();
+    if (phone !== undefined) payload.phone = phone ? String(phone).trim() : null;
+    if (email !== undefined) payload.email = email ? String(email).trim() : null;
+    if (notes !== undefined) payload.notes = notes ? String(notes).trim() : null;
+    if (rut !== undefined) payload.rut = rut ? String(rut).trim() : null;
+    if (birth_date !== undefined) payload.birth_date = normalizedBirthDate;
+    if (sex !== undefined) payload.sex = sex ? String(sex).trim() : null;
+    if (intake_notes !== undefined) payload.intake_notes = intake_notes ? String(intake_notes).trim() : null;
+    if (occupation !== undefined) payload.occupation = occupation ? String(occupation).trim() : null;
+    if (health_insurance !== undefined) payload.health_insurance = health_insurance ? String(health_insurance).trim() : null;
+    if (emergency_contact_name !== undefined) payload.emergency_contact_name = emergency_contact_name ? String(emergency_contact_name).trim() : null;
+    if (emergency_contact_phone !== undefined) payload.emergency_contact_phone = emergency_contact_phone ? String(emergency_contact_phone).trim() : null;
+    if (known_allergies !== undefined) payload.known_allergies = known_allergies ? String(known_allergies).trim() : null;
+    if (chronic_conditions !== undefined) payload.chronic_conditions = chronic_conditions ? String(chronic_conditions).trim() : null;
+    if (family_history !== undefined) payload.family_history = family_history ? String(family_history).trim() : null;
+    if (habits !== undefined) payload.habits = habits ? String(habits).trim() : null;
 
     const { data, error } = await supabase
       .from("customers")
