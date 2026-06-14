@@ -8034,7 +8034,7 @@ app.patch("/appointments/:id/clinical-pending", async (req, res) => {
 app.patch("/appointments/:id/status", async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body;
+    const { status, notes } = req.body;
 
     const allowed = ["booked", "completed", "no_show", "rescheduled", "canceled"];
     if (!allowed.includes(status)) {
@@ -8055,12 +8055,15 @@ app.patch("/appointments/:id/status", async (req, res) => {
       await deleteCalendarEventForAppointment(appt);
     }
 
+    const updatePayload = {
+      status,
+      ...(status === "canceled" ? { canceled_at: new Date().toISOString() } : {}),
+    };
+    if (notes !== undefined) updatePayload.notes = String(notes).trim() || null;
+
     const { data, error } = await supabase
   .from("appointments")
-  .update({
-    status,
-    ...(status === "canceled" ? { canceled_at: new Date().toISOString() } : {}),
-  })
+  .update(updatePayload)
   .eq("id", id)
   .select()
   .single();
