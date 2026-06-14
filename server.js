@@ -9582,6 +9582,16 @@ app.patch("/branches/:id", async (req, res) => {
 
     if (error) throw error;
 
+    // Al activar herencia de horario global, limpiar rows propios de la sucursal
+    // para que no interfieran si se vuelve a usar horario propio en el futuro
+    if (updateData.use_global_hours === true) {
+      await supabase
+        .from("business_hours")
+        .delete()
+        .eq("tenant_id", effectiveTenantId)
+        .eq("branch_id", id);
+    }
+
     return res.json({
       ok: true,
       branch: data,
