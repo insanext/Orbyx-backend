@@ -8313,15 +8313,23 @@ app.patch("/appointments/:id", async (req, res) => {
 app.patch("/appointments/:id/session-notes", async (req, res) => {
   try {
     const { id } = req.params;
-    const { notes, tenant_id } = req.body;
+    const { notes, slug } = req.body;
 
-    if (!tenant_id) return res.status(400).json({ error: "tenant_id es obligatorio" });
+    if (!slug) return res.status(400).json({ error: "slug es obligatorio" });
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .single();
+
+    if (tenantError || !tenant) return res.status(404).json({ error: "Negocio no encontrado" });
 
     const { data, error } = await supabase
       .from("appointments")
       .update({ notes: notes ?? null, updated_at: new Date().toISOString() })
       .eq("id", id)
-      .eq("tenant_id", tenant_id)
+      .eq("tenant_id", tenant.id)
       .select("id, notes")
       .single();
 
