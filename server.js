@@ -9738,7 +9738,7 @@ app.get("/services", async (req, res) => {
       .eq("tenant_id", tenant_id)
       .eq("branch_id", resolvedBranchId)
       .is("deleted_at", null)
-      .order("created_at", { ascending: true });
+      .order("sort_order", { ascending: true });
 
     if (active === "true") {
       query = query.eq("active", true);
@@ -9763,6 +9763,139 @@ app.get("/services", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+/* ======================================================
+   ✅ Service Groups endpoints
+====================================================== */
+
+app.get('/service-groups', async (req, res) => {
+  try {
+    const { tenant_id, branch_id } = req.query
+    if (!tenant_id || !branch_id) return res.status(400).json({ error: 'tenant_id y branch_id requeridos' })
+    const { data, error } = await supabase
+      .from('service_groups')
+      .select('*')
+      .eq('tenant_id', tenant_id)
+      .eq('branch_id', branch_id)
+      .order('sort_order', { ascending: true })
+    if (error) throw error
+    res.json(data ?? [])
+  } catch (err) {
+    console.error('GET /service-groups error:', err)
+    res.status(500).json({ error: 'Error obteniendo grupos' })
+  }
+})
+
+app.post('/service-groups', async (req, res) => {
+  try {
+    const { tenant_id, branch_id, name } = req.body
+    if (!tenant_id || !branch_id || !name?.trim()) {
+      return res.status(400).json({ error: 'tenant_id, branch_id y name requeridos' })
+    }
+    const { data: existing } = await supabase
+      .from('service_groups')
+      .select('sort_order')
+      .eq('tenant_id', tenant_id)
+      .eq('branch_id', branch_id)
+      .order('sort_order', { ascending: false })
+      .limit(1)
+    const nextOrder = existing?.[0] ? existing[0].sort_order + 1 : 0
+    const { data, error } = await supabase
+      .from('service_groups')
+      .insert({ tenant_id, branch_id, name: name.trim(), sort_order: nextOrder })
+      .select()
+      .single()
+    if (error) throw error
+    res.json(data)
+  } catch (err) {
+    console.error('POST /service-groups error:', err)
+    res.status(500).json({ error: 'Error creando grupo' })
+  }
+})
+
+app.patch('/service-groups/reorder', async (req, res) => {
+  try {
+    const { tenant_id, order } = req.body
+    if (!tenant_id || !Array.isArray(order)) return res.status(400).json({ error: 'tenant_id y order requeridos' })
+    const updates = order.map(({ id, sort_order }) =>
+      supabase.from('service_groups').update({ sort_order }).eq('id', id).eq('tenant_id', tenant_id)
+    )
+    await Promise.all(updates)
+    res.json({ success: true })
+  } catch (err) {
+    console.error('PATCH /service-groups/reorder error:', err)
+    res.status(500).json({ error: 'Error reordenando grupos' })
+  }
+})
+
+app.patch('/service-groups/:id', async (req, res) => {
+  try {
+    const { id } = req.params
+    const { name, tenant_id } = req.body
+    if (!tenant_id || !name?.trim()) return res.status(400).json({ error: 'tenant_id y name requeridos' })
+    const { data, error } = await supabase
+      .from('service_groups')
+      .update({ name: name.trim(), updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .eq('tenant_id', tenant_id)
+      .select()
+      .single()
+    if (error) throw error
+    res.json(data)
+  } catch (err) {
+    console.error('PATCH /service-groups/:id error:', err)
+    res.status(500).json({ error: 'Error actualizando grupo' })
+  }
+})
+
+app.delete('/service-groups/:id', async (req, res) => {
+  try {
+    const { id } = req.params
+    const { tenant_id } = req.query
+    if (!tenant_id) return res.status(400).json({ error: 'tenant_id requerido' })
+    const { data: existing } = await supabase
+      .from('service_groups')
+      .select('id')
+      .eq('id', id)
+      .eq('tenant_id', tenant_id)
+      .single()
+    if (!existing) return res.status(404).json({ error: 'Grupo no encontrado' })
+    await supabase
+      .from('services')
+      .update({ group_id: null })
+      .eq('group_id', id)
+      .eq('tenant_id', tenant_id)
+    const { error } = await supabase
+      .from('service_groups')
+      .delete()
+      .eq('id', id)
+      .eq('tenant_id', tenant_id)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    console.error('DELETE /service-groups/:id error:', err)
+    res.status(500).json({ error: 'Error eliminando grupo' })
+  }
+})
+
+app.patch('/services/reorder', async (req, res) => {
+  try {
+    const { tenant_id, order } = req.body
+    if (!tenant_id || !Array.isArray(order)) return res.status(400).json({ error: 'tenant_id y order requeridos' })
+    const updates = order.map(({ id, group_id, sort_order }) =>
+      supabase
+        .from('services')
+        .update({ group_id: group_id ?? null, sort_order })
+        .eq('id', id)
+        .eq('tenant_id', tenant_id)
+    )
+    await Promise.all(updates)
+    res.json({ success: true })
+  } catch (err) {
+    console.error('PATCH /services/reorder error:', err)
+    res.status(500).json({ error: 'Error reordenando servicios' })
+  }
+})
 
 /* ======================================================
    ✅ POST /services
