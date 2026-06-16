@@ -11232,13 +11232,13 @@ app.get("/api/pets/:slug", async (req, res) => {
 ====================================================== */
 app.post("/invitations", async (req, res) => {
   try {
-    const { tenant_id, email, role, branch_id, invited_by } = req.body;
+    const { tenant_id, email, role, branch_id, invited_by, permissions } = req.body;
 
     if (!tenant_id || !email || !role) {
       return res.status(400).json({ error: "Faltan campos: tenant_id, email, role" });
     }
 
-    const validRoles = ["admin", "branch", "readonly"];
+    const validRoles = ["admin", "branch", "readonly", "custom"];
     if (!validRoles.includes(role)) {
       return res.status(400).json({ error: "role inválido. Valores permitidos: admin, branch, readonly" });
     }
@@ -11325,6 +11325,7 @@ app.post("/invitations", async (req, res) => {
 
     if (branch_id) insertPayload.branch_id = branch_id;
     if (invited_by) insertPayload.invited_by = invited_by;
+    if (permissions) insertPayload.permissions = permissions;
 
     const { data: invitation, error: insertError } = await supabase
       .from("tenant_invitations")
@@ -11437,7 +11438,7 @@ app.post("/invitations/accept/:token", async (req, res) => {
     // Buscar invitación por token
     const { data: invitation, error: fetchError } = await supabase
       .from("tenant_invitations")
-      .select("id, tenant_id, branch_id, email, role, status, expires_at")
+      .select("id, tenant_id, branch_id, email, role, permissions, status, expires_at")
       .eq("token", token)
       .single();
 
@@ -11511,6 +11512,7 @@ app.post("/invitations/accept/:token", async (req, res) => {
         user_id: authUser.id,
         tenant_id: invitation.tenant_id,
         role: invitation.role,
+        permissions: invitation.permissions ?? {},
         is_active: true,
       });
 
@@ -11551,6 +11553,45 @@ app.post("/invitations/accept/:token", async (req, res) => {
   } catch (err) {
     console.error("POST /invitations/accept/:token error:", err.message);
     return res.status(500).json({ error: "Error aceptando invitación", detail: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ INVITACIONES — GET /invitations/token/:token
+   Endpoint público para leer una invitación pendiente por token.
+====================================================== */
+app.get("/invitations/token/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { data, error } = await supabase
+      .from("tenant_invitations")
+      .select("id, email, role, permissions, status, expires_at, tenant_id")
+      .eq("token", token)
+      .eq("status", "pending")
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: "Invitación no válida o ya fue usada." });
+    }
+
+    if (data.expires_at && new Date(data.expires_at) < new Date()) {
+      return res.status(410).json({ error: "Esta invitación ha expirado." });
+    }
+
+    const { data: tenant } = await supabase
+      .from("tenants")
+      .select("name, slug")
+      .eq("id", data.tenant_id)
+      .single();
+
+    return res.json({
+      ...data,
+      tenant_name: tenant?.name ?? "el negocio",
+      tenant_slug: tenant?.slug ?? null,
+    });
+  } catch (err) {
+    console.error("GET /invitations/token/:token error:", err.message);
+    return res.status(500).json({ error: "Error verificando invitación" });
   }
 });
 
