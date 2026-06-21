@@ -11217,6 +11217,7 @@ app.post("/upload/ticket-attachment", uploadTicket.single("file"), async (req, r
 app.post("/support/tickets", async (req, res) => {
   try {
     const { tenant_id, created_by, subject, category, description, attachments } = req.body;
+    console.log("[DEBUG support/tickets] body:", JSON.stringify({ tenant_id, created_by, subject, category, description: description?.slice(0, 30) }));
     if (!tenant_id || !created_by || !subject?.trim() || !description?.trim())
       return res.status(400).json({ error: "Faltan datos requeridos" });
     if (Array.isArray(attachments) && attachments.length > 1)
