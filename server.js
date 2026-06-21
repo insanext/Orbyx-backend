@@ -40,7 +40,7 @@ const upload = multer({
 
 const uploadTicket = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: 1 * 1024 * 1024 },
 });
 
 // =======================
@@ -11199,8 +11199,8 @@ app.post("/upload/ticket-attachment", uploadTicket.single("file"), async (req, r
     const allowed = ["image/jpeg", "image/png", "image/webp"];
     if (!allowed.includes(req.file.mimetype))
       return res.status(400).json({ error: "Solo se permiten imágenes JPG, PNG o WebP" });
-    if (req.file.size > 5 * 1024 * 1024)
-      return res.status(400).json({ error: "La imagen no debe superar 5MB" });
+    if (req.file.size > 1 * 1024 * 1024)
+      return res.status(400).json({ error: "La imagen no debe superar 1MB" });
     const fileName = `${tenant_id}/${Date.now()}-${req.file.originalname}`;
     const { error } = await supabase.storage
       .from("ticket-attachments")
@@ -11219,8 +11219,8 @@ app.post("/support/tickets", async (req, res) => {
     const { tenant_id, created_by, subject, category, description, attachments } = req.body;
     if (!tenant_id || !created_by || !subject?.trim() || !description?.trim())
       return res.status(400).json({ error: "Faltan datos requeridos" });
-    if (Array.isArray(attachments) && attachments.length > 2)
-      return res.status(400).json({ error: "Máximo 2 imágenes por ticket" });
+    if (Array.isArray(attachments) && attachments.length > 1)
+      return res.status(400).json({ error: "Máximo 1 imagen por ticket" });
     const validCategories = [
       "agenda_reservas", "pagina_publica", "disponibilidad_horarios",
       "staff", "servicios", "sucursales", "clientes", "campanas",
@@ -11306,8 +11306,8 @@ app.post("/support/tickets/:id/messages", async (req, res) => {
     const { tenant_id, sender_id, message, attachments } = req.body;
     if (!tenant_id || !sender_id || !message?.trim())
       return res.status(400).json({ error: "Faltan datos requeridos" });
-    if (Array.isArray(attachments) && attachments.length > 2)
-      return res.status(400).json({ error: "Máximo 2 imágenes por mensaje" });
+    if (Array.isArray(attachments) && attachments.length > 1)
+      return res.status(400).json({ error: "Máximo 1 imagen por mensaje" });
     const { data: ticket } = await supabase
       .from("support_tickets")
       .select("id, status")
