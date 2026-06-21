@@ -9,7 +9,12 @@ const cors = require("cors");
 const { google } = require("googleapis");
 const crypto = require("crypto");
 const PDFDocument = require("pdfkit");
-const { sendBookingEmail, sendInvitationEmail } = require("./email");
+const {
+  sendBookingEmail,
+  sendInvitationEmail,
+  sendEmailChangeConfirmationToOldEmail,
+  sendEmailChangeVerificationToNewEmail,
+} = require("./email");
 
 const app = express();
 
@@ -11782,5 +11787,227 @@ app.patch("/members/:id", async (req, res) => {
   } catch (err) {
     console.error("PATCH /members/:id error:", err.message);
     return res.status(500).json({ error: "Error actualizando miembro", detail: err.message });
+  }
+});
+
+
+/* ======================================================
+   ACCOUNT — EMAIL CHANGE (dual-confirmation)
+====================================================== */
+
+async function logSecurityAudit(user_id, tenant_id, action, metadata, ip_address) {
+  try {
+    await supabase.from("security_audit_log").insert({
+      user_id,
+      tenant_id: tenant_id || null,
+      action,
+      metadata: metadata || {},
+      ip_address: ip_address || null,
+    });
+  } catch (err) {
+    console.error("logSecurityAudit error:", err.message);
+  }
+}
+
+async function verifyCurrentPassword(email, password) {
+  try {
+    const r = await fetch(
+      process.env.SUPABASE_URL + "/auth/v1/token?grant_type=password",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+        },
+        body: JSON.stringify({ email, password }),
+      }
+    );
+    return r.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function maybeApplyEmailChange(requestId, record) {
+  if (!record.old_confirmed_at || !record.new_confirmed_at) return;
+  if (record.status !== "pending") return;
+
+  const { error: updateErr } = await supabase
+    .from("email_change_requests")
+    .update({ status: "applied" })
+    .eq("id", requestId);
+
+  if (updateErr) {
+    console.error("maybeApplyEmailChange update status error:", updateErr.message);
+    return;
+  }
+
+  const { error: authErr } = await supabase.auth.admin.updateUserById(record.user_id, {
+    email: record.new_email,
+  });
+
+  if (authErr) {
+    console.error("maybeApplyEmailChange auth.admin.updateUserById error:", authErr.message);
+    await supabase.from("email_change_requests").update({ status: "pending" }).eq("id", requestId);
+  } else {
+    await logSecurityAudit(record.user_id, record.tenant_id, "email_changed", {
+      old_email: record.current_email,
+      new_email: record.new_email,
+    }, null);
+  }
+}
+
+app.post("/account/email-change/request", async (req, res) => {
+  try {
+    const { user_id, current_email, new_email, password, tenant_id } = req.body;
+    if (!user_id || !current_email || !new_email || !password) {
+      return res.status(400).json({ error: "user_id, current_email, new_email y password son obligatorios" });
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(new_email)) {
+      return res.status(400).json({ error: "El nuevo correo no es valido" });
+    }
+    if (current_email.toLowerCase() === new_email.toLowerCase()) {
+      return res.status(400).json({ error: "El nuevo correo es igual al actual" });
+    }
+    const pwOk = await verifyCurrentPassword(current_email, password);
+    if (!pwOk) {
+      return res.status(401).json({ error: "Contrasena incorrecta" });
+    }
+    await supabase
+      .from("email_change_requests")
+      .update({ status: "cancelled" })
+      .eq("user_id", user_id)
+      .eq("status", "pending");
+
+    const tokenOld = crypto.randomBytes(32).toString("hex");
+    const tokenNew = crypto.randomBytes(32).toString("hex");
+
+    const { error: insertErr } = await supabase.from("email_change_requests").insert({
+      user_id,
+      tenant_id: tenant_id || null,
+      current_email,
+      new_email,
+      token_confirm_old_email: tokenOld,
+      token_confirm_new_email: tokenNew,
+      expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    });
+    if (insertErr) throw insertErr;
+
+    await sendEmailChangeConfirmationToOldEmail({ to: current_email, newEmail: new_email, token: tokenOld });
+    await logSecurityAudit(user_id, tenant_id || null, "email_change_requested", { current_email, new_email }, req.ip);
+
+    return res.json({ ok: true, message: "Solicitud iniciada. Revisa tu correo actual para confirmar." });
+  } catch (err) {
+    console.error("POST /account/email-change/request error:", err.message);
+    return res.status(500).json({ error: "Error interno", detail: err.message });
+  }
+});
+
+app.get("/account/email-change/confirm-old/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { data, error } = await supabase
+      .from("email_change_requests")
+      .select("*")
+      .eq("token_confirm_old_email", token)
+      .eq("status", "pending")
+      .single();
+
+    if (error || !data) return res.status(404).json({ error: "Token invalido o ya fue usado." });
+    if (new Date(data.expires_at) < new Date()) {
+      return res.status(410).json({ error: "Este enlace expiro. Solicita un nuevo cambio de correo." });
+    }
+    if (data.old_confirmed_at) {
+      return res.json({ ok: true, already: true, message: "Este correo ya fue confirmado anteriormente." });
+    }
+
+    const { error: updateErr } = await supabase
+      .from("email_change_requests")
+      .update({ old_confirmed_at: new Date().toISOString() })
+      .eq("id", data.id);
+    if (updateErr) throw updateErr;
+
+    await sendEmailChangeVerificationToNewEmail({ to: data.new_email, token: data.token_confirm_new_email });
+
+    const fresh = { ...data, old_confirmed_at: new Date().toISOString() };
+    await maybeApplyEmailChange(data.id, fresh);
+
+    return res.json({ ok: true, message: "Correo actual confirmado. Revisa tu nuevo correo para completar el cambio." });
+  } catch (err) {
+    console.error("GET /account/email-change/confirm-old error:", err.message);
+    return res.status(500).json({ error: "Error interno", detail: err.message });
+  }
+});
+
+app.get("/account/email-change/confirm-new/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { data, error } = await supabase
+      .from("email_change_requests")
+      .select("*")
+      .eq("token_confirm_new_email", token)
+      .eq("status", "pending")
+      .single();
+
+    if (error || !data) return res.status(404).json({ error: "Token invalido o ya fue usado." });
+    if (new Date(data.expires_at) < new Date()) {
+      return res.status(410).json({ error: "Este enlace expiro. Solicita un nuevo cambio de correo." });
+    }
+    if (!data.old_confirmed_at) {
+      return res.status(400).json({ error: "Primero debes confirmar desde tu correo actual." });
+    }
+    if (data.new_confirmed_at) {
+      return res.json({ ok: true, already: true, message: "El cambio ya fue aplicado anteriormente." });
+    }
+
+    const { error: updateErr } = await supabase
+      .from("email_change_requests")
+      .update({ new_confirmed_at: new Date().toISOString() })
+      .eq("id", data.id);
+    if (updateErr) throw updateErr;
+
+    await maybeApplyEmailChange(data.id, { ...data, new_confirmed_at: new Date().toISOString() });
+
+    return res.json({ ok: true, message: "Listo. Tu correo fue actualizado correctamente." });
+  } catch (err) {
+    console.error("GET /account/email-change/confirm-new error:", err.message);
+    return res.status(500).json({ error: "Error interno", detail: err.message });
+  }
+});
+
+app.get("/account/email-change/status", async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: "user_id es obligatorio" });
+
+    const { data, error } = await supabase
+      .from("email_change_requests")
+      .select("id, new_email, old_confirmed_at, new_confirmed_at, status, expires_at, created_at")
+      .eq("user_id", user_id)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) return res.json({ ok: true, pending: false });
+
+    if (new Date(data.expires_at) < new Date()) {
+      await supabase.from("email_change_requests").update({ status: "expired" }).eq("id", data.id);
+      return res.json({ ok: true, pending: false });
+    }
+
+    return res.json({
+      ok: true,
+      pending: true,
+      new_email: data.new_email,
+      old_confirmed: Boolean(data.old_confirmed_at),
+      new_confirmed: Boolean(data.new_confirmed_at),
+      expires_at: data.expires_at,
+    });
+  } catch (err) {
+    console.error("GET /account/email-change/status error:", err.message);
+    return res.status(500).json({ error: "Error interno", detail: err.message });
   }
 });

@@ -231,4 +231,129 @@ async function sendInvitationEmail({ email, businessName, role, token }) {
   }
 }
 
-module.exports = { sendBookingEmail, sendInvitationEmail };
+async function sendEmailChangeConfirmationToOldEmail({ to, newEmail, token }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Email de cambio de correo omitido.");
+      return;
+    }
+    const confirmUrl = `https://www.orbyx.cl/account/confirm-email-change/old/${token}`;
+    await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: "Confirma el cambio de tu correo electrónico en Orbyx",
+      html: `
+<div style="margin:0; padding:30px 16px; background:#f1f5f9; font-family:Arial, Helvetica, sans-serif;">
+  <div style="max-width:560px; margin:0 auto;">
+    <div style="background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.1);">
+      <div style="background:linear-gradient(135deg,#0f172a,#1e3a5f); padding:28px; text-align:center;">
+        <div style="color:#cbd5e1; font-size:12px; letter-spacing:0.2em;">CAMBIO DE CORREO</div>
+        <h1 style="color:#ffffff; margin:10px 0 0; font-size:26px;">Orbyx</h1>
+      </div>
+      <div style="padding:24px;">
+        <div style="background:#fef9c3; color:#854d0e; display:inline-block; padding:6px 12px; border-radius:999px; font-size:12px; margin-bottom:12px;">
+          ⚠ Paso 1 de 2 — Confirma desde tu correo actual
+        </div>
+        <h2 style="margin:0 0 10px;">Solicitud de cambio de correo</h2>
+        <p style="color:#475569;">
+          Recibimos una solicitud para cambiar el correo de tu cuenta al siguiente:
+          <strong>${newEmail}</strong>.
+        </p>
+        <p style="color:#475569;">
+          Si fuiste tú, haz clic en el botón para confirmar desde tu correo actual.
+          Luego recibirás un segundo correo en <strong>${newEmail}</strong> para completar el proceso.
+        </p>
+        <p style="color:#94a3b8; font-size:13px;">
+          Si no solicitaste este cambio, ignora este correo y tu cuenta no cambiará.
+          El enlace expira en <strong>24 horas</strong>.
+        </p>
+        <div style="text-align:center; margin-top:24px;">
+          <a href="${confirmUrl}" style="background:#0f172a; color:white; padding:12px 24px; border-radius:12px; text-decoration:none; font-weight:bold; font-size:15px;">
+            Sí, solicité este cambio
+          </a>
+        </div>
+        <p style="margin-top:20px; font-size:12px; color:#94a3b8; text-align:center;">
+          O copia este enlace:<br/>
+          <a href="${confirmUrl}" style="color:#6366f1;">${confirmUrl}</a>
+        </p>
+      </div>
+      <div style="padding:16px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
+        <a href="https://orbyx.cl" style="color:#64748b; font-size:12px; text-decoration:none;" target="_blank">
+          Orbyx · Sistema de reservas inteligentes
+        </a>
+      </div>
+    </div>
+  </div>
+</div>`,
+    });
+  } catch (error) {
+    console.error("Error enviando email de confirmación (correo actual):", error);
+  }
+}
+
+async function sendEmailChangeVerificationToNewEmail({ to, token }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Email de verificación de nuevo correo omitido.");
+      return;
+    }
+    const verifyUrl = `https://www.orbyx.cl/account/confirm-email-change/new/${token}`;
+    await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: "Verifica tu nuevo correo electrónico en Orbyx",
+      html: `
+<div style="margin:0; padding:30px 16px; background:#f1f5f9; font-family:Arial, Helvetica, sans-serif;">
+  <div style="max-width:560px; margin:0 auto;">
+    <div style="background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.1);">
+      <div style="background:linear-gradient(135deg,#0f172a,#1e3a5f); padding:28px; text-align:center;">
+        <div style="color:#cbd5e1; font-size:12px; letter-spacing:0.2em;">CAMBIO DE CORREO</div>
+        <h1 style="color:#ffffff; margin:10px 0 0; font-size:26px;">Orbyx</h1>
+      </div>
+      <div style="padding:24px;">
+        <div style="background:#dcfce7; color:#166534; display:inline-block; padding:6px 12px; border-radius:999px; font-size:12px; margin-bottom:12px;">
+          ✔ Paso 2 de 2 — Verifica tu nuevo correo
+        </div>
+        <h2 style="margin:0 0 10px;">¡Ya casi está!</h2>
+        <p style="color:#475569;">
+          Tu correo actual ya confirmó el cambio. Ahora solo falta que verifiques
+          <strong>${to}</strong> como tu nuevo correo en Orbyx.
+        </p>
+        <p style="color:#475569;">
+          Haz clic en el botón para completar el cambio. Una vez verificado, podrás
+          iniciar sesión con este correo.
+        </p>
+        <p style="color:#94a3b8; font-size:13px;">
+          El enlace expira en <strong>24 horas</strong>.
+          Si no solicitaste este cambio, ignora este correo.
+        </p>
+        <div style="text-align:center; margin-top:24px;">
+          <a href="${verifyUrl}" style="background:#166534; color:white; padding:12px 24px; border-radius:12px; text-decoration:none; font-weight:bold; font-size:15px;">
+            Confirmar nuevo correo
+          </a>
+        </div>
+        <p style="margin-top:20px; font-size:12px; color:#94a3b8; text-align:center;">
+          O copia este enlace:<br/>
+          <a href="${verifyUrl}" style="color:#6366f1;">${verifyUrl}</a>
+        </p>
+      </div>
+      <div style="padding:16px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
+        <a href="https://orbyx.cl" style="color:#64748b; font-size:12px; text-decoration:none;" target="_blank">
+          Orbyx · Sistema de reservas inteligentes
+        </a>
+      </div>
+    </div>
+  </div>
+</div>`,
+    });
+  } catch (error) {
+    console.error("Error enviando email de verificación (nuevo correo):", error);
+  }
+}
+
+module.exports = {
+  sendBookingEmail,
+  sendInvitationEmail,
+  sendEmailChangeConfirmationToOldEmail,
+  sendEmailChangeVerificationToNewEmail,
+};
