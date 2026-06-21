@@ -11578,6 +11578,7 @@ app.post("/invitations", async (req, res) => {
     if (branch_id) insertPayload.branch_id = branch_id;
     if (invited_by) insertPayload.invited_by = invited_by;
     if (permissions) insertPayload.permissions = permissions;
+    if (req.body.branch_ids) insertPayload.branch_ids = req.body.branch_ids;
 
     const { data: invitation, error: insertError } = await supabase
       .from("tenant_invitations")
@@ -11765,6 +11766,7 @@ app.post("/invitations/accept/:token", async (req, res) => {
         tenant_id: invitation.tenant_id,
         role: invitation.role,
         permissions: invitation.permissions ?? {},
+        branch_ids: invitation.branch_ids ?? [],
         is_active: true,
       });
 
@@ -11930,7 +11932,7 @@ app.get("/members", async (req, res) => {
 app.patch("/members/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { tenant_id, role, branch_id, is_active } = req.body;
+    const { tenant_id, role, branch_id, is_active, permissions, branch_ids } = req.body;
 
     if (!id || !tenant_id) {
       return res.status(400).json({ error: "Faltan campos: id (param), tenant_id (body)" });
@@ -11984,6 +11986,8 @@ app.patch("/members/:id", async (req, res) => {
     const updatePayload = {};
     if (role !== undefined) updatePayload.role = role;
     if (is_active !== undefined) updatePayload.is_active = Boolean(is_active);
+    if (permissions !== undefined) updatePayload.permissions = permissions;
+    if (branch_ids !== undefined) updatePayload.branch_ids = branch_ids;
 
     const { data: updated, error: updateError } = await supabase
       .from("tenant_users")
