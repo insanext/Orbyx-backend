@@ -38,6 +38,11 @@ const upload = multer({
   },
 });
 
+const uploadTicket = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+});
+
 // =======================
 // HELPERS
 // =======================
@@ -189,6 +194,11 @@ function inferBillingCycle(billingStart, billingEnd) {
   if (days >= 300) return "anual";
   if (days >= 150) return "semestral";
   return "mensual";
+}
+
+function getPriorityByPlan(plan) {
+  const map = { pro: "normal", premium: "media", vip: "alta", platinum: "maxima" };
+  return map[String(plan || "pro").toLowerCase()] ?? "normal";
 }
 
 function normalizePlanSlug(plan) {
@@ -11177,6 +11187,154 @@ app.delete("/campaign-images/:id", async (req, res) => {
 /* ======================================================
    🚀 START
 ====================================================== */
+// =======================
+// SOPORTE — TICKETS
+// =======================
+
+app.post("/upload/ticket-attachment", uploadTicket.single("file"), async (req, res) => {
+  try {
+    const { tenant_id } = req.body;
+    if (!tenant_id || !req.file)
+      return res.status(400).json({ error: "tenant_id y archivo requeridos" });
+    const allowed = ["image/jpeg", "image/png", "image/webp"];
+    if (!allowed.includes(req.file.mimetype))
+      return res.status(400).json({ error: "Solo se permiten imágenes JPG, PNG o WebP" });
+    if (req.file.size > 5 * 1024 * 1024)
+      return res.status(400).json({ error: "La imagen no debe superar 5MB" });
+    const fileName = `${tenant_id}/${Date.now()}-${req.file.originalname}`;
+    const { error } = await supabase.storage
+      .from("ticket-attachments")
+      .upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
+    if (error) throw error;
+    const { data: urlData } = supabase.storage.from("ticket-attachments").getPublicUrl(fileName);
+    res.json({ url: urlData.publicUrl });
+  } catch (err) {
+    console.error("POST /upload/ticket-attachment error:", err);
+    res.status(500).json({ error: "Error subiendo imagen" });
+  }
+});
+
+app.post("/support/tickets", async (req, res) => {
+  try {
+    const { tenant_id, created_by, subject, category, description, attachments } = req.body;
+    if (!tenant_id || !created_by || !subject?.trim() || !description?.trim())
+      return res.status(400).json({ error: "Faltan datos requeridos" });
+    if (Array.isArray(attachments) && attachments.length > 2)
+      return res.status(400).json({ error: "Máximo 2 imágenes por ticket" });
+    const validCategories = ["error_tecnico", "duda", "sugerencia", "facturacion"];
+    if (!validCategories.includes(category))
+      return res.status(400).json({ error: "Categoría no válida" });
+    const { data: tenant } = await supabase
+      .from("tenants")
+      .select("plan")
+      .eq("id", tenant_id)
+      .single();
+    const plan = tenant?.plan ?? "pro";
+    const priority = getPriorityByPlan(plan);
+    const { data, error } = await supabase
+      .from("support_tickets")
+      .insert({
+        tenant_id,
+        created_by,
+        subject: subject.trim(),
+        category,
+        description: description.trim(),
+        attachments: attachments ?? [],
+        plan_at_creation: plan,
+        priority,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("POST /support/tickets error:", err);
+    res.status(500).json({ error: "Error creando ticket" });
+  }
+});
+
+app.get("/support/tickets", async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+    if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
+    const { data, error } = await supabase
+      .from("support_tickets")
+      .select("*")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json(data ?? []);
+  } catch (err) {
+    console.error("GET /support/tickets error:", err);
+    res.status(500).json({ error: "Error obteniendo tickets" });
+  }
+});
+
+app.get("/support/tickets/:id/messages", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tenant_id } = req.query;
+    if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
+    const { data: ticket } = await supabase
+      .from("support_tickets")
+      .select("id")
+      .eq("id", id)
+      .eq("tenant_id", tenant_id)
+      .single();
+    if (!ticket) return res.status(404).json({ error: "Ticket no encontrado" });
+    const { data, error } = await supabase
+      .from("support_ticket_messages")
+      .select("*")
+      .eq("ticket_id", id)
+      .order("created_at", { ascending: true });
+    if (error) throw error;
+    res.json(data ?? []);
+  } catch (err) {
+    console.error("GET /support/tickets/:id/messages error:", err);
+    res.status(500).json({ error: "Error obteniendo mensajes" });
+  }
+});
+
+app.post("/support/tickets/:id/messages", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tenant_id, sender_id, message, attachments } = req.body;
+    if (!tenant_id || !sender_id || !message?.trim())
+      return res.status(400).json({ error: "Faltan datos requeridos" });
+    if (Array.isArray(attachments) && attachments.length > 2)
+      return res.status(400).json({ error: "Máximo 2 imágenes por mensaje" });
+    const { data: ticket } = await supabase
+      .from("support_tickets")
+      .select("id, status")
+      .eq("id", id)
+      .eq("tenant_id", tenant_id)
+      .single();
+    if (!ticket) return res.status(404).json({ error: "Ticket no encontrado" });
+    const { data, error } = await supabase
+      .from("support_ticket_messages")
+      .insert({
+        ticket_id: id,
+        sender_type: "customer",
+        sender_id,
+        message: message.trim(),
+        attachments: attachments ?? [],
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    if (ticket.status === "closed") {
+      await supabase
+        .from("support_tickets")
+        .update({ status: "open", updated_at: new Date().toISOString() })
+        .eq("id", id);
+    }
+    res.json(data);
+  } catch (err) {
+    console.error("POST /support/tickets/:id/messages error:", err);
+    res.status(500).json({ error: "Error enviando mensaje" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Servidor listo en http://localhost:${PORT}`);
 });
