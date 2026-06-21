@@ -11221,7 +11221,12 @@ app.post("/support/tickets", async (req, res) => {
       return res.status(400).json({ error: "Faltan datos requeridos" });
     if (Array.isArray(attachments) && attachments.length > 2)
       return res.status(400).json({ error: "Máximo 2 imágenes por ticket" });
-    const validCategories = ["error_tecnico", "duda", "sugerencia", "facturacion"];
+    const validCategories = [
+      "agenda_reservas", "pagina_publica", "disponibilidad_horarios",
+      "staff", "servicios", "sucursales", "clientes", "campanas",
+      "facturacion_planes", "mi_cuenta", "equipo_permisos", "calendario_google",
+      "error_tecnico", "sugerencia", "otro",
+    ];
     if (!validCategories.includes(category))
       return res.status(400).json({ error: "Categoría no válida" });
     const { data: tenant } = await supabase
@@ -11322,16 +11327,99 @@ app.post("/support/tickets/:id/messages", async (req, res) => {
       .select()
       .single();
     if (error) throw error;
-    if (ticket.status === "closed") {
+    const { sender_type } = req.body;
+    if (sender_type === "support") {
       await supabase
         .from("support_tickets")
-        .update({ status: "open", updated_at: new Date().toISOString() })
+        .update({ has_unread_for_customer: true, status: "answered", updated_at: new Date().toISOString() })
+        .eq("id", id);
+    } else if (["closed", "waiting_confirmation"].includes(ticket.status)) {
+      await supabase
+        .from("support_tickets")
+        .update({ status: "reopened", updated_at: new Date().toISOString() })
         .eq("id", id);
     }
     res.json(data);
   } catch (err) {
     console.error("POST /support/tickets/:id/messages error:", err);
     res.status(500).json({ error: "Error enviando mensaje" });
+  }
+});
+
+app.patch("/support/tickets/:id/mark-read", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tenant_id } = req.body;
+    if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
+    const { error } = await supabase
+      .from("support_tickets")
+      .update({ has_unread_for_customer: false })
+      .eq("id", id)
+      .eq("tenant_id", tenant_id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error("PATCH /support/tickets/:id/mark-read error:", err);
+    res.status(500).json({ error: "Error marcando como leído" });
+  }
+});
+
+app.get("/support/tickets/unread-count", async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+    if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
+    const { count, error } = await supabase
+      .from("support_tickets")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenant_id)
+      .eq("has_unread_for_customer", true);
+    if (error) throw error;
+    res.json({ count: count ?? 0 });
+  } catch (err) {
+    console.error("GET /support/tickets/unread-count error:", err);
+    res.status(500).json({ error: "Error obteniendo contador" });
+  }
+});
+
+app.patch("/support/tickets/:id/resolve", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tenant_id } = req.body;
+    if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
+    const { error } = await supabase
+      .from("support_tickets")
+      .update({
+        status: "waiting_confirmation",
+        resolution_requested_at: new Date().toISOString(),
+        has_unread_for_customer: true,
+      })
+      .eq("id", id)
+      .eq("tenant_id", tenant_id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error("PATCH /support/tickets/:id/resolve error:", err);
+    res.status(500).json({ error: "Error marcando como resuelto" });
+  }
+});
+
+app.patch("/support/tickets/:id/confirm-resolution", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tenant_id, confirmed } = req.body;
+    if (!tenant_id || typeof confirmed !== "boolean")
+      return res.status(400).json({ error: "tenant_id y confirmed (boolean) requeridos" });
+    const newStatus = confirmed ? "closed" : "reopened";
+    const { error } = await supabase
+      .from("support_tickets")
+      .update({ status: newStatus, updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .eq("tenant_id", tenant_id);
+    if (error) throw error;
+    res.json({ success: true, status: newStatus });
+  } catch (err) {
+    console.error("PATCH /support/tickets/:id/confirm-resolution error:", err);
+    res.status(500).json({ error: "Error confirmando resolución" });
   }
 });
 
