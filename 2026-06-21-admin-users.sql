@@ -15,5 +15,5 @@ ALTER TABLE public.admin_users ENABLE ROW LEVEL SECURITY;
 -- Solo accesible desde backend con service_role key.
 
 INSERT INTO public.admin_users (user_id, email)
-VALUES ('dd60e777-6f45-413b-870b-b0c20ecaab36', 'camilo.x07@gmail.com')
+VALUES ('dd60e777-6f45-413b-870b-b0c20ecaab36', 'camilo.merino.m@gmail.com')
 ON CONFLICT (user_id) DO NOTHING;
