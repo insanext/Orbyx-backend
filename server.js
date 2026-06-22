@@ -11304,9 +11304,11 @@ app.get("/support/tickets/:id/messages", async (req, res) => {
 app.post("/support/tickets/:id/messages", async (req, res) => {
   try {
     const { id } = req.params;
-    const { tenant_id, sender_id, message, attachments } = req.body;
+    const { tenant_id, sender_id, message, attachments, sender_type: rawSenderType } = req.body;
     if (!tenant_id || !sender_id || !message?.trim())
       return res.status(400).json({ error: "Faltan datos requeridos" });
+    const validSenderTypes = ["customer", "support"];
+    const sender_type = validSenderTypes.includes(rawSenderType) ? rawSenderType : "customer";
     if (Array.isArray(attachments) && attachments.length > 1)
       return res.status(400).json({ error: "Máximo 1 imagen por mensaje" });
     const { data: ticket } = await supabase
@@ -11320,7 +11322,7 @@ app.post("/support/tickets/:id/messages", async (req, res) => {
       .from("support_ticket_messages")
       .insert({
         ticket_id: id,
-        sender_type: "customer",
+        sender_type,
         sender_id,
         message: message.trim(),
         attachments: attachments ?? [],
@@ -11328,7 +11330,6 @@ app.post("/support/tickets/:id/messages", async (req, res) => {
       .select()
       .single();
     if (error) throw error;
-    const { sender_type } = req.body;
     if (sender_type === "support") {
       await supabase
         .from("support_tickets")
@@ -11421,6 +11422,153 @@ app.patch("/support/tickets/:id/confirm-resolution", async (req, res) => {
   } catch (err) {
     console.error("PATCH /support/tickets/:id/confirm-resolution error:", err);
     res.status(500).json({ error: "Error confirmando resolución" });
+  }
+});
+
+// =======================
+// ADMIN PANEL ROUTES
+// =======================
+
+async function requireAdminAuth(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Token requerido" });
+    }
+    const token = authHeader.split(" ")[1];
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+    const { data: adminRow } = await supabase
+      .from("admin_users")
+      .select("user_id, email, is_active")
+      .eq("user_id", user.id)
+      .single();
+    if (!adminRow || !adminRow.is_active) {
+      return res.status(403).json({ error: "Acceso denegado" });
+    }
+    const aal = user.factors && user.factors.some(f => f.status === "verified") ? "aal2" : "aal1";
+    if (aal !== "aal2") {
+      return res.status(403).json({ error: "mfa_required" });
+    }
+    req.adminUser = { user_id: user.id, email: adminRow.email };
+    next();
+  } catch (err) {
+    console.error("requireAdminAuth error:", err);
+    return res.status(500).json({ error: "Error de autenticación" });
+  }
+}
+
+const PRIORITY_ORDER = { maxima: 0, alta: 1, media: 2, normal: 3 };
+
+app.get("/admin/tickets", requireAdminAuth, async (req, res) => {
+  try {
+    const { status } = req.query;
+    let query = supabase
+      .from("support_tickets")
+      .select("*, tenants!inner(name, slug, plan, plan_slug)")
+      .order("created_at", { ascending: false });
+    if (status) query = query.eq("status", status);
+    const { data, error } = await query;
+    if (error) throw error;
+    const tickets = (data ?? [])
+      .map(t => ({
+        ...t,
+        tenant_name: t.tenants?.name,
+        tenant_slug: t.tenants?.slug,
+        tenant_plan: t.tenants?.plan_slug || t.tenants?.plan || t.plan_at_creation,
+      }))
+      .sort((a, b) => (PRIORITY_ORDER[a.priority] ?? 3) - (PRIORITY_ORDER[b.priority] ?? 3));
+    tickets.forEach(t => delete t.tenants);
+    res.json(tickets);
+  } catch (err) {
+    console.error("GET /admin/tickets error:", err);
+    res.status(500).json({ error: "Error obteniendo tickets" });
+  }
+});
+
+app.get("/admin/tickets/:id/messages", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: ticket } = await supabase
+      .from("support_tickets")
+      .select("id")
+      .eq("id", id)
+      .single();
+    if (!ticket) return res.status(404).json({ error: "Ticket no encontrado" });
+    const { data, error } = await supabase
+      .from("support_ticket_messages")
+      .select("*")
+      .eq("ticket_id", id)
+      .order("created_at", { ascending: true });
+    if (error) throw error;
+    res.json(data ?? []);
+  } catch (err) {
+    console.error("GET /admin/tickets/:id/messages error:", err);
+    res.status(500).json({ error: "Error obteniendo mensajes" });
+  }
+});
+
+app.post("/admin/tickets/:id/messages", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { message, attachments } = req.body;
+    if (!message?.trim())
+      return res.status(400).json({ error: "Mensaje requerido" });
+    if (Array.isArray(attachments) && attachments.length > 1)
+      return res.status(400).json({ error: "Máximo 1 imagen por mensaje" });
+    const { data: ticket } = await supabase
+      .from("support_tickets")
+      .select("id, tenant_id, status")
+      .eq("id", id)
+      .single();
+    if (!ticket) return res.status(404).json({ error: "Ticket no encontrado" });
+    const { data, error } = await supabase
+      .from("support_ticket_messages")
+      .insert({
+        ticket_id: id,
+        sender_type: "support",
+        sender_id: req.adminUser.user_id,
+        message: message.trim(),
+        attachments: attachments ?? [],
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    await supabase
+      .from("support_tickets")
+      .update({ has_unread_for_customer: true, status: "answered", updated_at: new Date().toISOString() })
+      .eq("id", id);
+    res.json(data);
+  } catch (err) {
+    console.error("POST /admin/tickets/:id/messages error:", err);
+    res.status(500).json({ error: "Error enviando mensaje" });
+  }
+});
+
+app.patch("/admin/tickets/:id/resolve", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: ticket } = await supabase
+      .from("support_tickets")
+      .select("id, tenant_id")
+      .eq("id", id)
+      .single();
+    if (!ticket) return res.status(404).json({ error: "Ticket no encontrado" });
+    const { error } = await supabase
+      .from("support_tickets")
+      .update({
+        status: "waiting_confirmation",
+        resolution_requested_at: new Date().toISOString(),
+        has_unread_for_customer: true,
+      })
+      .eq("id", id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error("PATCH /admin/tickets/:id/resolve error:", err);
+    res.status(500).json({ error: "Error marcando como resuelto" });
   }
 });
 
