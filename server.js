@@ -11448,8 +11448,8 @@ async function requireAdminAuth(req, res, next) {
     if (!adminRow || !adminRow.is_active) {
       return res.status(403).json({ error: "Acceso denegado" });
     }
-    const aal = user.factors && user.factors.some(f => f.status === "verified") ? "aal2" : "aal1";
-    if (aal !== "aal2") {
+    const jwtPayload = JSON.parse(Buffer.from(token.split(".")[1], "base64").toString());
+    if (jwtPayload.aal !== "aal2") {
       return res.status(403).json({ error: "mfa_required" });
     }
     req.adminUser = { user_id: user.id, email: adminRow.email };
