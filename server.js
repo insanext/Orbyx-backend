@@ -785,32 +785,39 @@ async function requireTenantAuth(req, res, next) {
     if (authError || !user) {
       return res.status(401).json({ error: "Token inválido o sesión expirada" });
     }
-    const { data: membership, error: memberError } = await supabase
-      .from("tenant_users")
-      .select("id, tenant_id, role, is_active")
-      .eq("user_id", user.id)
-      .eq("is_active", true)
-      .single();
-    if (memberError || !membership) {
-      return res.status(403).json({ error: "No tienes acceso a ningún negocio" });
-    }
-    const { data: branchRows } = await supabase
-      .from("branch_access")
-      .select("branch_id")
-      .eq("user_id", user.id)
-      .eq("tenant_id", membership.tenant_id)
-      .eq("is_active", true);
-    req.authenticatedUser = {
-      user_id: user.id,
-      tenant_id: membership.tenant_id,
-      role: membership.role,
-      branch_ids: (branchRows || []).map((r) => r.branch_id),
-    };
+    req.authenticatedUser = { user_id: user.id };
     next();
   } catch (err) {
     console.error("requireTenantAuth error:", err);
     return res.status(500).json({ error: "Error de autenticación" });
   }
+}
+
+async function resolveTenantMembership(req, res, tenantId) {
+  const userId = req.authenticatedUser.user_id;
+  const { data: membership } = await supabase
+    .from("tenant_users")
+    .select("id, tenant_id, role, is_active")
+    .eq("user_id", userId)
+    .eq("tenant_id", tenantId)
+    .eq("is_active", true)
+    .single();
+  if (!membership) {
+    return null;
+  }
+  const { data: branchRows } = await supabase
+    .from("branch_access")
+    .select("branch_id")
+    .eq("user_id", userId)
+    .eq("tenant_id", tenantId)
+    .eq("is_active", true);
+  req.authenticatedUser = {
+    user_id: userId,
+    tenant_id: tenantId,
+    role: membership.role,
+    branch_ids: (branchRows || []).map((r) => r.branch_id),
+  };
+  return membership;
 }
 
 function requireWriteAccess(req, res, next) {
@@ -820,19 +827,15 @@ function requireWriteAccess(req, res, next) {
   next();
 }
 
-function enforceTenantId(req, _res, next) {
-  const auth = req.authenticatedUser;
-  const bodyTid = req.body && req.body.tenant_id;
-  const queryTid = req.query && req.query.tenant_id;
-  if (bodyTid && bodyTid !== auth.tenant_id) {
-    return _res.status(403).json({ error: "No tienes acceso a este negocio" });
+async function enforceTenantId(req, res, next) {
+  const requestedTid = (req.body && req.body.tenant_id) || (req.query && req.query.tenant_id);
+  if (!requestedTid) {
+    return res.status(400).json({ error: "tenant_id es obligatorio" });
   }
-  if (queryTid && queryTid !== auth.tenant_id) {
-    return _res.status(403).json({ error: "No tienes acceso a este negocio" });
+  const membership = await resolveTenantMembership(req, res, requestedTid);
+  if (!membership) {
+    return res.status(403).json({ error: "No tienes acceso a este negocio" });
   }
-  if (req.body) req.body.tenant_id = auth.tenant_id;
-  if (!req.query) req.query = {};
-  req.query.tenant_id = auth.tenant_id;
   next();
 }
 
@@ -845,7 +848,11 @@ async function enforceSlugOwnership(req, res, next) {
     .eq("slug", slug)
     .eq("is_active", true)
     .single();
-  if (!tenant || tenant.id !== req.authenticatedUser.tenant_id) {
+  if (!tenant) {
+    return res.status(404).json({ error: "Negocio no encontrado" });
+  }
+  const membership = await resolveTenantMembership(req, res, tenant.id);
+  if (!membership) {
     return res.status(403).json({ error: "No tienes acceso a este negocio" });
   }
   next();
