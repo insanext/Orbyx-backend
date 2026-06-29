@@ -802,14 +802,7 @@ async function resolveTenantMembership(req, res, tenantId) {
     .eq("tenant_id", tenantId)
     .eq("is_active", true)
     .single();
-  console.log("[AUTH DEBUG] resolveTenantMembership", {
-    userId,
-    tenantId,
-    membership: membership || null,
-    error: membershipError?.message || null,
-    errorCode: membershipError?.code || null,
-  });
-  if (!membership) {
+  if (membershipError || !membership) {
     return null;
   }
   const { data: branchRows } = await supabase
@@ -8531,56 +8524,6 @@ app.patch("/calendars/:id/slot-minutes", [dashboardLimiter, requireTenantAuth, r
 ====================================================== */
 app.get("/_ping", (req, res) => {
   res.send("pong ✅");
-});
-
-// TEMPORAL: endpoint de diagnóstico de membership — ELIMINAR después de debug
-app.get("/_debug/membership", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.json({ step: "auth", error: "No Authorization header" });
-    }
-    const token = authHeader.split(" ")[1];
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-    if (authError || !user) {
-      return res.json({ step: "auth", error: authError?.message || "No user", userId: null });
-    }
-    const targetTenantId = req.query.tenant_id || "8395a297-6c56-454d-b462-306f232c9f4f";
-    // Query 1: buscar TODAS las filas de tenant_users para este user_id (sin filtro de tenant)
-    const { data: allMemberships, error: allErr } = await supabase
-      .from("tenant_users")
-      .select("id, user_id, tenant_id, role, is_active, created_at")
-      .eq("user_id", user.id);
-    // Query 2: buscar con el filtro exacto que usa el middleware
-    const { data: specificMembership, error: specificErr } = await supabase
-      .from("tenant_users")
-      .select("id, user_id, tenant_id, role, is_active")
-      .eq("user_id", user.id)
-      .eq("tenant_id", targetTenantId)
-      .eq("is_active", true)
-      .single();
-    // Query 3: buscar sin filtro is_active (por si is_active es null/false)
-    const { data: withoutActiveFilter, error: withoutActiveErr } = await supabase
-      .from("tenant_users")
-      .select("id, user_id, tenant_id, role, is_active")
-      .eq("user_id", user.id)
-      .eq("tenant_id", targetTenantId)
-      .single();
-    return res.json({
-      deployVersion: "2026-06-29-debug-v1",
-      authenticatedUserId: user.id,
-      authenticatedEmail: user.email,
-      targetTenantId,
-      allMemberships: allMemberships || [],
-      allMembershipsError: allErr?.message || null,
-      specificMembership: specificMembership || null,
-      specificMembershipError: specificErr?.message || null,
-      withoutActiveFilter: withoutActiveFilter || null,
-      withoutActiveFilterError: withoutActiveErr?.message || null,
-    });
-  } catch (err) {
-    return res.json({ step: "catch", error: err.message });
-  }
 });
 
 /* ======================================================
