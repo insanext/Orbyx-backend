@@ -6592,13 +6592,17 @@ app.patch("/customers/:id/extra-data", tenantAuthSlugWrite, async (req, res) => 
    ✅ GET /pets/:slug
    Listar mascotas por negocio y opcionalmente por cliente
 ====================================================== */
-app.get("/pets/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/pets/:slug", publicLimiter, async (req, res) => {
   try {
     const { slug } = req.params;
     const { customer_id, phone, email } = req.query;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    if (!customer_id && !phone && !email) {
+      return res.status(400).json({ error: "Se requiere customer_id, phone o email" });
     }
 
     const normalizedEmail = String(email || "").trim().toLowerCase();
