@@ -1,4 +1,4 @@
-console.log("BACKEND VERSION 26-03-EMAIL-CANCEL");
+console.log("BACKEND VERSION 26-06-SECURITY-AUTH");
 
 // server.js
 require("dotenv").config();
@@ -6,6 +6,8 @@ const express = require("express");
 const multer = require("multer");
 const { createClient } = require("@supabase/supabase-js");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const { google } = require("googleapis");
 const crypto = require("crypto");
 const PDFDocument = require("pdfkit");
@@ -739,7 +741,7 @@ const corsOptions = {
 
     if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
 
-    if (/^https:\/\/.*\.vercel\.app$/.test(origin)) return cb(null, true);
+    if (/^https:\/\/orbyx[\w-]*\.vercel\.app$/.test(origin)) return cb(null, true);
 
     return cb(new Error("Not allowed by CORS: " + origin));
   },
@@ -748,9 +750,111 @@ const corsOptions = {
   credentials: false,
 };
 
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 app.use(express.json());
+
+const publicLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiadas solicitudes. Intenta de nuevo en un momento." },
+});
+
+const dashboardLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiadas solicitudes. Intenta de nuevo en un momento." },
+});
+
+// =======================
+// AUTH MIDDLEWARE — TENANT DASHBOARD
+// =======================
+async function requireTenantAuth(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Token requerido" });
+    }
+    const token = authHeader.split(" ")[1];
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) {
+      return res.status(401).json({ error: "Token inválido o sesión expirada" });
+    }
+    const { data: membership, error: memberError } = await supabase
+      .from("tenant_users")
+      .select("id, tenant_id, role, is_active")
+      .eq("user_id", user.id)
+      .eq("is_active", true)
+      .single();
+    if (memberError || !membership) {
+      return res.status(403).json({ error: "No tienes acceso a ningún negocio" });
+    }
+    const { data: branchRows } = await supabase
+      .from("branch_access")
+      .select("branch_id")
+      .eq("user_id", user.id)
+      .eq("tenant_id", membership.tenant_id)
+      .eq("is_active", true);
+    req.authenticatedUser = {
+      user_id: user.id,
+      tenant_id: membership.tenant_id,
+      role: membership.role,
+      branch_ids: (branchRows || []).map((r) => r.branch_id),
+    };
+    next();
+  } catch (err) {
+    console.error("requireTenantAuth error:", err);
+    return res.status(500).json({ error: "Error de autenticación" });
+  }
+}
+
+function requireWriteAccess(req, res, next) {
+  if (req.authenticatedUser && req.authenticatedUser.role === "readonly") {
+    return res.status(403).json({ error: "Tu rol es solo lectura. No puedes realizar esta acción." });
+  }
+  next();
+}
+
+function enforceTenantId(req, _res, next) {
+  const auth = req.authenticatedUser;
+  const bodyTid = req.body && req.body.tenant_id;
+  const queryTid = req.query && req.query.tenant_id;
+  if (bodyTid && bodyTid !== auth.tenant_id) {
+    return _res.status(403).json({ error: "No tienes acceso a este negocio" });
+  }
+  if (queryTid && queryTid !== auth.tenant_id) {
+    return _res.status(403).json({ error: "No tienes acceso a este negocio" });
+  }
+  if (req.body) req.body.tenant_id = auth.tenant_id;
+  if (!req.query) req.query = {};
+  req.query.tenant_id = auth.tenant_id;
+  next();
+}
+
+async function enforceSlugOwnership(req, res, next) {
+  const slug = req.params.slug || req.body?.slug || req.query?.slug;
+  if (!slug) return next();
+  const { data: tenant } = await supabase
+    .from("tenants")
+    .select("id")
+    .eq("slug", slug)
+    .eq("is_active", true)
+    .single();
+  if (!tenant || tenant.id !== req.authenticatedUser.tenant_id) {
+    return res.status(403).json({ error: "No tienes acceso a este negocio" });
+  }
+  next();
+}
+
+const tenantAuth = [dashboardLimiter, requireTenantAuth, enforceTenantId];
+const tenantAuthWrite = [dashboardLimiter, requireTenantAuth, enforceTenantId, requireWriteAccess];
+const tenantAuthSlug = [dashboardLimiter, requireTenantAuth, enforceSlugOwnership];
+const tenantAuthSlugWrite = [dashboardLimiter, requireTenantAuth, enforceSlugOwnership, requireWriteAccess];
 
 const PORT = process.env.PORT || 3000;
 
@@ -2795,7 +2899,7 @@ const { data: cal, error: calErr } = await supabase
   }
 });
 
-app.get("/calendar-connections", async (req, res) => {
+app.get("/calendar-connections", tenantAuth, async (req, res) => {
   try {
     const { tenant_id, staff_id, branch_id } = req.query;
 
@@ -2866,7 +2970,7 @@ app.get("/test-event", async (req, res) => {
 /* ======================================================
    ✅ GET /business-hours
 ====================================================== */
-app.get("/business-hours", async (req, res) => {
+app.get("/business-hours", tenantAuth, async (req, res) => {
   try {
     const { tenant_id, branch_id, scope } = req.query;
 
@@ -2903,7 +3007,7 @@ app.get("/business-hours", async (req, res) => {
    ✅ PUT /business-hours
 ====================================================== */
 
-app.put("/business-hours", async (req, res) => {
+app.put("/business-hours", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, branch_id, scope, hours } = req.body;
 
@@ -2985,7 +3089,7 @@ app.put("/business-hours", async (req, res) => {
 /* ======================================================
    ✅ GET /business-special-dates
 ====================================================== */
-app.get("/business-special-dates", async (req, res) => {
+app.get("/business-special-dates", tenantAuth, async (req, res) => {
   try {
     const { tenant_id, branch_id, scope } = req.query;
 
@@ -3022,7 +3126,7 @@ app.get("/business-special-dates", async (req, res) => {
 /* ======================================================
    ✅ POST /business-special-dates
 ====================================================== */
-app.post("/business-special-dates", async (req, res) => {
+app.post("/business-special-dates", tenantAuthWrite, async (req, res) => {
   try {
     const {
       tenant_id,
@@ -3083,7 +3187,7 @@ app.post("/business-special-dates", async (req, res) => {
 /* ======================================================
    ✅ PUT /business-special-dates/:id
 ====================================================== */
-app.put("/business-special-dates/:id", async (req, res) => {
+app.put("/business-special-dates/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -3141,7 +3245,7 @@ app.put("/business-special-dates/:id", async (req, res) => {
 /* ======================================================
    ✅ DELETE /business-special-dates/:id
 ====================================================== */
-app.delete("/business-special-dates/:id", async (req, res) => {
+app.delete("/business-special-dates/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -3337,7 +3441,7 @@ if (mode === "exact_date") {
 /* ======================================================
    ✅ GET /staff
 ====================================================== */
-app.get("/staff", async (req, res) => {
+app.get("/staff", tenantAuth, async (req, res) => {
   try {
     const { tenant_id, branch_id, active } = req.query;
 
@@ -3380,7 +3484,7 @@ app.get("/staff", async (req, res) => {
    ✅ POST /staff
 ====================================================== */
 
-app.post("/staff", async (req, res) => {
+app.post("/staff", tenantAuthWrite, async (req, res) => {
   try {
     const {
   tenant_id,
@@ -3456,7 +3560,7 @@ photo_url: photo_url || null,
    ✅ PUT /staff/:id
 ====================================================== */
 
-app.put("/staff/:id", async (req, res) => {
+app.put("/staff/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -3545,7 +3649,7 @@ console.log("PUT /staff/:id updateData:", updateData);
 /* ======================================================
    ✅ DELETE /staff/:id
 ====================================================== */
-app.delete("/staff/:id", async (req, res) => {
+app.delete("/staff/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -3569,7 +3673,7 @@ app.delete("/staff/:id", async (req, res) => {
 /* ======================================================
    ✅ GET /staff-services
 ====================================================== */
-app.get("/staff-services", async (req, res) => {
+app.get("/staff-services", tenantAuth, async (req, res) => {
   try {
     const { tenant_id, staff_id, branch_id } = req.query;
 
@@ -3617,7 +3721,7 @@ app.get("/staff-services", async (req, res) => {
    ✅ PUT /staff-services
    Reemplaza todas las relaciones de un staff
 ====================================================== */
-app.put("/staff-services", async (req, res) => {
+app.put("/staff-services", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, branch_id, staff_id, service_ids } = req.body;
 
@@ -3683,7 +3787,7 @@ app.put("/staff-services", async (req, res) => {
 /* ======================================================
    ✅ DELETE /staff-services/:id
 ====================================================== */
-app.delete("/staff-services/:id", async (req, res) => {
+app.delete("/staff-services/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -3707,7 +3811,7 @@ app.delete("/staff-services/:id", async (req, res) => {
 /* ======================================================
    ✅ GET /staff-hours
 ====================================================== */
-app.get("/staff-hours", async (req, res) => {
+app.get("/staff-hours", tenantAuth, async (req, res) => {
   try {
     const { tenant_id, staff_id } = req.query;
 
@@ -3745,7 +3849,7 @@ app.get("/staff-hours", async (req, res) => {
    Reemplaza horarios semanales de un staff
    Soporta múltiples bloques por día
 ====================================================== */
-app.put("/staff-hours", async (req, res) => {
+app.put("/staff-hours", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, staff_id, hours } = req.body;
 
@@ -3837,7 +3941,7 @@ app.put("/staff-hours", async (req, res) => {
 /* ======================================================
    ✅ GET /staff-special-dates
 ====================================================== */
-app.get("/staff-special-dates", async (req, res) => {
+app.get("/staff-special-dates", tenantAuth, async (req, res) => {
   try {
     const { tenant_id, branch_id, staff_id } = req.query;
 
@@ -3878,7 +3982,7 @@ app.get("/staff-special-dates", async (req, res) => {
    ✅ POST /staff-special-dates
 ====================================================== */
 
-app.post("/staff-special-dates", async (req, res) => {
+app.post("/staff-special-dates", tenantAuthWrite, async (req, res) => {
   try {
     const {
       tenant_id,
@@ -3952,7 +4056,7 @@ app.post("/staff-special-dates", async (req, res) => {
    ✅ PUT /staff-special-dates/:id
 ====================================================== */
 
-app.put("/staff-special-dates/:id", async (req, res) => {
+app.put("/staff-special-dates/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -4030,7 +4134,7 @@ app.put("/staff-special-dates/:id", async (req, res) => {
 /* ======================================================
    ✅ DELETE /staff-special-dates/:id
 ====================================================== */
-app.delete("/staff-special-dates/:id", async (req, res) => {
+app.delete("/staff-special-dates/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -4055,7 +4159,7 @@ app.delete("/staff-special-dates/:id", async (req, res) => {
    🔹 ENDPOINT: /slots
 ====================================================== */
 
-app.get("/slots", async (req, res) => {
+app.get("/slots", publicLimiter, async (req, res) => {
   try {
     const { calendar_id, branch_id, service_id, date } = req.query;
 
@@ -4168,7 +4272,7 @@ app.get("/slots", async (req, res) => {
    ✅ POST /appointments/slot
 ====================================================== */
 
-app.post("/appointments/slot", async (req, res) => {
+app.post("/appointments/slot", publicLimiter, async (req, res) => {
   let apptCreated = null;
 
   try {
@@ -4932,7 +5036,7 @@ await sendBookingEmail({
    ✅ PATCH /appointments/:id/clinical
 ====================================================== */
 
-app.patch("/appointments/:id/clinical", async (req, res) => {
+app.patch("/appointments/:id/clinical", tenantAuthSlugWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -5094,7 +5198,7 @@ app.patch("/appointments/:id/clinical", async (req, res) => {
 /* ======================================================
    ✅ GET /appointments/by-day/:slug/:date
 ====================================================== */
-app.get("/appointments/by-day/:slug/:date", async (req, res) => {
+app.get("/appointments/by-day/:slug/:date", tenantAuthSlug, async (req, res) => {
   try {
     const { slug, date } = req.params;
 
@@ -5136,7 +5240,7 @@ const { data: tenant, error: tenantError } = await supabase
 /* ======================================================
    ✅ GET /appointments/by-range/:slug
 ====================================================== */
-app.get("/appointments/by-range/:slug", async (req, res) => {
+app.get("/appointments/by-range/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { from, to, branch_id, staff_id } = req.query;
@@ -5251,7 +5355,7 @@ function formatDateForServer(date) {
    ✅ GET /appointments/pending-close/:slug
    Pendientes de cierre globales
 ====================================================== */
-app.get("/appointments/pending-close/:slug", async (req, res) => {
+app.get("/appointments/pending-close/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { branch_id, staff_id } = req.query;
@@ -5295,7 +5399,7 @@ app.get("/appointments/pending-close/:slug", async (req, res) => {
 /* ======================================================
    ✅ GET /dashboard/metrics/:slug
 ====================================================== */
-app.get("/dashboard/metrics/:slug", async (req, res) => {
+app.get("/dashboard/metrics/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { branch_id } = req.query;
@@ -5614,7 +5718,7 @@ app.get("/dashboard/metrics/:slug", async (req, res) => {
    ✅ GET /appointments/customer-history/:slug
    Historial por cliente para ficha veterinaria
 ====================================================== */
-app.get("/appointments/customer-history/:slug", async (req, res) => {
+app.get("/appointments/customer-history/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { customer_id, branch_id } = req.query;
@@ -5682,7 +5786,7 @@ app.get("/appointments/customer-history/:slug", async (req, res) => {
    ✅ GET /pets/:id/clinical-pdf?slug=...
    PDF ficha clínica veterinaria
 ====================================================== */
-app.get("/pets/:id/clinical-pdf", async (req, res) => {
+app.get("/pets/:id/clinical-pdf", [dashboardLimiter, requireTenantAuth], async (req, res) => {
   try {
     const { id } = req.params;
     const { slug } = req.query;
@@ -5990,7 +6094,7 @@ app.get("/pets/:id/clinical-pdf", async (req, res) => {
 /* ======================================================
    ✅ GET /appointments
 ====================================================== */
-app.get("/appointments", async (req, res) => {
+app.get("/appointments", [dashboardLimiter, requireTenantAuth], async (req, res) => {
   try {
     const { calendar_id, from, to, status } = req.query;
 
@@ -6064,7 +6168,7 @@ function normalizeCampaignError(error) {
    ✅ GET /customers/:slug
    Soporta búsqueda + segmentación + inactivos
 ====================================================== */
-app.get("/customers/:slug", async (req, res) => {
+app.get("/customers/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { q, segment, inactive_days, branch_id } = req.query;
@@ -6260,7 +6364,7 @@ const isInactive =
 /* ======================================================
    ✅ POST /customers
 ====================================================== */
-app.post("/customers", async (req, res) => {
+app.post("/customers", tenantAuthSlugWrite, async (req, res) => {
   try {
     const {
       slug,
@@ -6334,7 +6438,7 @@ app.post("/customers", async (req, res) => {
   }
 });
 
-app.patch("/customers/:id", async (req, res) => {
+app.patch("/customers/:id", tenantAuthSlugWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -6433,7 +6537,7 @@ app.patch("/customers/:id", async (req, res) => {
    ✅ PATCH /customers/:id/extra-data
    Merge de campos personalizados (RUT, empresa, etc.) en customers.extra_data
 ====================================================== */
-app.patch("/customers/:id/extra-data", async (req, res) => {
+app.patch("/customers/:id/extra-data", tenantAuthSlugWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const { extra_data, slug } = req.body;
@@ -6481,7 +6585,7 @@ app.patch("/customers/:id/extra-data", async (req, res) => {
    ✅ GET /pets/:slug
    Listar mascotas por negocio y opcionalmente por cliente
 ====================================================== */
-app.get("/pets/:slug", async (req, res) => {
+app.get("/pets/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { customer_id, phone, email } = req.query;
@@ -6567,7 +6671,7 @@ app.get("/pets/:slug", async (req, res) => {
    🐾 GET /pet-followups/:slug
    Lista de próximos controles por cliente o mascota
 ====================================================== */
-app.get("/pet-followups/:slug", async (req, res) => {
+app.get("/pet-followups/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { customer_id, pet_id } = req.query;
@@ -6627,7 +6731,7 @@ app.get("/pet-followups/:slug", async (req, res) => {
 /* ======================================================
    ✅ POST /clinical-notes/:slug
 ====================================================== */
-app.post("/clinical-notes/:slug", async (req, res) => {
+app.post("/clinical-notes/:slug", tenantAuthSlugWrite, async (req, res) => {
   try {
     const { slug } = req.params;
     const {
@@ -6718,7 +6822,7 @@ app.post("/clinical-notes/:slug", async (req, res) => {
    ✅ GET /clinical-notes/:slug
    Notas clínicas veterinarias por mascota o appointment
 ====================================================== */
-app.get("/clinical-notes/:slug", async (req, res) => {
+app.get("/clinical-notes/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { pet_id, appointment_id, customer_id, appointment_ids, from, to, limit = 50 } = req.query;
@@ -6805,7 +6909,7 @@ app.get("/clinical-notes/:slug", async (req, res) => {
    ✅ POST /pets
    Crear mascota para un cliente
 ====================================================== */
-app.post("/pets", async (req, res) => {
+app.post("/pets", tenantAuthSlugWrite, async (req, res) => {
   try {
     const {
       slug,
@@ -6920,7 +7024,7 @@ app.post("/pets", async (req, res) => {
    ✅ PATCH /pets/:id
    Editar datos de una mascota existente
 ====================================================== */
-app.patch("/pets/:id", async (req, res) => {
+app.patch("/pets/:id", tenantAuthSlugWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -7032,7 +7136,7 @@ app.patch("/pets/:id", async (req, res) => {
    ✅ POST /campaigns/send-email
    Envío real por email usando audiencia curada desde frontend
 ====================================================== */
-app.post("/campaigns/send-email", async (req, res) => {
+app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
   try {
     const {
       slug,
@@ -7562,7 +7666,7 @@ app.post("/campaigns/send-email", async (req, res) => {
    ✅ POST /campaigns/save-whatsapp
    Guarda campaña WhatsApp mock en historial
 ====================================================== */
-app.post("/campaigns/save-whatsapp", async (req, res) => {
+app.post("/campaigns/save-whatsapp", tenantAuthSlugWrite, async (req, res) => {
   try {
     const {
       slug,
@@ -7722,7 +7826,7 @@ const name = String(
 /* ======================================================
    📊 GET /campaigns/history/:slug
 ====================================================== */
-app.get("/campaigns/history/:slug", async (req, res) => {
+app.get("/campaigns/history/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
 
@@ -7759,7 +7863,7 @@ app.get("/campaigns/history/:slug", async (req, res) => {
   }
 });
 
-app.get("/campaigns/logs/:campaignId", async (req, res) => {
+app.get("/campaigns/logs/:campaignId", [dashboardLimiter, requireTenantAuth], async (req, res) => {
   try {
     const { campaignId } = req.params;
 
@@ -7799,7 +7903,7 @@ app.get("/campaigns/logs/:campaignId", async (req, res) => {
    ✅ POST /appointments/:id/close
    Cierre atendido con control veterinario
 ====================================================== */
-app.post("/appointments/:id/close", async (req, res) => {
+app.post("/appointments/:id/close", [dashboardLimiter, requireTenantAuth, requireWriteAccess], async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -7959,7 +8063,7 @@ const nextControl = resolveNextControlDate({
 /* ======================================================
    ✅ GET /appointments/clinical-pending/:slug
 ====================================================== */
-app.get("/appointments/clinical-pending/:slug", async (req, res) => {
+app.get("/appointments/clinical-pending/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { branch_id, staff_id } = req.query;
@@ -7999,7 +8103,7 @@ app.get("/appointments/clinical-pending/:slug", async (req, res) => {
 /* ======================================================
    ✅ PATCH /appointments/:id/clinical-pending
 ====================================================== */
-app.patch("/appointments/:id/clinical-pending", async (req, res) => {
+app.patch("/appointments/:id/clinical-pending", tenantAuthSlugWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const { pending, slug } = req.body || {};
@@ -8046,7 +8150,7 @@ app.patch("/appointments/:id/clinical-pending", async (req, res) => {
 /* ======================================================
    ✅ PATCH /appointments/:id/status
 ====================================================== */
-app.patch("/appointments/:id/status", async (req, res) => {
+app.patch("/appointments/:id/status", [dashboardLimiter, requireTenantAuth, requireWriteAccess], async (req, res) => {
   try {
     const { id } = req.params;
     const { status, notes } = req.body;
@@ -8149,7 +8253,7 @@ if (updated?.customer_id) {
 return res.json({ ok: true, canceled: true, appointment: updated });
 }
 
-app.post("/appointments/:id", async (req, res) => {
+app.post("/appointments/:id", publicLimiter, async (req, res) => {
   try {
     return await cancelById(req.params.id, req.query.token, res);
   } catch (err) {
@@ -8157,7 +8261,7 @@ app.post("/appointments/:id", async (req, res) => {
   }
 });
 
-app.delete("/appointments/:id", async (req, res) => {
+app.delete("/appointments/:id", publicLimiter, async (req, res) => {
   try {
     return await cancelById(req.params.id, req.query.token, res);
   } catch (err) {
@@ -8168,7 +8272,7 @@ app.delete("/appointments/:id", async (req, res) => {
 /* ======================================================
    🔎 GET /appointments/:id (info pública para cancelación)
 ====================================================== */
-app.get("/appointments/:id", async (req, res) => {
+app.get("/appointments/:id", publicLimiter, async (req, res) => {
   try {
     const { id } = req.params;
     const { token } = req.query;
@@ -8202,7 +8306,7 @@ app.get("/appointments/:id", async (req, res) => {
    🔎 SEARCH APPOINTMENTS (nuevo)
 ====================================================== */
 
-app.get("/appointments/search/:slug", async (req, res) => {
+app.get("/appointments/search/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { q, branch_id, staff_id } = req.query;
@@ -8266,7 +8370,7 @@ app.get("/appointments/search/:slug", async (req, res) => {
 /* ======================================================
    ✏️ UPDATE APPOINTMENT (editar cliente)
 ====================================================== */
-app.patch("/appointments/:id", async (req, res) => {
+app.patch("/appointments/:id", [dashboardLimiter, requireTenantAuth, requireWriteAccess], async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -8328,7 +8432,7 @@ app.patch("/appointments/:id", async (req, res) => {
    ✅ PATCH /appointments/:id/session-notes
    Guarda nota de sesión en appointments.notes (negocios genéricos)
 ====================================================== */
-app.patch("/appointments/:id/session-notes", async (req, res) => {
+app.patch("/appointments/:id/session-notes", tenantAuthSlugWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const { notes, slug } = req.body;
@@ -8363,7 +8467,7 @@ app.patch("/appointments/:id/session-notes", async (req, res) => {
 /* ======================================================
    ✅ PATCH /calendars/:id/slot-minutes
 ====================================================== */
-app.patch("/calendars/:id/slot-minutes", async (req, res) => {
+app.patch("/calendars/:id/slot-minutes", [dashboardLimiter, requireTenantAuth, requireWriteAccess], async (req, res) => {
   try {
     const { id } = req.params;
     const { slot_minutes } = req.body;
@@ -8521,7 +8625,7 @@ const { data: tenant, error: tenantError } = await supabase
 /* ======================================================
    ✅ GET /billing/preview-change
 ====================================================== */
-app.get("/billing/preview-change", async (req, res) => {
+app.get("/billing/preview-change", tenantAuth, async (req, res) => {
   try {
     const { tenant_id, new_plan } = req.query;
 
@@ -8596,7 +8700,7 @@ app.get("/billing/preview-change", async (req, res) => {
 /* ======================================================
    ✅ POST /billing/change-plan
 ====================================================== */
-app.post("/billing/change-plan", async (req, res) => {
+app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, new_plan, billing_cycle } = req.body;
 
@@ -8738,7 +8842,7 @@ app.post("/billing/change-plan", async (req, res) => {
    Con ?tenant_id= incluye además los add-ons activos del tenant
    (campos aditivos; el shape original se preserva).
 ====================================================== */
-app.get("/billing/addons", async (req, res) => {
+app.get("/billing/addons", tenantAuth, async (req, res) => {
   try {
     const { plan, tenant_id } = req.query;
 
@@ -8850,7 +8954,7 @@ app.get("/billing/addons", async (req, res) => {
    Valida tenant, catálogo y disponibilidad por plan.
    Acumulable: si ya hay un addon activo, suma quantity.
 ====================================================== */
-app.post("/billing/addons/activate", async (req, res) => {
+app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, addon_key, quantity, billing_cycle } = req.body;
 
@@ -8958,7 +9062,7 @@ app.post("/billing/addons/activate", async (req, res) => {
    body: { tenant_id, addon_key, quantity }
    quantity > 0 → actualiza cantidad; quantity = 0 → cancela.
 ====================================================== */
-app.patch("/billing/addons/quantity", async (req, res) => {
+app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, addon_key, quantity } = req.body;
 
@@ -9067,7 +9171,7 @@ app.patch("/billing/addons/quantity", async (req, res) => {
    ✅ POST /billing/addons/cancel
    body: { tenant_id, addon_key }
 ====================================================== */
-app.post("/billing/addons/cancel", async (req, res) => {
+app.post("/billing/addons/cancel", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, addon_key } = req.body;
 
@@ -9132,7 +9236,7 @@ app.post("/billing/addons/cancel", async (req, res) => {
    ✅ POST /billing/apply-scheduled-changes
    Lo puedes disparar manualmente o desde cron
 ====================================================== */
-app.post("/billing/apply-scheduled-changes", async (req, res) => {
+app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) => {
   try {
     const nowIso = new Date().toISOString();
 
@@ -9212,7 +9316,7 @@ app.post("/billing/apply-scheduled-changes", async (req, res) => {
    ✅ PATCH /tenants/:id
 ====================================================== */
 
-app.patch("/tenants/:id", async (req, res) => {
+app.patch("/tenants/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -9450,7 +9554,7 @@ app.patch("/tenants/:id", async (req, res) => {
 /* ======================================================
    ✅ GET /branches
 ====================================================== */
-app.get("/branches", async (req, res) => {
+app.get("/branches", tenantAuth, async (req, res) => {
   try {
     const { tenant_id } = req.query;
 
@@ -9480,7 +9584,7 @@ app.get("/branches", async (req, res) => {
    ✅ POST /branches
 ====================================================== */
 
-app.post("/branches", async (req, res) => {
+app.post("/branches", tenantAuthWrite, async (req, res) => {
   try {
     const {
       tenant_id,
@@ -9565,7 +9669,7 @@ app.post("/branches", async (req, res) => {
 /* ======================================================
    ✅ PATCH /branches/:id
 ====================================================== */
-app.patch("/branches/:id", async (req, res) => {
+app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -9734,7 +9838,7 @@ app.patch("/branches/:id", async (req, res) => {
    ✅ GET /services
 ====================================================== */
 
-app.get("/services", async (req, res) => {
+app.get("/services", tenantAuth, async (req, res) => {
   try {
     const { tenant_id, branch_id, active } = req.query;
 
@@ -9783,7 +9887,7 @@ app.get("/services", async (req, res) => {
    ✅ Service Groups endpoints
 ====================================================== */
 
-app.get('/service-groups', async (req, res) => {
+app.get('/service-groups', tenantAuth, async (req, res) => {
   try {
     const { tenant_id, branch_id } = req.query
     if (!tenant_id || !branch_id) return res.status(400).json({ error: 'tenant_id y branch_id requeridos' })
@@ -9801,7 +9905,7 @@ app.get('/service-groups', async (req, res) => {
   }
 })
 
-app.post('/service-groups', async (req, res) => {
+app.post('/service-groups', tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, branch_id, name } = req.body
     if (!tenant_id || !branch_id || !name?.trim()) {
@@ -9828,7 +9932,7 @@ app.post('/service-groups', async (req, res) => {
   }
 })
 
-app.patch('/service-groups/reorder', async (req, res) => {
+app.patch('/service-groups/reorder', tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, order } = req.body
     if (!tenant_id || !Array.isArray(order)) return res.status(400).json({ error: 'tenant_id y order requeridos' })
@@ -9843,7 +9947,7 @@ app.patch('/service-groups/reorder', async (req, res) => {
   }
 })
 
-app.patch('/service-groups/:id', async (req, res) => {
+app.patch('/service-groups/:id', tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params
     const { name, tenant_id } = req.body
@@ -9863,7 +9967,7 @@ app.patch('/service-groups/:id', async (req, res) => {
   }
 })
 
-app.delete('/service-groups/:id', async (req, res) => {
+app.delete('/service-groups/:id', tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params
     const { tenant_id } = req.query
@@ -9893,7 +9997,7 @@ app.delete('/service-groups/:id', async (req, res) => {
   }
 })
 
-app.patch('/services/reorder', async (req, res) => {
+app.patch('/services/reorder', tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, order } = req.body
     if (!tenant_id || !Array.isArray(order)) return res.status(400).json({ error: 'tenant_id y order requeridos' })
@@ -9916,7 +10020,7 @@ app.patch('/services/reorder', async (req, res) => {
    ✅ POST /services
 ====================================================== */
 
-app.post("/services", async (req, res) => {
+app.post("/services", tenantAuthWrite, async (req, res) => {
   try {
 const {
   tenant_id,
@@ -10002,7 +10106,7 @@ const {
    ✏️ PATCH /services/:id
 ====================================================== */
 
-app.patch("/services/:id", async (req, res) => {
+app.patch("/services/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -10113,7 +10217,7 @@ if (capacity !== undefined) updateData.capacity = Number(capacity);
 /* ======================================================
    🗑️ DELETE /services/:id
 ====================================================== */
-app.delete("/services/:id", async (req, res) => {
+app.delete("/services/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -10153,7 +10257,7 @@ app.delete("/services/:id", async (req, res) => {
    🌐 PUBLIC: servicios por slug
 ====================================================== */
 
-app.get("/public/services/:slug", async (req, res) => {
+app.get("/public/services/:slug", publicLimiter, async (req, res) => {
   try {
     const { slug } = req.params;
     const { branch_id } = req.query;
@@ -10247,7 +10351,7 @@ const filteredServices = (services || []).filter((s) =>
    🌐 PUBLIC: negocio por slug
 ====================================================== */
 
-app.get("/public/business/:slug", async (req, res) => {
+app.get("/public/business/:slug", publicLimiter, async (req, res) => {
   try {
     const { slug } = req.params;
 
@@ -10321,7 +10425,7 @@ app.get("/public/business/:slug", async (req, res) => {
    🌐 PUBLIC: staff por slug + service_id
 ====================================================== */
 
-app.get("/public/staff/:slug/:service_id", async (req, res) => {
+app.get("/public/staff/:slug/:service_id", publicLimiter, async (req, res) => {
   try {
     const { slug, service_id } = req.params;
     const { branch_id } = req.query;
@@ -10434,7 +10538,7 @@ app.get("/public/staff/:slug/:service_id", async (req, res) => {
    🌐 PUBLIC: slots por slug + service_id + date
 ====================================================== */
 
-app.get("/public/slots/:slug/:service_id", async (req, res) => {
+app.get("/public/slots/:slug/:service_id", publicLimiter, async (req, res) => {
   try {
     const { slug, service_id } = req.params;
     const { date, staff_id, branch_id } = req.query;
@@ -10942,7 +11046,7 @@ app.post("/onboarding/setup", async (req, res) => {
    🔹 GET /booking-fields/:slug
    Obtener configuración de campos dinámicos
 ====================================================== */
-app.get("/booking-fields/:slug", async (req, res) => {
+app.get("/booking-fields/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
 
@@ -11006,7 +11110,7 @@ const DEFAULT_BOOKING_FIELDS_CONFIG = [
    🔹 PUT /booking-fields/:slug
    Guardar configuración de campos dinámicos
 ====================================================== */
-app.put("/booking-fields/:slug", async (req, res) => {
+app.put("/booking-fields/:slug", tenantAuthSlugWrite, async (req, res) => {
   try {
     const { slug } = req.params;
     const { booking_fields_config } = req.body;
@@ -11057,7 +11161,7 @@ app.put("/booking-fields/:slug", async (req, res) => {
 // =======================
 // UPLOAD IMAGE
 // =======================
-app.post("/upload/campaign-image", upload.single("file"), async (req, res) => {
+app.post("/upload/campaign-image", [dashboardLimiter, requireTenantAuth, requireWriteAccess], upload.single("file"), async (req, res) => {
   try {
     const { slug } = req.body;
 
@@ -11134,7 +11238,7 @@ app.post("/upload/campaign-image", upload.single("file"), async (req, res) => {
 // =======================
 // LISTAR IMÁGENES
 // =======================
-app.get("/campaign-images/:slug", async (req, res) => {
+app.get("/campaign-images/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
 
@@ -11159,7 +11263,7 @@ app.get("/campaign-images/:slug", async (req, res) => {
 // =======================
 // DELETE IMAGE
 // =======================
-app.delete("/campaign-images/:id", async (req, res) => {
+app.delete("/campaign-images/:id", [dashboardLimiter, requireTenantAuth, requireWriteAccess], async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -11191,7 +11295,7 @@ app.delete("/campaign-images/:id", async (req, res) => {
 // SOPORTE — TICKETS
 // =======================
 
-app.post("/upload/ticket-attachment", uploadTicket.single("file"), async (req, res) => {
+app.post("/upload/ticket-attachment", [dashboardLimiter, requireTenantAuth], uploadTicket.single("file"), async (req, res) => {
   try {
     const { tenant_id } = req.body;
     if (!tenant_id || !req.file)
@@ -11214,7 +11318,7 @@ app.post("/upload/ticket-attachment", uploadTicket.single("file"), async (req, r
   }
 });
 
-app.post("/support/tickets", async (req, res) => {
+app.post("/support/tickets", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, created_by, subject, category, description, attachments } = req.body;
     console.log("[DEBUG support/tickets] body:", JSON.stringify({ tenant_id, created_by, subject, category, description: description?.slice(0, 30) }));
@@ -11259,7 +11363,7 @@ app.post("/support/tickets", async (req, res) => {
   }
 });
 
-app.get("/support/tickets", async (req, res) => {
+app.get("/support/tickets", tenantAuth, async (req, res) => {
   try {
     const { tenant_id } = req.query;
     if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
@@ -11276,7 +11380,7 @@ app.get("/support/tickets", async (req, res) => {
   }
 });
 
-app.get("/support/tickets/:id/messages", async (req, res) => {
+app.get("/support/tickets/:id/messages", [dashboardLimiter, requireTenantAuth], async (req, res) => {
   try {
     const { id } = req.params;
     const { tenant_id } = req.query;
@@ -11301,7 +11405,7 @@ app.get("/support/tickets/:id/messages", async (req, res) => {
   }
 });
 
-app.post("/support/tickets/:id/messages", async (req, res) => {
+app.post("/support/tickets/:id/messages", [dashboardLimiter, requireTenantAuth, requireWriteAccess], async (req, res) => {
   try {
     const { id } = req.params;
     const { tenant_id, sender_id, message, attachments, sender_type: rawSenderType } = req.body;
@@ -11348,7 +11452,7 @@ app.post("/support/tickets/:id/messages", async (req, res) => {
   }
 });
 
-app.patch("/support/tickets/:id/mark-read", async (req, res) => {
+app.patch("/support/tickets/:id/mark-read", [dashboardLimiter, requireTenantAuth], async (req, res) => {
   try {
     const { id } = req.params;
     const { tenant_id } = req.body;
@@ -11366,7 +11470,7 @@ app.patch("/support/tickets/:id/mark-read", async (req, res) => {
   }
 });
 
-app.get("/support/tickets/unread-count", async (req, res) => {
+app.get("/support/tickets/unread-count", tenantAuth, async (req, res) => {
   try {
     const { tenant_id } = req.query;
     if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
@@ -11383,7 +11487,7 @@ app.get("/support/tickets/unread-count", async (req, res) => {
   }
 });
 
-app.patch("/support/tickets/:id/resolve", async (req, res) => {
+app.patch("/support/tickets/:id/resolve", [dashboardLimiter, requireTenantAuth], async (req, res) => {
   try {
     const { id } = req.params;
     const { tenant_id } = req.body;
@@ -11405,7 +11509,7 @@ app.patch("/support/tickets/:id/resolve", async (req, res) => {
   }
 });
 
-app.patch("/support/tickets/:id/confirm-resolution", async (req, res) => {
+app.patch("/support/tickets/:id/confirm-resolution", [dashboardLimiter, requireTenantAuth], async (req, res) => {
   try {
     const { id } = req.params;
     const { tenant_id, confirmed } = req.body;
@@ -11576,7 +11680,7 @@ app.listen(PORT, () => {
   console.log(`🚀 Servidor listo en http://localhost:${PORT}`);
 });
 
-app.get("/api/pets/:slug", async (req, res) => {
+app.get("/api/pets/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { phone, email } = req.query;
@@ -11630,7 +11734,7 @@ app.get("/api/pets/:slug", async (req, res) => {
    Crea una invitación pendiente y envía email al invitado.
    Body: { tenant_id, email, role, branch_id?, invited_by? }
 ====================================================== */
-app.post("/invitations", async (req, res) => {
+app.post("/invitations", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, email, role, branch_id, invited_by, permissions } = req.body;
 
@@ -11756,7 +11860,7 @@ app.post("/invitations", async (req, res) => {
    Lista todas las invitaciones del tenant.
    Query: { tenant_id }
 ====================================================== */
-app.get("/invitations", async (req, res) => {
+app.get("/invitations", tenantAuth, async (req, res) => {
   try {
     const { tenant_id } = req.query;
 
@@ -11784,7 +11888,7 @@ app.get("/invitations", async (req, res) => {
    Cancela una invitación (cambia status a canceled, no elimina).
    Body: { tenant_id }
 ====================================================== */
-app.delete("/invitations/:id", async (req, res) => {
+app.delete("/invitations/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const { tenant_id } = req.body;
@@ -12002,7 +12106,7 @@ app.get("/invitations/token/:token", async (req, res) => {
    Lista miembros activos del tenant con email y sucursal.
    Query: { tenant_id }
 ====================================================== */
-app.get("/members", async (req, res) => {
+app.get("/members", tenantAuth, async (req, res) => {
   try {
     const { tenant_id } = req.query;
 
@@ -12077,7 +12181,7 @@ app.get("/members", async (req, res) => {
    No permite modificar al owner.
    Body: { tenant_id, role?, branch_id?, is_active? }
 ====================================================== */
-app.patch("/members/:id", async (req, res) => {
+app.patch("/members/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
     const { tenant_id, role, branch_id, is_active, permissions, branch_ids } = req.body;
@@ -12256,7 +12360,7 @@ async function maybeApplyEmailChange(requestId, record) {
   }
 }
 
-app.post("/account/email-change/request", async (req, res) => {
+app.post("/account/email-change/request", [dashboardLimiter, requireTenantAuth], async (req, res) => {
   try {
     const { user_id, current_email, new_email, password, tenant_id } = req.body;
     if (!user_id || !current_email || !new_email || !password) {
@@ -12375,7 +12479,7 @@ app.get("/account/email-change/confirm-new/:token", async (req, res) => {
   }
 });
 
-app.get("/account/email-change/status", async (req, res) => {
+app.get("/account/email-change/status", [dashboardLimiter, requireTenantAuth], async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: "user_id es obligatorio" });
