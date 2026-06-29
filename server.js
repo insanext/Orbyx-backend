@@ -8541,6 +8541,17 @@ app.post("/tenants/provision", async (req, res) => {
       return res.status(400).json({ error: "Faltan campos: user_id, email" });
     }
 
+    const maxRetries = 5;
+    let authUser = null;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      const { data } = await supabase.auth.admin.getUserById(user_id);
+      if (data?.user) { authUser = data.user; break; }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    if (!authUser) {
+      return res.status(400).json({ error: "Usuario no encontrado en auth. Intenta de nuevo." });
+    }
+
     // billing_cycle opcional: mensual (default), semestral o anual
     const provisionCycle = normalizeBillingCycle(billing_cycle);
 
