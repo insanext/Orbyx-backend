@@ -783,8 +783,13 @@ async function requireTenantAuth(req, res, next) {
     const token = authHeader.split(" ")[1];
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) {
+      console.log("[TEMP DEBUG] requireTenantAuth failed", {
+        path: req.path,
+        error: authError?.message || "no user",
+      });
       return res.status(401).json({ error: "Token inválido o sesión expirada" });
     }
+    console.log("[TEMP DEBUG] requireTenantAuth ok", { path: req.path, userId: user.id });
     req.authenticatedUser = { user_id: user.id };
     next();
   } catch (err) {
@@ -802,6 +807,15 @@ async function resolveTenantMembership(req, res, tenantId) {
     .eq("tenant_id", tenantId)
     .eq("is_active", true)
     .single();
+  console.log("[TEMP DEBUG] resolveTenantMembership", {
+    path: req.path,
+    method: req.method,
+    paramsId: req.params?.id,
+    userIdUsed: userId,
+    tenantIdUsed: tenantId,
+    membershipFound: membership || null,
+    queryError: membershipError ? { message: membershipError.message, code: membershipError.code, details: membershipError.details } : null,
+  });
   if (membershipError || !membership) {
     return null;
   }
