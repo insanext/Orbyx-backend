@@ -783,13 +783,12 @@ async function requireTenantAuth(req, res, next) {
     const token = authHeader.split(" ")[1];
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) {
-      console.log("[TEMP DEBUG] requireTenantAuth failed", {
-        path: req.path,
-        error: authError?.message || "no user",
+      // TEMP DEBUG - REMOVE: expone detalle de diagnóstico en la respuesta HTTP
+      return res.status(401).json({
+        error: "Token inválido o sesión expirada",
+        _debug: { path: req.path, authError: authError?.message || null, hadUser: Boolean(user) },
       });
-      return res.status(401).json({ error: "Token inválido o sesión expirada" });
     }
-    console.log("[TEMP DEBUG] requireTenantAuth ok", { path: req.path, userId: user.id });
     req.authenticatedUser = { user_id: user.id };
     next();
   } catch (err) {
@@ -807,15 +806,20 @@ async function resolveTenantMembership(req, res, tenantId) {
     .eq("tenant_id", tenantId)
     .eq("is_active", true)
     .single();
-  console.log("[TEMP DEBUG] resolveTenantMembership", {
+  // TEMP DEBUG - REMOVE: guarda detalle para incluirlo en la respuesta HTTP si falla
+  req._membershipDebug = {
     path: req.path,
     method: req.method,
-    paramsId: req.params?.id,
-    userIdUsed: userId,
-    tenantIdUsed: tenantId,
-    membershipFound: membership || null,
-    queryError: membershipError ? { message: membershipError.message, code: membershipError.code, details: membershipError.details } : null,
-  });
+    paramsId: req.params?.id ?? null,
+    user_id_usado: userId,
+    tenant_id_usado: tenantId,
+    query_result: {
+      data: membership || null,
+      error: membershipError
+        ? { message: membershipError.message, code: membershipError.code, details: membershipError.details, hint: membershipError.hint }
+        : null,
+    },
+  };
   if (membershipError || !membership) {
     return null;
   }
@@ -879,7 +883,11 @@ async function enforceTenantIdParam(req, res, next) {
   }
   const membership = await resolveTenantMembership(req, res, requestedTid);
   if (!membership) {
-    return res.status(403).json({ error: "No tienes acceso a este negocio" });
+    // TEMP DEBUG - REMOVE: expone detalle de diagnóstico en la respuesta HTTP
+    return res.status(403).json({
+      error: "No tienes acceso a este negocio",
+      _debug: req._membershipDebug || null,
+    });
   }
   next();
 }
