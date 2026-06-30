@@ -783,11 +783,7 @@ async function requireTenantAuth(req, res, next) {
     const token = authHeader.split(" ")[1];
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) {
-      // TEMP DEBUG - REMOVE: expone detalle de diagnóstico en la respuesta HTTP
-      return res.status(401).json({
-        error: "Token inválido o sesión expirada",
-        _debug: { path: req.path, authError: authError?.message || null, hadUser: Boolean(user) },
-      });
+      return res.status(401).json({ error: "Token inválido o sesión expirada" });
     }
     req.authenticatedUser = { user_id: user.id };
     next();
@@ -801,25 +797,11 @@ async function resolveTenantMembership(req, res, tenantId) {
   const userId = req.authenticatedUser.user_id;
   const { data: membership, error: membershipError } = await supabase
     .from("tenant_users")
-    .select("id, tenant_id, role, is_active")
+    .select("tenant_id, role, is_active")
     .eq("user_id", userId)
     .eq("tenant_id", tenantId)
     .eq("is_active", true)
     .single();
-  // TEMP DEBUG - REMOVE: guarda detalle para incluirlo en la respuesta HTTP si falla
-  req._membershipDebug = {
-    path: req.path,
-    method: req.method,
-    paramsId: req.params?.id ?? null,
-    user_id_usado: userId,
-    tenant_id_usado: tenantId,
-    query_result: {
-      data: membership || null,
-      error: membershipError
-        ? { message: membershipError.message, code: membershipError.code, details: membershipError.details, hint: membershipError.hint }
-        : null,
-    },
-  };
   if (membershipError || !membership) {
     return null;
   }
@@ -883,11 +865,7 @@ async function enforceTenantIdParam(req, res, next) {
   }
   const membership = await resolveTenantMembership(req, res, requestedTid);
   if (!membership) {
-    // TEMP DEBUG - REMOVE: expone detalle de diagnóstico en la respuesta HTTP
-    return res.status(403).json({
-      error: "No tienes acceso a este negocio",
-      _debug: req._membershipDebug || null,
-    });
+    return res.status(403).json({ error: "No tienes acceso a este negocio" });
   }
   next();
 }
@@ -11858,7 +11836,7 @@ app.post("/invitations", tenantAuthWrite, async (req, res) => {
     if (matchingAuthUser) {
       const { data: existingMember } = await supabase
         .from("tenant_users")
-        .select("id")
+        .select("user_id")
         .eq("tenant_id", tenant_id)
         .eq("user_id", matchingAuthUser.id)
         .eq("is_active", true)
@@ -12045,7 +12023,7 @@ app.post("/invitations/accept/:token", async (req, res) => {
     // Verificar que no sea ya miembro activo
     const { data: existingMember } = await supabase
       .from("tenant_users")
-      .select("id")
+      .select("user_id")
       .eq("tenant_id", invitation.tenant_id)
       .eq("user_id", authUser.id)
       .eq("is_active", true)
@@ -12173,7 +12151,7 @@ app.get("/members", tenantAuth, async (req, res) => {
 
     const { data: members, error: membersError } = await supabase
       .from("tenant_users")
-      .select("id, user_id, tenant_id, role, is_active, created_at")
+      .select("user_id, tenant_id, role, is_active, created_at")
       .eq("tenant_id", tenant_id)
       .eq("is_active", true)
       .order("created_at", { ascending: true });
@@ -12221,6 +12199,7 @@ app.get("/members", tenantAuth, async (req, res) => {
     // Enriquecer cada miembro
     const enrichedMembers = members.map((m) => ({
       ...m,
+      id: m.user_id,
       email: authUsersMap[m.user_id] || null,
       branch_access: m.role === "branch" ? (branchAccessMap[m.user_id] || null) : null,
     }));
@@ -12247,11 +12226,11 @@ app.patch("/members/:id", tenantAuthWrite, async (req, res) => {
       return res.status(400).json({ error: "Faltan campos: id (param), tenant_id (body)" });
     }
 
-    // Buscar el miembro
+    // Buscar el miembro (el param :id representa user_id; tenant_users no tiene columna id propia)
     const { data: member, error: fetchError } = await supabase
       .from("tenant_users")
-      .select("id, user_id, tenant_id, role, is_active")
-      .eq("id", id)
+      .select("user_id, tenant_id, role, is_active")
+      .eq("user_id", id)
       .eq("tenant_id", tenant_id)
       .single();
 
@@ -12301,7 +12280,8 @@ app.patch("/members/:id", tenantAuthWrite, async (req, res) => {
     const { data: updated, error: updateError } = await supabase
       .from("tenant_users")
       .update(updatePayload)
-      .eq("id", id)
+      .eq("user_id", id)
+      .eq("tenant_id", tenant_id)
       .select()
       .single();
 
