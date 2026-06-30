@@ -858,10 +858,23 @@ async function enforceSlugOwnership(req, res, next) {
   next();
 }
 
+async function enforceTenantIdParam(req, res, next) {
+  const requestedTid = req.params.id;
+  if (!requestedTid) {
+    return res.status(400).json({ error: "tenant_id es obligatorio" });
+  }
+  const membership = await resolveTenantMembership(req, res, requestedTid);
+  if (!membership) {
+    return res.status(403).json({ error: "No tienes acceso a este negocio" });
+  }
+  next();
+}
+
 const tenantAuth = [dashboardLimiter, requireTenantAuth, enforceTenantId];
 const tenantAuthWrite = [dashboardLimiter, requireTenantAuth, enforceTenantId, requireWriteAccess];
 const tenantAuthSlug = [dashboardLimiter, requireTenantAuth, enforceSlugOwnership];
 const tenantAuthSlugWrite = [dashboardLimiter, requireTenantAuth, enforceSlugOwnership, requireWriteAccess];
+const tenantAuthParamWrite = [dashboardLimiter, requireTenantAuth, enforceTenantIdParam, requireWriteAccess];
 
 const PORT = process.env.PORT || 3000;
 
@@ -9338,7 +9351,7 @@ app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) =
    ✅ PATCH /tenants/:id
 ====================================================== */
 
-app.patch("/tenants/:id", tenantAuthWrite, async (req, res) => {
+app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
   try {
     const { id } = req.params;
 
