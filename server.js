@@ -8463,6 +8463,10 @@ app.patch("/appointments/:id/session-notes", tenantAuthSlugWrite, async (req, re
 
     if (!slug) return res.status(400).json({ error: "slug es obligatorio" });
 
+    if (typeof notes === "string" && notes.length > 300) {
+      return res.status(400).json({ error: "La nota no puede superar los 300 caracteres" });
+    }
+
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .select("id")
