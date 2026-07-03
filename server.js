@@ -8477,7 +8477,7 @@ app.patch("/appointments/:id/session-notes", tenantAuthSlugWrite, async (req, re
 
     const { data, error } = await supabase
       .from("appointments")
-      .update({ notes: notes ?? null, updated_at: new Date().toISOString() })
+      .update({ notes: notes ?? null })
       .eq("id", id)
       .eq("tenant_id", tenant.id)
       .select("id, notes")
