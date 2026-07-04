@@ -19,6 +19,7 @@ const {
 } = require("./email");
 
 const app = express();
+app.set("trust proxy", 1);
 
 // =======================
 // SUPABASE
@@ -11857,10 +11858,19 @@ app.post("/invitations", tenantAuthWrite, async (req, res) => {
     // expires_at = ahora + 7 días
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
+    // tenant_invitations.role tiene CHECK (role IN ('owner','admin','branch','readonly')).
+    // 'custom' es un concepto de frontend (permisos granulares por módulo); se
+    // almacena como 'readonly' y los permisos reales quedan en la columna jsonb
+    // 'permissions'. Se mantiene 'readonly' (no un rol con más acceso) porque
+    // requireWriteAccess solo bloquea escritura para role === 'readonly' — hoy
+    // no hay enforcement de 'permissions' a nivel de endpoint, así que cualquier
+    // otro valor de role daría acceso de escritura total sin restricción real.
+    const dbRole = role === "custom" ? "readonly" : role;
+
     const insertPayload = {
       tenant_id,
       email: normalizedEmail,
-      role,
+      role: dbRole,
       token,
       status: "pending",
       expires_at: expiresAt,
@@ -11889,12 +11899,7 @@ app.post("/invitations", tenantAuthWrite, async (req, res) => {
 
     return res.status(201).json({ ok: true, invitation });
   } catch (err) {
-    console.error("POST /invitations error:", {
-      message: err.message,
-      code: err.code,
-      details: err.details,
-      hint: err.hint,
-    });
+    console.error("POST /invitations error:", err.message);
     return res.status(500).json({ error: "Error creando invitación", detail: err.message });
   }
 });
