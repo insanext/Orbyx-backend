@@ -1,4 +1,4 @@
-console.log("BACKEND VERSION 03-07-INVITATIONS-FIX-v3");
+console.log("BACKEND VERSION 03-07-INVITATIONS-FIX-v4");
 
 // server.js
 require("dotenv").config();

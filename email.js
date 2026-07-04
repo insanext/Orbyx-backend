@@ -145,6 +145,7 @@ async function sendBookingEmail({
 }
 
 async function sendInvitationEmail({ email, businessName, role, token }) {
+  console.log("[INVITE EMAIL] Intentando enviar a:", email);
   try {
     if (!resend) {
       console.warn("⚠️ RESEND_API_KEY no configurada. Email de invitación omitido.");
@@ -159,7 +160,8 @@ async function sendInvitationEmail({ email, businessName, role, token }) {
     const roleLabel = roleLabels[role] || role;
     const inviteUrl = `https://www.orbyx.cl/invite/${token}`;
 
-    await resend.emails.send({
+    console.log("[INVITE EMAIL] Llamando a Resend con from:", process.env.RESEND_FROM_EMAIL);
+    const { data, error } = await resend.emails.send({
       from: "Orbyx <reservas@notificaciones.orbyx.cl>",
       to: email,
       subject: `Te invitaron a gestionar ${businessName || "un negocio"} en Orbyx`,
@@ -226,8 +228,10 @@ async function sendInvitationEmail({ email, businessName, role, token }) {
 </div>
 `,
     });
+    console.log("[INVITE EMAIL] Resultado de Resend:", JSON.stringify({ data, error }));
   } catch (error) {
     console.error("Error enviando email de invitación:", error);
+    console.error("[INVITE EMAIL] Error:", JSON.stringify(error));
   }
 }
 
