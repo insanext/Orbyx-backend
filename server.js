@@ -1,4 +1,4 @@
-console.log("BACKEND VERSION 26-06-SECURITY-AUTH");
+console.log("BACKEND VERSION 03-07-INVITATIONS-FIX");
 
 // server.js
 require("dotenv").config();
