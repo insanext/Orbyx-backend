@@ -1,4 +1,4 @@
-console.log("BACKEND VERSION 03-07-INVITATIONS-FIX-v4");
+console.log("BACKEND VERSION 03-07-INVITATIONS-FINAL");
 
 // server.js
 require("dotenv").config();
@@ -11891,7 +11891,7 @@ app.post("/invitations", tenantAuthWrite, async (req, res) => {
     sendInvitationEmail({
       email: normalizedEmail,
       businessName: tenant.name,
-      role,
+      role: dbRole,
       token,
     }).catch((err) => console.error("sendInvitationEmail error:", err));
 
