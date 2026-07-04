@@ -1,4 +1,4 @@
-console.log("BACKEND VERSION 03-07-INVITATIONS-FIX-v2");
+console.log("BACKEND VERSION 03-07-INVITATIONS-FIX-v3");
 
 // server.js
 require("dotenv").config();
@@ -11858,14 +11858,12 @@ app.post("/invitations", tenantAuthWrite, async (req, res) => {
     // expires_at = ahora + 7 días
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
-    // tenant_invitations.role tiene CHECK (role IN ('owner','admin','branch','readonly')).
-    // 'custom' es un concepto de frontend (permisos granulares por módulo); se
-    // almacena como 'readonly' y los permisos reales quedan en la columna jsonb
-    // 'permissions'. Se mantiene 'readonly' (no un rol con más acceso) porque
-    // requireWriteAccess solo bloquea escritura para role === 'readonly' — hoy
-    // no hay enforcement de 'permissions' a nivel de endpoint, así que cualquier
-    // otro valor de role daría acceso de escritura total sin restricción real.
-    const dbRole = role === "custom" ? "readonly" : role;
+    // NOTA: el constraint real en producción acepta ('owner','admin',
+    // 'operator','staff','manager'). La migración accounts-base-A.sql
+    // está desactualizada — fue modificado directamente en Supabase.
+    // 'custom' (permisos granulares del frontend) se mapea a 'operator'
+    // como rol por defecto hasta que se implemente enforcement real de permissions.
+    const dbRole = role === "custom" ? "operator" : role;
 
     const insertPayload = {
       tenant_id,
