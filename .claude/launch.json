@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "orbyx-web-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "orbyx-web", "run", "dev"],
+      "port": 3000
+    }
+  ]
+}

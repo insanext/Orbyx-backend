@@ -1,4 +1,4 @@
-console.log("BACKEND VERSION 03-07-INVITATIONS-FIX");
+console.log("BACKEND VERSION 03-07-INVITATIONS-FIX-v2");
 
 // server.js
 require("dotenv").config();
@@ -11899,7 +11899,12 @@ app.post("/invitations", tenantAuthWrite, async (req, res) => {
 
     return res.status(201).json({ ok: true, invitation });
   } catch (err) {
-    console.error("POST /invitations error:", err.message);
+    console.error("POST /invitations error:", {
+      message: err.message,
+      code: err.code,
+      details: err.details,
+      hint: err.hint,
+    });
     return res.status(500).json({ error: "Error creando invitación", detail: err.message });
   }
 });
