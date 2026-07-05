@@ -1,4 +1,4 @@
-console.log("BACKEND VERSION 03-07-INVITATIONS-FINAL");
+console.log("BACKEND VERSION 03-07-PERMISOS-INVITACION");
 
 // server.js
 require("dotenv").config();
@@ -798,7 +798,7 @@ async function resolveTenantMembership(req, res, tenantId) {
   const userId = req.authenticatedUser.user_id;
   const { data: membership, error: membershipError } = await supabase
     .from("tenant_users")
-    .select("tenant_id, role, is_active")
+    .select("tenant_id, role, is_active, permissions")
     .eq("user_id", userId)
     .eq("tenant_id", tenantId)
     .eq("is_active", true)
@@ -816,16 +816,79 @@ async function resolveTenantMembership(req, res, tenantId) {
     user_id: userId,
     tenant_id: tenantId,
     role: membership.role,
+    permissions: membership.permissions || null,
     branch_ids: (branchRows || []).map((r) => r.branch_id),
   };
   return membership;
 }
 
+// Mapeo de prefijos de ruta -> módulo de permisos granulares.
+// "always": siempre permitido (soporte). "owner_admin": solo owner/admin.
+const WRITE_ACCESS_MODULE_RULES = [
+  { prefix: "/support", access: "always" },
+  { prefix: "/billing", access: "owner_admin" },
+  { prefix: "/tenants", access: "owner_admin" },
+  { prefix: "/invitations", access: "owner_admin" },
+  { prefix: "/members", access: "owner_admin" },
+  { prefix: "/upload/campaign-image", module: "campanas" },
+  { prefix: "/campaign-images", module: "campanas" },
+  { prefix: "/campaigns", module: "campanas" },
+  { prefix: "/pets", module: "clientes" },
+  { prefix: "/clinical-notes", module: "clientes" },
+  { prefix: "/customers", module: "clientes" },
+  { prefix: "/appointments", module: "agenda" },
+  { prefix: "/staff", module: "staff" },
+  { prefix: "/service", module: "servicios" }, // cubre /services y /service-groups
+  { prefix: "/branches", module: "sucursales" },
+  { prefix: "/calendars", module: "negocio" },
+  { prefix: "/booking-fields", module: "negocio" },
+  { prefix: "/business", module: "negocio" },
+];
+
+function getWriteAccessRule(path) {
+  return WRITE_ACCESS_MODULE_RULES.find((rule) => path.startsWith(rule.prefix)) || null;
+}
+
 function requireWriteAccess(req, res, next) {
-  if (req.authenticatedUser && req.authenticatedUser.role === "readonly") {
+  const authUser = req.authenticatedUser;
+  if (!authUser) return next();
+
+  if (authUser.role === "readonly") {
     return res.status(403).json({ error: "Tu rol es solo lectura. No puedes realizar esta acción." });
   }
-  next();
+
+  // owner y admin siempre tienen acceso total.
+  if (authUser.role === "owner" || authUser.role === "admin") {
+    return next();
+  }
+
+  const rule = getWriteAccessRule(req.path);
+
+  if (!rule || rule.access === "always") {
+    return next();
+  }
+
+  if (rule.access === "owner_admin") {
+    return res.status(403).json({ error: "Esta acción requiere rol de administrador." });
+  }
+
+  const permissions = authUser.permissions;
+  const moduleAccess = permissions ? permissions[rule.module] : undefined;
+
+  // Sin permissions configurados (cuentas legacy sin permisos granulares): no restringir.
+  if (moduleAccess === undefined || moduleAccess === null) {
+    return next();
+  }
+
+  if (moduleAccess === false) {
+    return res.status(403).json({ error: "Sin acceso a este módulo" });
+  }
+
+  if (moduleAccess === "view") {
+    return res.status(403).json({ error: "Solo tienes acceso de lectura a este módulo" });
+  }
+
+  return next();
 }
 
 async function enforceTenantId(req, res, next) {
@@ -12023,19 +12086,43 @@ app.post("/invitations/accept/:token", async (req, res) => {
       return res.status(410).json({ error: "Esta invitación ha expirado. Solicita una nueva al administrador." });
     }
 
+    const { password } = req.body || {};
+    if (!password || String(password).length < 8) {
+      return res.status(400).json({ error: "La contraseña debe tener al menos 8 caracteres" });
+    }
+
     // Buscar usuario en auth.users por email
     const normalizedEmail = String(invitation.email).toLowerCase();
     const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
-    const authUser = authList?.users?.find(
+    let authUser = authList?.users?.find(
       (u) => String(u.email || "").toLowerCase() === normalizedEmail
     );
 
     if (!authUser) {
-      return res.status(404).json({
-        error: "No existe una cuenta de Orbyx con este email. Crea tu cuenta primero y luego acepta la invitación.",
+      // No existe cuenta todavía: la creamos ya confirmada (el click en el link
+      // de invitación ya validó la identidad, no hace falta doble confirmación).
+      const { data: created, error: createError } = await supabase.auth.admin.createUser({
         email: invitation.email,
+        password: String(password),
+        email_confirm: true,
       });
+
+      if (createError) {
+        // Carrera: puede haberse creado entre el listUsers y este createUser.
+        const { data: retryList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+        authUser = retryList?.users?.find(
+          (u) => String(u.email || "").toLowerCase() === normalizedEmail
+        );
+        if (!authUser) {
+          console.error("invitations/accept createUser error:", createError.message);
+          return res.status(500).json({ error: "Error creando la cuenta", detail: createError.message });
+        }
+      } else {
+        authUser = created.user;
+      }
     }
+    // Si el usuario ya existía (ej: invitado a otro negocio), no se toca su
+    // password actual — solo se lo agrega como miembro del nuevo tenant.
 
     // Verificar que no sea ya miembro activo
     const { data: existingMember } = await supabase
@@ -12168,7 +12255,7 @@ app.get("/members", tenantAuth, async (req, res) => {
 
     const { data: members, error: membersError } = await supabase
       .from("tenant_users")
-      .select("user_id, tenant_id, role, is_active, created_at")
+      .select("user_id, tenant_id, role, is_active, created_at, permissions")
       .eq("tenant_id", tenant_id)
       .eq("is_active", true)
       .order("created_at", { ascending: true });
