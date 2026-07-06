@@ -9639,6 +9639,7 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    // 06-07-DEBUG-CLEANUP
     return res.json({
       ok: true,
       tenant: data,
