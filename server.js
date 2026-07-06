@@ -12478,6 +12478,21 @@ app.delete("/members/:id", tenantAuthWrite, async (req, res) => {
 
     if (deleteError) throw deleteError;
 
+    // Solo borrar la cuenta de Supabase Auth si no tiene membresías activas en otros tenants.
+    const { data: otherMemberships } = await supabase
+      .from("tenant_users")
+      .select("tenant_id")
+      .eq("user_id", member.user_id)
+      .eq("is_active", true)
+      .neq("tenant_id", tenant_id);
+
+    if (!otherMemberships || otherMemberships.length === 0) {
+      const { error: authDeleteError } = await supabase.auth.admin.deleteUser(member.user_id);
+      if (authDeleteError) {
+        console.error("DELETE /members/:id auth.admin.deleteUser error:", authDeleteError.message);
+      }
+    }
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /members/:id error:", err.message);
