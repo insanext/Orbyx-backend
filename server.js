@@ -3677,7 +3677,6 @@ app.put("/staff/:id", tenantAuthWrite, async (req, res) => {
     const effectiveTenantId = tenant_id || existingStaff.tenant_id;
 
     const updateData = {};
-console.log("PUT /staff/:id body:", req.body);
 
     if (branch_id !== undefined) {
       const resolvedBranchId = await resolveBranchId({
@@ -3708,8 +3707,6 @@ console.log("PUT /staff/:id body:", req.body);
 if (req.body.photo_url !== undefined) {
   updateData.photo_url = req.body.photo_url || null;
 }
-
-console.log("PUT /staff/:id updateData:", updateData);
 
     const { data, error } = await supabase
       .from("staff")
@@ -9641,8 +9638,6 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
     if (error) {
       return res.status(500).json({ error: error.message });
     }
-
-    console.log("PATCH /tenants/:id logo_url saved:", data?.logo_url || null);
 
     return res.json({
       ok: true,
