@@ -1,4 +1,4 @@
-console.log("BACKEND VERSION 03-07-PERMISOS-INVITACION");
+console.log("BACKEND VERSION 06-07-INVITE-PASSWORD-FIX");
 
 // server.js
 require("dotenv").config();
@@ -11424,7 +11424,6 @@ app.post("/upload/ticket-attachment", [dashboardLimiter, requireTenantAuth], upl
 app.post("/support/tickets", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, created_by, subject, category, description, attachments } = req.body;
-    console.log("[DEBUG support/tickets] body:", JSON.stringify({ tenant_id, created_by, subject, category, description: description?.slice(0, 30) }));
     if (!tenant_id || !created_by || !subject?.trim() || !description?.trim())
       return res.status(400).json({ error: "Faltan datos requeridos" });
     if (Array.isArray(attachments) && attachments.length > 1)
@@ -12120,9 +12119,25 @@ app.post("/invitations/accept/:token", async (req, res) => {
       } else {
         authUser = created.user;
       }
+    } else {
+      // El usuario ya existía. Si solo tiene login OAuth (ej. Google) y no un
+      // identity "email", le agregamos el proveedor email/password para que
+      // también pueda entrar con email+contraseña (no afecta su login OAuth).
+      // Si ya tiene un identity "email" (con password propio, ej. invitado a
+      // otro tenant), no tocamos su password actual.
+      const hasEmailIdentity = (authUser.identities || []).some(
+        (identity) => identity.provider === "email"
+      );
+      if (!hasEmailIdentity) {
+        const { error: updatePasswordError } = await supabase.auth.admin.updateUserById(
+          authUser.id,
+          { password: String(password) }
+        );
+        if (updatePasswordError) {
+          console.error("invitations/accept updateUserById error:", updatePasswordError.message);
+        }
+      }
     }
-    // Si el usuario ya existía (ej: invitado a otro negocio), no se toca su
-    // password actual — solo se lo agrega como miembro del nuevo tenant.
 
     // Verificar que no sea ya miembro activo
     const { data: existingMember } = await supabase
