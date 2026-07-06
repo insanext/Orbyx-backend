@@ -12434,6 +12434,56 @@ app.patch("/members/:id", tenantAuthWrite, async (req, res) => {
   }
 });
 
+/* ======================================================
+   ✅ MIEMBROS — DELETE /members/:id
+   Elimina permanentemente a un miembro del tenant.
+   No permite eliminar al owner.
+   Body: { tenant_id }
+====================================================== */
+app.delete("/members/:id", tenantAuthWrite, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tenant_id } = req.body;
+
+    if (!id || !tenant_id) {
+      return res.status(400).json({ error: "Faltan campos: id (param), tenant_id (body)" });
+    }
+
+    const { data: member, error: fetchError } = await supabase
+      .from("tenant_users")
+      .select("user_id, tenant_id, role")
+      .eq("user_id", id)
+      .eq("tenant_id", tenant_id)
+      .single();
+
+    if (fetchError || !member) {
+      return res.status(404).json({ error: "Miembro no encontrado en este tenant" });
+    }
+
+    if (member.role === "owner") {
+      return res.status(403).json({ error: "No se puede eliminar al owner del tenant" });
+    }
+
+    await supabase
+      .from("branch_access")
+      .delete()
+      .eq("user_id", member.user_id)
+      .eq("tenant_id", tenant_id);
+
+    const { error: deleteError } = await supabase
+      .from("tenant_users")
+      .delete()
+      .eq("user_id", member.user_id)
+      .eq("tenant_id", tenant_id);
+
+    if (deleteError) throw deleteError;
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /members/:id error:", err.message);
+    return res.status(500).json({ error: "Error eliminando miembro", detail: err.message });
+  }
+});
 
 /* ======================================================
    ACCOUNT — EMAIL CHANGE (dual-confirmation)
