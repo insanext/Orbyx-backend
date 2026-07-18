@@ -2082,6 +2082,27 @@ async function flowApiRequest(endpoint, params, method = "POST") {
   return data;
 }
 
+// /customer/create no es idempotente: si el externalId ya tiene un customer
+// en Flow, responde error en vez de devolverlo. /customer/list no soporta
+// filtrar por externalId, así que se pagina y se busca client-side.
+async function findFlowCustomerByExternalId(externalId) {
+  const limit = 100;
+  const maxPages = 20; // tope de seguridad: hasta 2000 customers escaneados
+  for (let page = 0; page < maxPages; page++) {
+    const start = page * limit;
+    const result = await flowApiRequest("/customer/list", { start, limit }, "GET");
+    const items = Array.isArray(result?.data)
+      ? result.data
+      : Array.isArray(result)
+      ? result
+      : [];
+    const match = items.find((c) => c.externalId === externalId);
+    if (match) return match;
+    if (items.length < limit) return null;
+  }
+  return null;
+}
+
 async function sendCampaignEmail({
   to,
   subject,
@@ -9484,11 +9505,21 @@ app.post("/billing/flow/create-customer", tenantAuthWrite, async (req, res) => {
     const user_agent = req.headers["user-agent"] || null;
     const timestamp = new Date().toISOString();
 
-    const flowCustomer = await flowApiRequest("/customer/create", {
-      email: tenant.email,
-      name: tenant.name || tenant.email,
-      externalId: tenant_id,
-    });
+    let flowCustomer;
+    try {
+      flowCustomer = await flowApiRequest("/customer/create", {
+        email: tenant.email,
+        name: tenant.name || tenant.email,
+        externalId: tenant_id,
+      });
+    } catch (createErr) {
+      const alreadyExists = /customer.*externalId|externalId.*customer/i.test(createErr.message || "");
+      if (!alreadyExists) throw createErr;
+
+      const existingCustomer = await findFlowCustomerByExternalId(tenant_id);
+      if (!existingCustomer) throw createErr;
+      flowCustomer = existingCustomer;
+    }
 
     const consentimiento = { ip, timestamp, user_agent, texto_autorizacion_version };
 
