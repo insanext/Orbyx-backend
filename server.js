@@ -751,10 +751,33 @@ const corsOptions = {
   credentials: false,
 };
 
+// Flow.cl llama estas dos rutas server-a-servidor / vía redirect desde su
+// propia página (sandbox.flow.cl u otro origin nuestro), no desde el
+// dashboard: no deben pasar por la validación de origin ni por el parser
+// JSON global, que asumen un caller propio nuestro y por defecto rechazan
+// o revientan ante un origin/body externo. El resto de /billing/flow/*
+// (create-customer, register-card) sí los necesita: los llama el dashboard.
+const FLOW_INBOUND_PATHS = new Set([
+  "/billing/flow/register-card-callback",
+  "/billing/flow/webhook",
+]);
+
+const corsMiddleware = cors(corsOptions);
+function corsUnlessFlowInbound(req, res, next) {
+  if (FLOW_INBOUND_PATHS.has(req.path)) return next();
+  return corsMiddleware(req, res, next);
+}
+
+const jsonParser = express.json();
+function jsonUnlessFlowInbound(req, res, next) {
+  if (FLOW_INBOUND_PATHS.has(req.path)) return next();
+  return jsonParser(req, res, next);
+}
+
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
-app.use(cors(corsOptions));
-app.options(/.*/, cors(corsOptions));
-app.use(express.json());
+app.use(corsUnlessFlowInbound);
+app.options(/.*/, corsUnlessFlowInbound);
+app.use(jsonUnlessFlowInbound);
 
 const publicLimiter = rateLimit({
   windowMs: 60 * 1000,
