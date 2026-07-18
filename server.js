@@ -16,6 +16,8 @@ const {
   sendInvitationEmail,
   sendEmailChangeConfirmationToOldEmail,
   sendEmailChangeVerificationToNewEmail,
+  sendSignupRecoveryEmail,
+  sendSignupStuckAlertEmail,
 } = require("./email");
 
 const app = express();
@@ -760,6 +762,7 @@ const corsOptions = {
 const FLOW_INBOUND_PATHS = new Set([
   "/billing/flow/register-card-callback",
   "/billing/flow/webhook",
+  "/signup/register-card-callback",
 ]);
 
 const corsMiddleware = cors(corsOptions);
@@ -8751,6 +8754,94 @@ app.get("/_ping", (req, res) => {
   res.send("pong ✅");
 });
 
+// provisionTenantCore/linkTenantOwner: lógica interna de /tenants/provision
+// extraída para reusarse desde el flujo de signup pagado (premium/vip/platinum),
+// donde el tenant se crea antes de que exista un user_id de Supabase Auth.
+async function provisionTenantCore({ email, plan = "pro", billing_cycle }) {
+  const provisionCycle = normalizeBillingCycle(billing_cycle);
+
+  const baseSlug = String(email).split("@")[0] || "tenant";
+  const cleanBase =
+    baseSlug
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 30) || "tenant";
+
+  const suffix = Math.random().toString(16).slice(2, 8);
+  const slug = `${cleanBase}-${suffix}`;
+
+  const billing_cycle_start = new Date().toISOString();
+  const billing_cycle_end = addMonths(
+    new Date(),
+    BILLING_CYCLES[provisionCycle].months
+  ).toISOString();
+
+  const normalizedProvisionPlan = normalizePlanSlug(plan);
+  const { data: tenant, error: tenantError } = await supabase
+    .from("tenants")
+    .insert({
+      name: email,
+      slug,
+      plan_slug: normalizedProvisionPlan,
+      is_trial: normalizedProvisionPlan === "pro",
+      billing_cycle_start,
+      billing_cycle_end,
+      scheduled_plan_slug: null,
+      scheduled_change_at: null,
+      pending_change_type: null,
+      proration_credit: 0,
+      proration_charge: 0,
+    })
+    .select()
+    .single();
+
+  if (tenantError) throw tenantError;
+
+  const { data: calendar, error: calendarError } = await supabase
+    .from("calendars")
+    .insert({
+      tenant_id: tenant.id,
+      name: "Agenda Principal",
+      timezone: "America/Santiago",
+      is_active: true,
+      slot_minutes: 30,
+      buffer_minutes: 0,
+    })
+    .select()
+    .single();
+
+  if (calendarError) throw calendarError;
+
+  const { data: branch, error: branchError } = await supabase
+    .from("branches")
+    .insert({
+      tenant_id: tenant.id,
+      name: "Principal",
+      is_active: true,
+      use_global_hours: true,
+      use_global_special_dates: true,
+      use_global_socials: true,
+      use_global_contact: true,
+    })
+    .select()
+    .single();
+
+  if (branchError) throw branchError;
+
+  return { tenant, calendar, branch };
+}
+
+async function linkTenantOwner({ tenant_id, user_id }) {
+  const { error: userError } = await supabase.from("tenant_users").insert({
+    user_id,
+    tenant_id,
+    role: "owner",
+  });
+
+  if (userError) throw userError;
+}
+
 /* ======================================================
    ✅ SAAS: Provision tenant + owner user + main calendar
 ====================================================== */
@@ -8773,85 +8864,8 @@ app.post("/tenants/provision", async (req, res) => {
       return res.status(400).json({ error: "Usuario no encontrado en auth. Intenta de nuevo." });
     }
 
-    // billing_cycle opcional: mensual (default), semestral o anual
-    const provisionCycle = normalizeBillingCycle(billing_cycle);
-
-    const baseSlug = String(email).split("@")[0] || "tenant";
-    const cleanBase =
-      baseSlug
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "")
-        .slice(0, 30) || "tenant";
-
-    const suffix = Math.random().toString(16).slice(2, 8);
-    const slug = `${cleanBase}-${suffix}`;
-
-const billing_cycle_start = new Date().toISOString();
-const billing_cycle_end = addMonths(
-  new Date(),
-  BILLING_CYCLES[provisionCycle].months
-).toISOString();
-
-const normalizedProvisionPlan = normalizePlanSlug(plan);
-const { data: tenant, error: tenantError } = await supabase
-  .from("tenants")
-  .insert({
-    name: email,
-    slug,
-    plan_slug: normalizedProvisionPlan,
-    is_trial: normalizedProvisionPlan === "pro",
-    billing_cycle_start,
-    billing_cycle_end,
-    scheduled_plan_slug: null,
-    scheduled_change_at: null,
-    pending_change_type: null,
-    proration_credit: 0,
-    proration_charge: 0,
-  })
-  .select()
-  .single();
-
-    if (tenantError) throw tenantError;
-
-    const { error: userError } = await supabase.from("tenant_users").insert({
-      user_id,
-      tenant_id: tenant.id,
-      role: "owner",
-    });
-
-    if (userError) throw userError;
-
-    const { data: calendar, error: calendarError } = await supabase
-      .from("calendars")
-      .insert({
-        tenant_id: tenant.id,
-        name: "Agenda Principal",
-        timezone: "America/Santiago",
-        is_active: true,
-        slot_minutes: 30,
-        buffer_minutes: 0,
-      })
-      .select()
-      .single();
-
-    if (calendarError) throw calendarError;
-
-    const { data: branch, error: branchError } = await supabase
-      .from("branches")
-      .insert({
-        tenant_id: tenant.id,
-        name: "Principal",
-        is_active: true,
-        use_global_hours: true,
-        use_global_special_dates: true,
-        use_global_socials: true,
-        use_global_contact: true,
-      })
-      .select()
-      .single();
-
-    if (branchError) throw branchError;
+    const { tenant, calendar, branch } = await provisionTenantCore({ email, plan, billing_cycle });
+    await linkTenantOwner({ tenant_id: tenant.id, user_id });
 
     return res.json({
       ok: true,
@@ -9939,6 +9953,625 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+// =======================
+// SIGNUP PAGADO — PREMIUM/VIP/PLATINUM (pago primero, tenant después)
+// =======================
+const PAID_SIGNUP_PLANS = new Set(["premium", "vip", "platinum"]);
+
+/* ======================================================
+   ✅ POST /signup/start-paid (sandbox)
+   Pre-registro sin tenant: crea signup_intent + customer en Flow.
+   Sin auth (no existe usuario ni tenant todavía).
+====================================================== */
+app.post("/signup/start-paid", publicLimiter, async (req, res) => {
+  try {
+    const { email, business_name, plan_id, periodicidad, monto } = req.body || {};
+
+    if (!email || !plan_id || !periodicidad || !monto) {
+      return res.status(400).json({
+        error: "email, plan_id, periodicidad y monto son obligatorios",
+      });
+    }
+
+    const normalizedPlan = String(plan_id).toLowerCase();
+    if (!PAID_SIGNUP_PLANS.has(normalizedPlan)) {
+      return res.status(400).json({
+        error: "plan_id debe ser premium, vip o platinum. El plan Pro usa el onboarding normal.",
+      });
+    }
+
+    if (!PERIODICIDAD_TO_FLOW_INTERVAL[periodicidad]) {
+      return res.status(400).json({ error: `periodicidad no soportada: ${periodicidad}` });
+    }
+
+    const { data: intent, error: insertErr } = await supabase
+      .from("signup_intents")
+      .insert({
+        email,
+        business_name: business_name || null,
+        plan_id: normalizedPlan,
+        periodicidad,
+        monto,
+        status: "started",
+      })
+      .select("id")
+      .single();
+
+    if (insertErr) throw insertErr;
+
+    let flowCustomer;
+    try {
+      flowCustomer = await flowApiRequest("/customer/create", {
+        email,
+        name: business_name || email,
+        externalId: intent.id,
+      });
+    } catch (createErr) {
+      const alreadyExists = /customer.*externalId|externalId.*customer/i.test(createErr.message || "");
+      if (!alreadyExists) throw createErr;
+
+      const existingCustomer = await findFlowCustomerByExternalId(intent.id);
+      if (!existingCustomer) throw createErr;
+      flowCustomer = existingCustomer;
+    }
+
+    const { error: updateErr } = await supabase
+      .from("signup_intents")
+      .update({
+        flow_customer_id: flowCustomer.customerId,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", intent.id);
+
+    if (updateErr) throw updateErr;
+
+    return res.json({ signup_intent_id: intent.id });
+  } catch (err) {
+    console.error("POST /signup/start-paid error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /signup/register-card (sandbox)
+   Inicia enrolamiento de tarjeta para un signup_intent (pre-tenant).
+====================================================== */
+app.post("/signup/register-card", publicLimiter, async (req, res) => {
+  try {
+    const { signup_intent_id } = req.body || {};
+    if (!signup_intent_id) {
+      return res.status(400).json({ error: "signup_intent_id es obligatorio" });
+    }
+
+    const { data: intent, error: intentErr } = await supabase
+      .from("signup_intents")
+      .select("id, flow_customer_id, status")
+      .eq("id", signup_intent_id)
+      .maybeSingle();
+
+    if (intentErr) throw intentErr;
+    if (!intent || !intent.flow_customer_id) {
+      return res.status(404).json({ error: "No hay un customer de Flow creado para este signup" });
+    }
+
+    if (intent.status !== "started") {
+      return res.status(400).json({
+        error: "Este signup ya fue procesado, no se puede reintentar el registro de tarjeta",
+        status: intent.status,
+      });
+    }
+
+    const registerResult = await flowApiRequest("/customer/register", {
+      customerId: intent.flow_customer_id,
+      url_return: "https://orbyx-backend.onrender.com/signup/register-card-callback",
+    });
+
+    return res.json({
+      url: registerResult.url,
+      token: registerResult.token,
+    });
+  } catch (err) {
+    console.error("POST /signup/register-card error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+const SIGNUP_INTENT_SELECT_FIELDS =
+  "id, email, business_name, plan_id, periodicidad, monto, status, flow_customer_id, flow_subscription_id, recovery_token, tenant_id";
+
+// Reclamo atómico: solo el request que gana la carrera pasa de fromStatus a
+// patch.status. Los demás reciben null y deben releer el estado actual en vez
+// de asumir que ganaron — evita reintentos concurrentes duplicando efectos
+// (ej. crear dos tenants para el mismo signup_intent).
+async function claimSignupIntentStatus(intentId, fromStatus, patch) {
+  const { data, error } = await supabase
+    .from("signup_intents")
+    .update({ ...patch, updated_at: new Date().toISOString() })
+    .eq("id", intentId)
+    .eq("status", fromStatus)
+    .select(SIGNUP_INTENT_SELECT_FIELDS)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+// Intenta crear el tenant real para un signup_intent ya pagado. Reusable desde
+// el callback de tarjeta y desde /signup/resume (retry vía recovery_token).
+// Nunca vuelve a llamar a Flow: solo provisiona el tenant.
+async function attemptSignupIntentTenantCreation(intent) {
+  try {
+    const { tenant } = await provisionTenantCore({
+      email: intent.email,
+      plan: intent.plan_id,
+      billing_cycle: intent.periodicidad,
+    });
+
+    const recoveryToken = intent.recovery_token || crypto.randomBytes(32).toString("hex");
+
+    const { error: updateErr } = await supabase
+      .from("signup_intents")
+      .update({
+        status: "completed",
+        tenant_id: tenant.id,
+        recovery_token: recoveryToken,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", intent.id);
+    if (updateErr) throw updateErr;
+
+    return { ok: true, tenant, recoveryToken };
+  } catch (provisionErr) {
+    console.error(
+      `signup_intent ${intent.id}: fallo creando tenant tras pago confirmado:`,
+      provisionErr.message
+    );
+
+    const recoveryToken = intent.recovery_token || crypto.randomBytes(32).toString("hex");
+    await supabase
+      .from("signup_intents")
+      .update({
+        status: "tenant_creation_failed",
+        recovery_token: recoveryToken,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", intent.id);
+
+    return { ok: false, recoveryToken };
+  }
+}
+
+/* ======================================================
+   ✅ POST /signup/register-card-callback (sandbox)
+   Flow llama este callback (x-www-form-urlencoded) tras el enrolamiento
+   de tarjeta. No usa auth de tenant: lo invoca Flow. Confirma el estado
+   real vía Flow antes de activar la suscripción y crear el tenant.
+====================================================== */
+app.post(
+  "/signup/register-card-callback",
+  publicLimiter,
+  express.urlencoded({ extended: true }),
+  async (req, res) => {
+    const token = req.body?.token;
+    const frontendBase = "https://orbyx.cl";
+
+    if (!token) {
+      console.error("POST /signup/register-card-callback: falta token en el body");
+      return res.redirect(`${frontendBase}/checkout-premium?status=error`);
+    }
+
+    try {
+      const status = await flowApiRequest("/customer/getRegisterStatus", { token }, "GET");
+      const cardRegistered = String(status.status) === "1";
+
+      const { data: intentRow, error: intentErr } = await supabase
+        .from("signup_intents")
+        .select("id, email, plan_id, periodicidad, monto, status, flow_customer_id, recovery_token")
+        .eq("flow_customer_id", status.customerId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (intentErr) throw intentErr;
+
+      if (!intentRow) {
+        console.error(
+          "POST /signup/register-card-callback: no se encontró signup_intent para customerId",
+          status.customerId
+        );
+        return res.redirect(`${frontendBase}/checkout-premium?status=error`);
+      }
+
+      let intent = intentRow;
+
+      // Idempotencia: si Flow o el usuario vuelven a golpear este callback,
+      // nunca se vuelve a llamar subscription/create para el mismo intent.
+      if (intent.status === "completed") {
+        return res.redirect(`${frontendBase}/completar-registro?token=${intent.recovery_token}`);
+      }
+
+      if (intent.status === "tenant_creation_failed") {
+        // Ya se generó (o se está generando) el email de recuperación; no lo
+        // reenviamos en cada golpe repetido del callback.
+        return res.redirect(`${frontendBase}/pago-exitoso?email_enviado=1`);
+      }
+
+      if (intent.status === "started") {
+        if (!cardRegistered) {
+          // Escenario A: falla ANTES de cobrar. Sin token, sin email.
+          // Reutiliza el mismo signup_intent_id para reintentar.
+          return res.redirect(
+            `${frontendBase}/checkout-premium?signup_intent_id=${intent.id}&status=retry`
+          );
+        }
+
+        const flowPlanId = await getOrCreateFlowPlan(intent.plan_id, intent.periodicidad, intent.monto);
+
+        let flowSubscription;
+        try {
+          flowSubscription = await flowApiRequest("/subscription/create", {
+            planId: flowPlanId,
+            customerId: intent.flow_customer_id,
+          });
+        } catch (subErr) {
+          console.error(
+            `POST /signup/register-card-callback: subscription/create falló para signup_intent ${intent.id}:`,
+            subErr.message
+          );
+          return res.redirect(
+            `${frontendBase}/checkout-premium?signup_intent_id=${intent.id}&status=retry`
+          );
+        }
+
+        // status de Flow: 0=Inactive, 1=Active, 2=Trial, 4=Cancelled.
+        const paymentConfirmed = Number(flowSubscription.status) === 1;
+
+        if (!paymentConfirmed) {
+          console.error(
+            `POST /signup/register-card-callback: status inesperado de Flow (${flowSubscription.status}) para signup_intent ${intent.id}`
+          );
+          return res.redirect(
+            `${frontendBase}/checkout-premium?signup_intent_id=${intent.id}&status=retry`
+          );
+        }
+
+        const { data: paidIntent, error: paidUpdateErr } = await supabase
+          .from("signup_intents")
+          .update({
+            status: "paid",
+            flow_subscription_id: flowSubscription.subscriptionId,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", intent.id)
+          .select("id, email, plan_id, periodicidad, monto, status, flow_customer_id, recovery_token")
+          .single();
+
+        if (paidUpdateErr) {
+          // El pago ya se confirmó en Flow: no podemos perderlo. Seguimos con
+          // los datos que ya teníamos e igual intentamos crear el tenant.
+          console.error(
+            `POST /signup/register-card-callback: fallo marcando signup_intent ${intent.id} como paid:`,
+            paidUpdateErr.message
+          );
+        } else {
+          intent = paidIntent;
+        }
+      }
+
+      // intent.status === "paid" en este punto (recién marcado arriba, o ya
+      // lo estaba de un golpe anterior del callback): crear el tenant.
+      const result = await attemptSignupIntentTenantCreation(intent);
+
+      if (result.ok) {
+        return res.redirect(`${frontendBase}/completar-registro?token=${result.recoveryToken}`);
+      }
+
+      try {
+        await sendSignupRecoveryEmail({ to: intent.email, token: result.recoveryToken });
+      } catch (emailErr) {
+        console.error(
+          `POST /signup/register-card-callback: fallo enviando email de recuperación para signup_intent ${intent.id}:`,
+          emailErr.message
+        );
+      }
+
+      return res.redirect(`${frontendBase}/pago-exitoso?email_enviado=1`);
+    } catch (err) {
+      console.error("POST /signup/register-card-callback error:", err.message);
+      return res.redirect(`${frontendBase}/checkout-premium?status=error`);
+    }
+  }
+);
+
+/* ======================================================
+   ✅ GET /signup/resume?token=xxx (sandbox)
+   Retoma un signup_intent por recovery_token. Si la creación del tenant
+   había fallado, reintenta SOLO esa parte (nunca vuelve a cobrar en Flow).
+   Nunca usa auth de tenant: se accede antes de que exista un user_id.
+====================================================== */
+app.get("/signup/resume", publicLimiter, async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (!token) {
+      return res.status(400).json({ error: "token es obligatorio" });
+    }
+
+    const { data: intent, error: intentErr } = await supabase
+      .from("signup_intents")
+      .select(SIGNUP_INTENT_SELECT_FIELDS)
+      .eq("recovery_token", token)
+      .maybeSingle();
+
+    if (intentErr) throw intentErr;
+    if (!intent) {
+      return res.status(404).json({ error: "Token inválido o expirado" });
+    }
+
+    let current = intent;
+
+    if (current.status === "tenant_creation_failed") {
+      const claimed = await claimSignupIntentStatus(current.id, "tenant_creation_failed", {
+        status: "paid",
+      });
+
+      if (claimed) {
+        const result = await attemptSignupIntentTenantCreation(claimed);
+        current = {
+          ...claimed,
+          status: result.ok ? "completed" : "tenant_creation_failed",
+          tenant_id: result.ok ? result.tenant.id : claimed.tenant_id,
+        };
+      } else {
+        // Perdimos la carrera: otro request ya está reintentando o ya
+        // terminó. Releemos el estado actual en vez de reintentar de nuevo.
+        const { data: fresh, error: freshErr } = await supabase
+          .from("signup_intents")
+          .select(SIGNUP_INTENT_SELECT_FIELDS)
+          .eq("id", current.id)
+          .single();
+        if (freshErr) throw freshErr;
+        current = fresh;
+      }
+    }
+
+    if (current.status === "expired") {
+      return res.status(410).json({
+        error: "Este enlace ya expiró. Contáctanos para retomar tu registro.",
+      });
+    }
+
+    if (current.status === "tenant_creation_failed") {
+      return res.status(200).json({
+        ok: false,
+        status: "tenant_creation_failed",
+        message:
+          "No pudimos completar la creación de tu cuenta automáticamente. Escríbenos a soporte@orbyx.cl con este código: " +
+          current.id,
+      });
+    }
+
+    if (current.status !== "completed" || !current.tenant_id) {
+      // paid/started sin tenant_id todavía: aún no hay nada que retomar aquí.
+      return res.status(200).json({
+        ok: false,
+        status: current.status,
+        message: "Tu registro todavía está en proceso. Intenta de nuevo en unos minutos.",
+      });
+    }
+
+    const { data: existingOwner } = await supabase
+      .from("tenant_users")
+      .select("user_id")
+      .eq("tenant_id", current.tenant_id)
+      .eq("role", "owner")
+      .maybeSingle();
+
+    if (existingOwner) {
+      return res.json({
+        ok: true,
+        needs_password: false,
+        message: "Tu cuenta ya fue creada. Inicia sesión para continuar.",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      needs_password: true,
+      email: current.email,
+      business_name: current.business_name,
+      plan_id: current.plan_id,
+    });
+  } catch (err) {
+    console.error("GET /signup/resume error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /signup/claim-account (sandbox)
+   Último paso del signup pagado: define la contraseña y crea/linkea el
+   Supabase Auth user como owner del tenant ya provisionado. Mismo patrón
+   que /invitations/accept/:token, pero para el tenant recién creado.
+====================================================== */
+app.post("/signup/claim-account", publicLimiter, async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+
+    if (!token) {
+      return res.status(400).json({ error: "token es obligatorio" });
+    }
+    if (!password || String(password).length < 8) {
+      return res.status(400).json({ error: "La contraseña debe tener al menos 8 caracteres" });
+    }
+
+    const { data: intent, error: intentErr } = await supabase
+      .from("signup_intents")
+      .select(SIGNUP_INTENT_SELECT_FIELDS)
+      .eq("recovery_token", token)
+      .maybeSingle();
+
+    if (intentErr) throw intentErr;
+    if (!intent || intent.status !== "completed" || !intent.tenant_id) {
+      return res.status(400).json({ error: "Este registro todavía no está listo para completarse" });
+    }
+
+    const { data: existingOwner } = await supabase
+      .from("tenant_users")
+      .select("user_id")
+      .eq("tenant_id", intent.tenant_id)
+      .eq("role", "owner")
+      .maybeSingle();
+
+    if (existingOwner) {
+      return res.status(400).json({ error: "Ya existe una cuenta para este negocio. Inicia sesión." });
+    }
+
+    // Mismo patrón que /invitations/accept/:token: busca el auth user por
+    // email; si no existe lo crea ya confirmado (el pago+token ya validaron
+    // la identidad); si existe (ej. login social) le agrega password propio
+    // solo si todavía no tiene un identity "email".
+    const normalizedEmail = String(intent.email).toLowerCase();
+    const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+    let authUser = authList?.users?.find(
+      (u) => String(u.email || "").toLowerCase() === normalizedEmail
+    );
+
+    if (!authUser) {
+      const { data: created, error: createError } = await supabase.auth.admin.createUser({
+        email: intent.email,
+        password: String(password),
+        email_confirm: true,
+      });
+
+      if (createError) {
+        const { data: retryList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+        authUser = retryList?.users?.find(
+          (u) => String(u.email || "").toLowerCase() === normalizedEmail
+        );
+        if (!authUser) {
+          console.error("POST /signup/claim-account createUser error:", createError.message);
+          return res.status(500).json({ error: "Error creando la cuenta", detail: createError.message });
+        }
+      } else {
+        authUser = created.user;
+      }
+    } else {
+      const hasEmailIdentity = (authUser.identities || []).some(
+        (identity) => identity.provider === "email"
+      );
+      if (!hasEmailIdentity) {
+        const { error: updatePasswordError } = await supabase.auth.admin.updateUserById(authUser.id, {
+          password: String(password),
+        });
+        if (updatePasswordError) {
+          console.error("POST /signup/claim-account updateUserById error:", updatePasswordError.message);
+        }
+      }
+    }
+
+    await linkTenantOwner({ tenant_id: intent.tenant_id, user_id: authUser.id });
+
+    const { data: tenant } = await supabase
+      .from("tenants")
+      .select("slug")
+      .eq("id", intent.tenant_id)
+      .single();
+
+    return res.json({ ok: true, tenant_slug: tenant?.slug || null });
+  } catch (err) {
+    console.error("POST /signup/claim-account error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// El proyecto no tiene ningún mecanismo de cron propio: este endpoint está
+// pensado para ser llamado por un cron externo (ej. Render Cron Job o
+// cron-job.org) con el header x-maintenance-secret.
+function requireSignupMaintenanceSecret(req, res, next) {
+  const expected = process.env.SIGNUP_MAINTENANCE_SECRET;
+  if (!expected) {
+    return res.status(500).json({ error: "SIGNUP_MAINTENANCE_SECRET no configurado en el servidor" });
+  }
+  if (req.headers["x-maintenance-secret"] !== expected) {
+    return res.status(401).json({ error: "No autorizado" });
+  }
+  next();
+}
+
+/* ======================================================
+   ✅ POST /signup/maintenance/sweep (sandbox)
+   1) Expira signup_intents 'started' con más de 48h sin pagar.
+   2) Alerta por email (camilo.merino.m@gmail.com) signup_intents
+      'paid'/'tenant_creation_failed' con más de 24h sin llegar a
+      'completed'. No hay columna para marcar "ya se avisó", así que la
+      alerta se repite cada ~24h mientras el caso siga sin resolverse
+      (se usa updated_at tanto para medir el tiempo detenido como para
+      no re-alertar en la misma corrida).
+====================================================== */
+app.post(
+  "/signup/maintenance/sweep",
+  publicLimiter,
+  requireSignupMaintenanceSecret,
+  async (req, res) => {
+    try {
+      const now = new Date();
+      const expiredCutoff = new Date(now.getTime() - 48 * 60 * 60 * 1000).toISOString();
+      const stuckCutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+
+      const { data: expired, error: expireErr } = await supabase
+        .from("signup_intents")
+        .update({ status: "expired", updated_at: now.toISOString() })
+        .eq("status", "started")
+        .lt("created_at", expiredCutoff)
+        .select("id");
+
+      if (expireErr) throw expireErr;
+
+      const { data: stuck, error: stuckErr } = await supabase
+        .from("signup_intents")
+        .select("id, email, plan_id, monto, status, updated_at")
+        .in("status", ["paid", "tenant_creation_failed"])
+        .lt("updated_at", stuckCutoff);
+
+      if (stuckErr) throw stuckErr;
+
+      let alerted = 0;
+      for (const row of stuck || []) {
+        try {
+          await sendSignupStuckAlertEmail({
+            to: "camilo.merino.m@gmail.com",
+            signupIntentId: row.id,
+            email: row.email,
+            planId: row.plan_id,
+            monto: row.monto,
+          });
+
+          await supabase
+            .from("signup_intents")
+            .update({ updated_at: new Date().toISOString() })
+            .eq("id", row.id);
+
+          alerted++;
+        } catch (alertErr) {
+          console.error(
+            `signup_intent ${row.id}: fallo enviando alerta interna:`,
+            alertErr.message
+          );
+        }
+      }
+
+      return res.json({
+        ok: true,
+        expired: expired?.length || 0,
+        alerted,
+      });
+    } catch (err) {
+      console.error("POST /signup/maintenance/sweep error:", err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 /* ======================================================
    ✅ PATCH /tenants/:id

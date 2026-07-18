@@ -355,9 +355,90 @@ async function sendEmailChangeVerificationToNewEmail({ to, token }) {
   }
 }
 
+async function sendSignupRecoveryEmail({ to, token }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Email de recuperación de registro omitido.");
+      return;
+    }
+    const resumeUrl = `https://orbyx.cl/completar-registro?token=${token}`;
+    await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: "Tu pago fue exitoso — completa tu cuenta en Orbyx",
+      html: `
+<div style="margin:0; padding:30px 16px; background:#f1f5f9; font-family:Arial, Helvetica, sans-serif;">
+  <div style="max-width:560px; margin:0 auto;">
+    <div style="background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.1);">
+      <div style="background:linear-gradient(135deg,#0f172a,#312e81); padding:28px; text-align:center;">
+        <div style="color:#cbd5e1; font-size:12px; letter-spacing:0.2em;">PAGO CONFIRMADO</div>
+        <h1 style="color:#ffffff; margin:10px 0 0; font-size:26px;">Orbyx</h1>
+      </div>
+      <div style="padding:24px;">
+        <div style="background:#dcfce7; color:#166534; display:inline-block; padding:6px 12px; border-radius:999px; font-size:12px; margin-bottom:12px;">
+          ✔ Tu pago fue exitoso
+        </div>
+        <h2 style="margin:0 0 10px;">Falta un paso para activar tu cuenta</h2>
+        <p style="color:#475569;">
+          Tu pago se procesó correctamente, pero tuvimos un problema técnico terminando de configurar tu cuenta.
+          Haz clic en el botón para completar el registro — no se te cobrará de nuevo.
+        </p>
+        <div style="text-align:center; margin-top:24px;">
+          <a href="${resumeUrl}" style="background:#0f172a; color:white; padding:12px 24px; border-radius:12px; text-decoration:none; font-weight:bold; font-size:15px;">
+            Completar mi cuenta
+          </a>
+        </div>
+        <p style="margin-top:20px; font-size:12px; color:#94a3b8; text-align:center;">
+          O copia este enlace:<br/>
+          <a href="${resumeUrl}" style="color:#6366f1;">${resumeUrl}</a>
+        </p>
+      </div>
+      <div style="padding:16px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
+        <a href="https://orbyx.cl" style="color:#64748b; font-size:12px; text-decoration:none;" target="_blank">
+          Orbyx · Sistema de reservas inteligentes
+        </a>
+      </div>
+    </div>
+  </div>
+</div>`,
+    });
+  } catch (error) {
+    console.error("Error enviando email de recuperación de registro:", error);
+  }
+}
+
+async function sendSignupStuckAlertEmail({ to, signupIntentId, email, planId, monto }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Email de alerta interna omitido.");
+      return;
+    }
+    await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: `⚠️ signup_intent atascado sin completar: ${signupIntentId}`,
+      html: `
+<div style="font-family:Arial, Helvetica, sans-serif; padding:16px;">
+  <h2>signup_intent pagado sin completar hace más de 24h</h2>
+  <ul>
+    <li><strong>signup_intent_id:</strong> ${signupIntentId}</li>
+    <li><strong>email prospecto:</strong> ${email}</li>
+    <li><strong>plan:</strong> ${planId}</li>
+    <li><strong>monto:</strong> ${monto}</li>
+  </ul>
+  <p>Requiere seguimiento manual: esta persona pagó y no tiene cuenta ni logró usar el link de recuperación.</p>
+</div>`,
+    });
+  } catch (error) {
+    console.error("Error enviando email de alerta interna de signup:", error);
+  }
+}
+
 module.exports = {
   sendBookingEmail,
   sendInvitationEmail,
   sendEmailChangeConfirmationToOldEmail,
   sendEmailChangeVerificationToNewEmail,
+  sendSignupRecoveryEmail,
+  sendSignupStuckAlertEmail,
 };
