@@ -2165,6 +2165,7 @@ async function getOrCreateFlowPlan(plan_id, periodicidad, monto) {
       currency: "CLP",
       interval: intervalConfig.interval,
       interval_count: intervalConfig.interval_count,
+      urlCallback: "https://orbyx-backend.onrender.com/billing/flow/webhook",
     });
   } catch (createErr) {
     const alreadyExists = /there is a plan|plan.*(already|exist)/i.test(createErr.message || "");
