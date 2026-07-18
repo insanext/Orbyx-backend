@@ -2126,6 +2126,64 @@ async function findFlowCustomerByExternalId(externalId) {
   return null;
 }
 
+// Flow no tiene "semestral" como interval nativo (1=diario, 2=semanal,
+// 3=mensual, 4=anual): se modela como interval=3 (mensual) con
+// interval_count=6, tal como documenta Flow para múltiplos de un interval.
+const PERIODICIDAD_TO_FLOW_INTERVAL = {
+  mensual: { interval: 3, interval_count: 1 },
+  semestral: { interval: 3, interval_count: 6 },
+  anual: { interval: 4, interval_count: 1 },
+};
+
+// getOrCreateFlowPlan: idempotente. planId de Flow es elegido por el
+// comercio (no lo genera Flow), así que se deriva determinísticamente de
+// (plan_id, periodicidad) y se cachea en flow_plans para no recrearlo.
+async function getOrCreateFlowPlan(plan_id, periodicidad, monto) {
+  const { data: existing, error: existingErr } = await supabase
+    .from("flow_plans")
+    .select("flow_plan_id")
+    .eq("plan_id", plan_id)
+    .eq("periodicidad", periodicidad)
+    .maybeSingle();
+
+  if (existingErr) throw existingErr;
+  if (existing?.flow_plan_id) return existing.flow_plan_id;
+
+  const intervalConfig = PERIODICIDAD_TO_FLOW_INTERVAL[periodicidad];
+  if (!intervalConfig) {
+    throw new Error(`periodicidad no soportada para Flow: ${periodicidad}`);
+  }
+
+  const flowPlanId = `orbyx_${plan_id}_${periodicidad}`;
+
+  let flowPlan;
+  try {
+    flowPlan = await flowApiRequest("/plans/create", {
+      planId: flowPlanId,
+      name: `Orbyx ${plan_id} (${periodicidad})`,
+      amount: monto,
+      currency: "CLP",
+      interval: intervalConfig.interval,
+      interval_count: intervalConfig.interval_count,
+    });
+  } catch (createErr) {
+    const alreadyExists = /there is a plan|plan.*(already|exist)/i.test(createErr.message || "");
+    if (!alreadyExists) throw createErr;
+
+    flowPlan = await flowApiRequest("/plans/get", { planId: flowPlanId }, "GET");
+  }
+
+  const { error: upsertErr } = await supabase
+    .from("flow_plans")
+    .upsert(
+      { plan_id, periodicidad, monto, flow_plan_id: flowPlan.planId },
+      { onConflict: "plan_id,periodicidad" }
+    );
+  if (upsertErr) throw upsertErr;
+
+  return flowPlan.planId;
+}
+
 async function sendCampaignEmail({
   to,
   subject,
@@ -9806,6 +9864,80 @@ app.post(
     }
   }
 );
+
+/* ======================================================
+   ✅ POST /billing/flow/subscribe (sandbox)
+   Activa la primera suscripción real en Flow para un tenant que ya
+   registró tarjeta. El webhook existente confirma los cobros recurrentes
+   posteriores; este endpoint solo dispara la activación inicial.
+====================================================== */
+app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id, plan_id, periodicidad, monto } = req.body;
+
+    if (!tenant_id || !plan_id || !periodicidad || !monto) {
+      return res.status(400).json({
+        error: "tenant_id, plan_id, periodicidad y monto son obligatorios",
+      });
+    }
+
+    const { data: subscription, error: subErr } = await supabase
+      .from("subscriptions")
+      .select("id, tenant_id, flow_customer_id, status")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (subErr) throw subErr;
+
+    if (!subscription || subscription.status !== "card_registered") {
+      return res.status(400).json({
+        error: "Tarjeta no registrada. Completa register-card primero.",
+      });
+    }
+
+    const flowPlanId = await getOrCreateFlowPlan(plan_id, periodicidad, monto);
+
+    const flowSubscription = await flowApiRequest("/subscription/create", {
+      planId: flowPlanId,
+      customerId: subscription.flow_customer_id,
+    });
+
+    // status de Flow: 0=Inactive, 1=Active, 2=Trial, 4=Cancelled.
+    const flowStatus = Number(flowSubscription.status);
+    const mappedStatus = flowStatus === 1 ? "active" : flowStatus === 4 ? "canceled" : "error";
+
+    if (mappedStatus === "error") {
+      console.error(
+        `POST /billing/flow/subscribe: status inesperado de Flow (${flowSubscription.status}) para tenant ${tenant_id}`
+      );
+    }
+
+    const { error: updateErr } = await supabase
+      .from("subscriptions")
+      .update({
+        plan_id,
+        periodicidad,
+        monto,
+        flow_subscription_id: flowSubscription.subscriptionId,
+        status: mappedStatus,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", subscription.id);
+
+    if (updateErr) throw updateErr;
+
+    return res.json({
+      subscription_id: subscription.id,
+      flow_subscription_id: flowSubscription.subscriptionId,
+      status: mappedStatus,
+    });
+  } catch (err) {
+    console.error("POST /billing/flow/subscribe error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 /* ======================================================
    ✅ PATCH /tenants/:id
