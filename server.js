@@ -9672,13 +9672,21 @@ app.post(
         return res.redirect(`${frontendBase}/dashboard?card_status=error`);
       }
 
-      await supabase
+      const { error: updateErr } = await supabase
         .from("subscriptions")
         .update({
           status: cardRegistered ? "card_registered" : "error",
           updated_at: new Date().toISOString(),
         })
         .eq("id", subscription.id);
+
+      if (updateErr) {
+        console.error(
+          "POST /billing/flow/register-card-callback: fallo al actualizar subscriptions",
+          updateErr.message
+        );
+        return res.redirect(`${frontendBase}/dashboard?card_status=error`);
+      }
 
       const { data: tenant } = await supabase
         .from("tenants")
@@ -9741,7 +9749,7 @@ app.post(
       }
 
       if (paymentOk) {
-        await supabase
+        const { error: subUpdateErr } = await supabase
           .from("subscriptions")
           .update({
             status: "active",
@@ -9750,19 +9758,40 @@ app.post(
           })
           .eq("id", subscription.id);
 
-        await supabase
+        if (subUpdateErr) {
+          console.error(
+            "POST /billing/flow/webhook: fallo al actualizar subscriptions.status=active",
+            subUpdateErr.message
+          );
+        }
+
+        const { error: tenantUpdateErr } = await supabase
           .from("tenants")
           .update({ plan_slug: normalizePlanSlug(subscription.plan_id) })
           .eq("id", subscription.tenant_id);
+
+        if (tenantUpdateErr) {
+          console.error(
+            "POST /billing/flow/webhook: fallo al actualizar tenants.plan_slug",
+            tenantUpdateErr.message
+          );
+        }
 
         console.log(
           `Flow webhook: pago confirmado para tenant ${subscription.tenant_id}, plan ${subscription.plan_id}`
         );
       } else {
-        await supabase
+        const { error: subErrorUpdateErr } = await supabase
           .from("subscriptions")
           .update({ status: "error", updated_at: new Date().toISOString() })
           .eq("id", subscription.id);
+
+        if (subErrorUpdateErr) {
+          console.error(
+            "POST /billing/flow/webhook: fallo al actualizar subscriptions.status=error",
+            subErrorUpdateErr.message
+          );
+        }
 
         console.error(
           `Flow webhook: pago no confirmado para tenant ${subscription.tenant_id}, status Flow: ${payment.status}`
