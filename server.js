@@ -2042,6 +2042,46 @@ async function resolvePetFromAppointment({
   return createdPet;
 }
 
+// =======================
+// FLOW.CL — HELPERS (customer, cargo automático) — SANDBOX
+// =======================
+function signFlowParams(params, secretKey) {
+  const keys = Object.keys(params).sort();
+  let toSign = "";
+  for (const key of keys) {
+    toSign += key + params[key];
+  }
+  return crypto.createHmac("sha256", secretKey).update(toSign).digest("hex");
+}
+
+async function flowApiRequest(endpoint, params, method = "POST") {
+  const apiKey = process.env.FLOW_SANDBOX_API_KEY;
+  const secretKey = process.env.FLOW_SANDBOX_SECRET_KEY;
+  const baseUrl = process.env.FLOW_API_URL;
+
+  const fullParams = { ...params, apiKey };
+  const signature = signFlowParams(fullParams, secretKey);
+  fullParams.s = signature;
+
+  const url = `${baseUrl}${endpoint}`;
+  const body = new URLSearchParams(fullParams);
+
+  const response = await fetch(
+    method === "GET" ? `${url}?${body.toString()}` : url,
+    method === "GET"
+      ? { method: "GET" }
+      : { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body }
+  );
+
+  const data = await response.json();
+  if (!response.ok) {
+    const err = new Error(data.message || "Flow API error");
+    err.flowResponse = data;
+    throw err;
+  }
+  return data;
+}
+
 async function sendCampaignEmail({
   to,
   subject,
@@ -9411,6 +9451,278 @@ app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) =
     return res.status(500).json({ error: err.message });
   }
 });
+
+/* ======================================================
+   ✅ POST /billing/flow/create-customer (sandbox)
+   Crea customer en Flow + captura consentimiento de Cargo Automático
+====================================================== */
+app.post("/billing/flow/create-customer", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id, plan_id, monto, periodicidad, texto_autorizacion_version } = req.body;
+
+    if (!tenant_id || !plan_id || !texto_autorizacion_version) {
+      return res.status(400).json({
+        error: "tenant_id, plan_id y texto_autorizacion_version son obligatorios",
+      });
+    }
+
+    const { data: tenant, error: tenantErr } = await supabase
+      .from("tenants")
+      .select("id, name, email")
+      .eq("id", tenant_id)
+      .single();
+
+    if (tenantErr || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    if (!tenant.email) {
+      return res.status(400).json({ error: "El negocio no tiene un email de contacto configurado" });
+    }
+
+    const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip;
+    const user_agent = req.headers["user-agent"] || null;
+    const timestamp = new Date().toISOString();
+
+    const flowCustomer = await flowApiRequest("/customer/create", {
+      email: tenant.email,
+      name: tenant.name || tenant.email,
+      externalId: tenant_id,
+    });
+
+    const consentimiento = { ip, timestamp, user_agent, texto_autorizacion_version };
+
+    const { data: existing } = await supabase
+      .from("subscriptions")
+      .select("id")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const payload = {
+      plan_id,
+      flow_customer_id: flowCustomer.customerId,
+      status: "pending",
+      periodicidad: periodicidad || "mensual",
+      monto: monto ?? null,
+      consentimiento,
+      updated_at: new Date().toISOString(),
+    };
+
+    let subscriptionRow;
+    if (existing) {
+      const { data: updated, error: updateErr } = await supabase
+        .from("subscriptions")
+        .update(payload)
+        .eq("id", existing.id)
+        .select("id")
+        .single();
+      if (updateErr) throw updateErr;
+      subscriptionRow = updated;
+    } else {
+      const { data: inserted, error: insertErr } = await supabase
+        .from("subscriptions")
+        .insert({ tenant_id, ...payload })
+        .select("id")
+        .single();
+      if (insertErr) throw insertErr;
+      subscriptionRow = inserted;
+    }
+
+    return res.json({
+      subscription_id: subscriptionRow.id,
+      flow_customer_id: flowCustomer.customerId,
+    });
+  } catch (err) {
+    console.error("POST /billing/flow/create-customer error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /billing/flow/register-card (sandbox)
+   Inicia enrolamiento de tarjeta para Cargo Automático
+====================================================== */
+app.post("/billing/flow/register-card", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.body;
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    const { data: subscription, error: subErr } = await supabase
+      .from("subscriptions")
+      .select("id, flow_customer_id")
+      .eq("tenant_id", tenant_id)
+      .not("flow_customer_id", "is", null)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (subErr) throw subErr;
+    if (!subscription) {
+      return res.status(404).json({ error: "No hay un customer de Flow creado para este negocio" });
+    }
+
+    const registerResult = await flowApiRequest("/customer/register", {
+      customerId: subscription.flow_customer_id,
+      url_return: "https://orbyx-backend.onrender.com/billing/flow/register-card-callback",
+    });
+
+    return res.json({
+      url: registerResult.url,
+      token: registerResult.token,
+    });
+  } catch (err) {
+    console.error("POST /billing/flow/register-card error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /billing/flow/register-card-callback (sandbox)
+   Flow llama este callback (POST, x-www-form-urlencoded) tras el
+   enrolamiento de tarjeta. No usa auth de tenant: lo invoca Flow.
+====================================================== */
+app.post(
+  "/billing/flow/register-card-callback",
+  publicLimiter,
+  express.urlencoded({ extended: true }),
+  async (req, res) => {
+    const token = req.body?.token;
+    const frontendBase = "https://orbyx.cl";
+
+    if (!token) {
+      console.error("POST /billing/flow/register-card-callback: falta token en el body");
+      return res.redirect(`${frontendBase}/dashboard?card_status=error`);
+    }
+
+    try {
+      const status = await flowApiRequest("/customer/getRegisterStatus", { token }, "GET");
+      const cardRegistered = String(status.status) === "1";
+
+      const { data: subscription } = await supabase
+        .from("subscriptions")
+        .select("id, tenant_id")
+        .eq("flow_customer_id", status.customerId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!subscription) {
+        console.error(
+          "POST /billing/flow/register-card-callback: no se encontró subscription para customerId",
+          status.customerId
+        );
+        return res.redirect(`${frontendBase}/dashboard?card_status=error`);
+      }
+
+      await supabase
+        .from("subscriptions")
+        .update({
+          status: cardRegistered ? "card_registered" : "error",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", subscription.id);
+
+      const { data: tenant } = await supabase
+        .from("tenants")
+        .select("slug")
+        .eq("id", subscription.tenant_id)
+        .single();
+
+      const cardStatusParam = cardRegistered ? "ok" : "error";
+      const redirectUrl = tenant?.slug
+        ? `${frontendBase}/dashboard/${tenant.slug}/billing?card_status=${cardStatusParam}`
+        : `${frontendBase}/dashboard?card_status=${cardStatusParam}`;
+
+      return res.redirect(redirectUrl);
+    } catch (err) {
+      console.error("POST /billing/flow/register-card-callback error:", err.message);
+      return res.redirect(`${frontendBase}/dashboard?card_status=error`);
+    }
+  }
+);
+
+/* ======================================================
+   ✅ POST /billing/flow/webhook (sandbox)
+   Flow notifica cobros recurrentes (POST, x-www-form-urlencoded).
+   Confirma el estado real vía GET /payment/getStatus antes de
+   activar el plan. No usa auth de tenant: lo invoca Flow.
+====================================================== */
+app.post(
+  "/billing/flow/webhook",
+  publicLimiter,
+  express.urlencoded({ extended: true }),
+  async (req, res) => {
+    const token = req.body?.token;
+
+    if (!token) {
+      console.error("POST /billing/flow/webhook: falta token en el body");
+      return res.sendStatus(200);
+    }
+
+    try {
+      const payment = await flowApiRequest("/payment/getStatus", { token }, "GET");
+      // status 2 = pagada/confirmada según la convención estándar de Flow.
+      const paymentOk = Number(payment.status) === 2;
+      const flowCustomerId = payment.customerId || payment.customer?.customerId || null;
+
+      let subscription = null;
+      if (flowCustomerId) {
+        const { data } = await supabase
+          .from("subscriptions")
+          .select("id, tenant_id, plan_id")
+          .eq("flow_customer_id", flowCustomerId)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        subscription = data;
+      }
+
+      if (!subscription) {
+        console.error("POST /billing/flow/webhook: no se encontró subscription para el pago", { token });
+        return res.sendStatus(200);
+      }
+
+      if (paymentOk) {
+        await supabase
+          .from("subscriptions")
+          .update({
+            status: "active",
+            flow_subscription_id: payment.subscriptionId || null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", subscription.id);
+
+        await supabase
+          .from("tenants")
+          .update({ plan_slug: normalizePlanSlug(subscription.plan_id) })
+          .eq("id", subscription.tenant_id);
+
+        console.log(
+          `Flow webhook: pago confirmado para tenant ${subscription.tenant_id}, plan ${subscription.plan_id}`
+        );
+      } else {
+        await supabase
+          .from("subscriptions")
+          .update({ status: "error", updated_at: new Date().toISOString() })
+          .eq("id", subscription.id);
+
+        console.error(
+          `Flow webhook: pago no confirmado para tenant ${subscription.tenant_id}, status Flow: ${payment.status}`
+        );
+      }
+
+      return res.sendStatus(200);
+    } catch (err) {
+      console.error("POST /billing/flow/webhook error:", err.message);
+      // Respondemos 200 igual para que Flow no reintente indefinidamente.
+      return res.sendStatus(200);
+    }
+  }
+);
 
 /* ======================================================
    ✅ PATCH /tenants/:id
