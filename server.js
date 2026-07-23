@@ -10226,6 +10226,24 @@ async function attemptSignupIntentTenantCreation(intent) {
       .eq("id", intent.id);
     if (updateErr) throw updateErr;
 
+    try {
+      const { error: subInsertErr } = await supabase.from("subscriptions").insert({
+        tenant_id: tenant.id,
+        plan_id: intent.plan_id,
+        flow_customer_id: intent.flow_customer_id,
+        flow_subscription_id: intent.flow_subscription_id,
+        status: "active",
+        periodicidad: intent.periodicidad,
+        monto: intent.monto,
+      });
+      if (subInsertErr) throw subInsertErr;
+    } catch (subErr) {
+      console.error(
+        `signup_intent ${intent.id}: tenant ${tenant.id} creado OK, pero falló el insert en subscriptions (requiere corrección manual):`,
+        subErr.message
+      );
+    }
+
     return { ok: true, tenant, recoveryToken };
   } catch (provisionErr) {
     console.error(
@@ -10272,7 +10290,7 @@ app.post(
 
       const { data: intentRow, error: intentErr } = await supabase
         .from("signup_intents")
-        .select("id, email, plan_id, periodicidad, monto, status, flow_customer_id, recovery_token")
+        .select(SIGNUP_INTENT_SELECT_FIELDS)
         .eq("flow_customer_id", status.customerId)
         .order("created_at", { ascending: false })
         .limit(1)
@@ -10349,7 +10367,7 @@ app.post(
             updated_at: new Date().toISOString(),
           })
           .eq("id", intent.id)
-          .select("id, email, plan_id, periodicidad, monto, status, flow_customer_id, recovery_token")
+          .select(SIGNUP_INTENT_SELECT_FIELDS)
           .single();
 
         if (paidUpdateErr) {
