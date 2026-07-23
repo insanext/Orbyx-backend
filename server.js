@@ -9954,6 +9954,111 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
   }
 });
 
+/* ======================================================
+   ✅ GET /billing/flow/subscription-status (sandbox)
+   Estado de la suscripción Flow de un tenant existente. Los datos de
+   tarjeta (marca/últimos 4) no se guardan en la DB — se consultan a
+   Flow en vivo cada vez que se carga el panel de billing.
+====================================================== */
+app.get("/billing/flow/subscription-status", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+
+    const { data: subscription, error: subErr } = await supabase
+      .from("subscriptions")
+      .select("id, status, plan_id, periodicidad, monto, flow_customer_id, flow_subscription_id")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (subErr) throw subErr;
+
+    if (!subscription) {
+      return res.json({ has_subscription: false });
+    }
+
+    let card = null;
+    if (subscription.flow_customer_id) {
+      try {
+        const customer = await flowApiRequest(
+          "/customer/get",
+          { customerId: subscription.flow_customer_id },
+          "GET"
+        );
+        if (customer?.creditCardType && customer?.last4CardDigits) {
+          card = { brand: customer.creditCardType, last4: customer.last4CardDigits };
+        }
+      } catch (cardErr) {
+        console.error(
+          "GET /billing/flow/subscription-status: fallo al consultar customer/get",
+          cardErr.message
+        );
+      }
+    }
+
+    return res.json({
+      has_subscription: true,
+      status: subscription.status,
+      plan_id: subscription.plan_id,
+      periodicidad: subscription.periodicidad,
+      monto: subscription.monto,
+      card,
+      flow_subscription_id: subscription.flow_subscription_id,
+    });
+  } catch (err) {
+    console.error("GET /billing/flow/subscription-status error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /billing/flow/cancel-subscription (sandbox)
+   Cancela la suscripción activa en Flow. No toca tenants.plan_slug: el
+   acceso se mantiene hasta el fin del ciclo actual (billing_cycle_end),
+   igual que el downgrade legacy. Revocar el acceso de inmediato al
+   cancelar es una decisión de producto pendiente de confirmar con
+   Camilo, no algo resuelto en este endpoint.
+====================================================== */
+app.post("/billing/flow/cancel-subscription", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.body;
+
+    const { data: subscription, error: subErr } = await supabase
+      .from("subscriptions")
+      .select("id, status, flow_subscription_id")
+      .eq("tenant_id", tenant_id)
+      .in("status", ["active", "card_registered"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (subErr) throw subErr;
+
+    if (!subscription) {
+      return res.status(404).json({ error: "No hay una suscripción activa para cancelar" });
+    }
+
+    if (subscription.flow_subscription_id) {
+      await flowApiRequest("/subscription/cancel", {
+        subscriptionId: subscription.flow_subscription_id,
+      });
+    }
+
+    const { error: updateErr } = await supabase
+      .from("subscriptions")
+      .update({ status: "canceled", updated_at: new Date().toISOString() })
+      .eq("id", subscription.id);
+
+    if (updateErr) throw updateErr;
+
+    return res.json({ ok: true, status: "canceled" });
+  } catch (err) {
+    console.error("POST /billing/flow/cancel-subscription error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // =======================
 // SIGNUP PAGADO — PREMIUM/VIP/PLATINUM (pago primero, tenant después)
 // =======================
