@@ -10059,6 +10059,91 @@ app.post("/billing/flow/cancel-subscription", tenantAuthWrite, async (req, res) 
   }
 });
 
+// status de Flow para pagos individuales (payment/getStatus y, se asume,
+// customer/getCharges): 2 = pagada/confirmada, misma convención que ya usa
+// /billing/flow/webhook. No hay confirmación en vivo del shape exacto de
+// customer/getCharges (sin credenciales Flow locales para probar) — si un
+// item no matchea ningún status numérico reconocible, se loguea el objeto
+// completo para poder ajustar el mapeo con datos reales.
+function translateFlowChargeStatus(rawStatus) {
+  const statusNum = Number(rawStatus);
+  if (Number.isNaN(statusNum)) return null;
+  return statusNum === 2 ? "Pagado" : "No confirmado";
+}
+
+function mapFlowCharge(item) {
+  const status = translateFlowChargeStatus(item?.status);
+
+  if (status === null) {
+    console.warn(
+      "GET /billing/flow/payment-history: item de customer/getCharges con status no reconocido, revisar shape real:",
+      JSON.stringify(item)
+    );
+  }
+
+  return {
+    date: item?.requestDate ?? item?.date ?? null,
+    amount: item?.amount ?? null,
+    status: status ?? "—",
+    flowOrder: item?.flowOrder ?? null,
+  };
+}
+
+/* ======================================================
+   ✅ GET /billing/flow/payment-history (sandbox)
+   Lista de cargos de Cargo Automático para un tenant, vía Flow
+   customer/getCharges. Shape defensivo: si Flow no responde con el array
+   `data` esperado, o falla la llamada, responde charges: [] en vez de
+   reventar el endpoint.
+====================================================== */
+app.get("/billing/flow/payment-history", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+
+    const { data: subscription, error: subErr } = await supabase
+      .from("subscriptions")
+      .select("id, flow_customer_id")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (subErr) throw subErr;
+
+    if (!subscription || !subscription.flow_customer_id) {
+      return res.json({ charges: [] });
+    }
+
+    try {
+      const result = await flowApiRequest(
+        "/customer/getCharges",
+        { customerId: subscription.flow_customer_id, limit: 20 },
+        "GET"
+      );
+
+      if (!Array.isArray(result?.data)) {
+        console.error(
+          "GET /billing/flow/payment-history: respuesta de customer/getCharges sin el shape esperado (falta data[]):",
+          JSON.stringify(result)
+        );
+        return res.json({ charges: [] });
+      }
+
+      const charges = result.data.map(mapFlowCharge);
+      return res.json({ charges });
+    } catch (flowErr) {
+      console.error(
+        "GET /billing/flow/payment-history: fallo consultando customer/getCharges",
+        flowErr.message
+      );
+      return res.json({ charges: [] });
+    }
+  } catch (err) {
+    console.error("GET /billing/flow/payment-history error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // =======================
 // SIGNUP PAGADO — PREMIUM/VIP/PLATINUM (pago primero, tenant después)
 // =======================
