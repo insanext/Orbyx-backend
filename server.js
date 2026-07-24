@@ -9225,6 +9225,8 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
       });
     }
 
+    const addon = ADDON_CATALOG[addon_key];
+
     const qty = Math.max(1, parseInt(quantity, 10) || 1);
     const cycle = normalizeBillingCycle(billing_cycle);
 
@@ -9259,6 +9261,37 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
     let unitPrice = addon.price;
     if (currentQty >= 2) unitPrice = addon.price_pack3 ?? addon.price;
     else if (currentQty >= 1) unitPrice = addon.price_pack2 ?? addon.price;
+
+    const chargeAmount = unitPrice * qty;
+
+    const { data: addonSubscription, error: addonSubErr } = await supabase
+      .from("subscriptions")
+      .select("id, flow_customer_id")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (addonSubErr) throw addonSubErr;
+
+    if (!addonSubscription || !addonSubscription.flow_customer_id) {
+      return res.status(400).json({
+        error:
+          "Necesitas tener un medio de pago registrado para activar add-ons. Ve a Facturación y pago para agregar tu tarjeta.",
+      });
+    }
+
+    try {
+      await flowApiRequest("/customer/charge", {
+        customerId: addonSubscription.flow_customer_id,
+        amount: chargeAmount,
+        subject: `Add-on: ${addon_key} x${qty}`,
+        commerceOrder: `addon_${tenant_id}_${addon_key}_${Date.now()}`,
+      });
+    } catch (chargeErr) {
+      console.error("POST /billing/addons/activate: fallo el cargo Flow", chargeErr.message);
+      return res.status(500).json({ error: chargeErr.message });
+    }
 
     let row;
 
@@ -9350,7 +9383,7 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
 
     const { data: existing, error: existingError } = await supabase
       .from("tenant_addons")
-      .select("id, quantity")
+      .select("id, quantity, unit_price")
       .eq("tenant_id", tenant_id)
       .eq("addon_key", addon_key)
       .eq("status", "active")
@@ -9365,6 +9398,44 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
     }
 
     const now = new Date().toISOString();
+
+    if (qty > existing.quantity) {
+      // No prorrateo fino en esta iteración: cobra precio unitario × la
+      // cantidad nueva agregada (el incremento), no la diferencia proporcional
+      // al ciclo de facturación restante.
+      const increment = qty - existing.quantity;
+      const unitPrice = existing.unit_price ?? ADDON_CATALOG[addon_key].price;
+      const chargeAmount = unitPrice * increment;
+
+      const { data: addonSubscription, error: addonSubErr } = await supabase
+        .from("subscriptions")
+        .select("id, flow_customer_id")
+        .eq("tenant_id", tenant_id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (addonSubErr) throw addonSubErr;
+
+      if (!addonSubscription || !addonSubscription.flow_customer_id) {
+        return res.status(400).json({
+          error:
+            "Necesitas tener un medio de pago registrado para activar add-ons. Ve a Facturación y pago para agregar tu tarjeta.",
+        });
+      }
+
+      try {
+        await flowApiRequest("/customer/charge", {
+          customerId: addonSubscription.flow_customer_id,
+          amount: chargeAmount,
+          subject: `Add-on: ${addon_key} x${increment}`,
+          commerceOrder: `addon_${tenant_id}_${addon_key}_${Date.now()}`,
+        });
+      } catch (chargeErr) {
+        console.error("PATCH /billing/addons/quantity: fallo el cargo Flow", chargeErr.message);
+        return res.status(500).json({ error: chargeErr.message });
+      }
+    }
 
     if (qty === 0) {
       const { data, error } = await supabase
@@ -10083,9 +10154,10 @@ function mapFlowCharge(item) {
 
   return {
     date: item?.requestDate ?? item?.date ?? null,
-    amount: item?.amount ?? null,
+    amount: item?.amount != null ? Number(item.amount) : null,
     status: status ?? "—",
     flowOrder: item?.flowOrder ?? null,
+    subject: item?.subject ?? null,
   };
 }
 
