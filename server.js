@@ -357,7 +357,7 @@ function getAddonsForPlan(plan) {
 async function getActiveAddons(tenant_id) {
   const { data, error } = await supabase
     .from("tenant_addons")
-    .select("id, addon_key, quantity, billing_cycle, status, activated_at, unit_price, last_reset_at")
+    .select("id, addon_key, quantity, billing_cycle, status, activated_at, unit_price, last_reset_at, renewal_mode, last_charged_at")
     .eq("tenant_id", tenant_id)
     .eq("status", "active");
 
@@ -9305,6 +9305,7 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
     }
 
     let row;
+    const chargedNowIso = new Date().toISOString();
 
     if (existing) {
       const { data, error } = await supabase
@@ -9313,7 +9314,8 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
           quantity: existing.quantity + qty,
           billing_cycle: cycle,
           unit_price: unitPrice,
-          updated_at: new Date().toISOString(),
+          last_charged_at: chargedNowIso,
+          updated_at: chargedNowIso,
         })
         .eq("id", existing.id)
         .select()
@@ -9331,6 +9333,8 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
           billing_cycle: cycle,
           unit_price: unitPrice,
           status: "active",
+          renewal_mode: "manual",
+          last_charged_at: chargedNowIso,
         })
         .select()
         .single();
@@ -9409,6 +9413,7 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
     }
 
     const now = new Date().toISOString();
+    let justCharged = false;
 
     if (qty > existing.quantity) {
       // No prorrateo fino en esta iteración: cobra precio unitario × la
@@ -9442,6 +9447,7 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
           subject: `Add-on: ${addon_key} x${increment}`,
           commerceOrder: `addon_${tenant_id}_${addon_key}_${Date.now()}`,
         });
+        justCharged = true;
       } catch (chargeErr) {
         console.error("PATCH /billing/addons/quantity: fallo el cargo Flow", chargeErr.message);
         return res.status(500).json({ error: chargeErr.message });
@@ -9477,6 +9483,7 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
       .update({
         quantity: qty,
         updated_at: now,
+        ...(justCharged ? { last_charged_at: now } : {}),
       })
       .eq("id", existing.id)
       .select()
@@ -9559,6 +9566,79 @@ app.post("/billing/addons/cancel", tenantAuthWrite, async (req, res) => {
     });
   } catch (err) {
     console.error("POST /billing/addons/cancel error:", err.message);
+
+    if (isMissingAddonsTableError(err)) {
+      return res.status(503).json({
+        error:
+          "La tabla tenant_addons no existe aún. Ejecuta tenant_addons.sql en el SQL editor de Supabase.",
+      });
+    }
+
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ PATCH /billing/addons/renewal-mode
+   body: { tenant_id, addon_key, renewal_mode }  // 'manual' | 'automatico'
+   Solo cambia el flag — no cobra nada. El cobro real ocurre en la
+   activación inicial o en el cron mensual (charge-recurring).
+====================================================== */
+app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id, addon_key, renewal_mode } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!addon_key || !ADDON_CATALOG[addon_key]) {
+      return res.status(400).json({
+        error: `addon_key inválido. Válidos: ${Object.keys(ADDON_CATALOG).join(", ")}`,
+      });
+    }
+
+    if (!["manual", "automatico"].includes(renewal_mode)) {
+      return res.status(400).json({
+        error: "renewal_mode debe ser 'manual' o 'automatico'",
+      });
+    }
+
+    // Ownership: el tenant debe existir; la mutación filtra por tenant_id.
+    try {
+      await getPlan(tenant_id);
+    } catch {
+      return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    const { data: existing, error: existingError } = await supabase
+      .from("tenant_addons")
+      .select("id")
+      .eq("tenant_id", tenant_id)
+      .eq("addon_key", addon_key)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (existingError) throw existingError;
+
+    if (!existing) {
+      return res.status(404).json({
+        error: "El tenant no tiene ese add-on activo",
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("tenant_addons")
+      .update({ renewal_mode, updated_at: new Date().toISOString() })
+      .eq("id", existing.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, renewal_mode: data.renewal_mode });
+  } catch (err) {
+    console.error("PATCH /billing/addons/renewal-mode error:", err.message);
 
     if (isMissingAddonsTableError(err)) {
       return res.status(503).json({
@@ -10789,6 +10869,131 @@ function requireSignupMaintenanceSecret(req, res, next) {
   }
   next();
 }
+
+/* ======================================================
+   ✅ POST /billing/addons/maintenance/charge-recurring (sandbox)
+   Cron de cobro recurrente mensual para add-ons con renewal_mode=
+   'automatico'. Pensado para dispararse ~1 vez al día vía cron externo
+   (cron-job.org u otro) — el criterio "ya pasaron 30 días desde
+   last_charged_at" se evalúa en cada corrida, así que correrlo más
+   seguido no duplica cobros (una fila recién cobrada no vuelve a
+   calificar hasta que pasen 30 días de nuevo).
+   Mismo header/secret que /signup/maintenance/sweep.
+====================================================== */
+app.post(
+  "/billing/addons/maintenance/charge-recurring",
+  publicLimiter,
+  requireSignupMaintenanceSecret,
+  async (req, res) => {
+    const MAX_FAILED_ATTEMPTS = 3;
+
+    try {
+      const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      // last_charged_at NULL cuenta como "vencido" también: cubre filas
+      // creadas antes de esta migración, o cualquier caso borde donde el
+      // campo nunca se llenó.
+      const { data: dueRows, error: dueErr } = await supabase
+        .from("tenant_addons")
+        .select("id, tenant_id, addon_key, quantity, unit_price, last_charged_at, failed_attempts")
+        .eq("status", "active")
+        .eq("renewal_mode", "automatico")
+        .or(`last_charged_at.is.null,last_charged_at.lte.${cutoff}`);
+
+      if (dueErr) throw dueErr;
+
+      const rows = dueRows || [];
+      let charged = 0;
+      let failed = 0;
+      let skipped = 0;
+
+      for (const row of rows) {
+        try {
+          const { data: subscription, error: subErr } = await supabase
+            .from("subscriptions")
+            .select("id, flow_customer_id")
+            .eq("tenant_id", row.tenant_id)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (subErr) throw subErr;
+
+          if (!subscription || !subscription.flow_customer_id) {
+            console.warn(
+              `charge-recurring: tenant ${row.tenant_id} sin flow_customer_id, se salta addon ${row.addon_key} (tenant_addons.id=${row.id})`
+            );
+            skipped++;
+            continue;
+          }
+
+          const netAmount = Number(row.unit_price || 0) * Number(row.quantity || 0);
+
+          await flowApiRequest("/customer/charge", {
+            customerId: subscription.flow_customer_id,
+            amount: applyIva(netAmount),
+            subject: `Add-on recurrente: ${row.addon_key} x${row.quantity}`,
+            commerceOrder: `addon_recurring_${row.tenant_id}_${row.addon_key}_${Date.now()}`,
+          });
+
+          const { error: updateErr } = await supabase
+            .from("tenant_addons")
+            .update({
+              last_charged_at: new Date().toISOString(),
+              failed_attempts: 0,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", row.id);
+
+          if (updateErr) throw updateErr;
+
+          charged++;
+        } catch (chargeErr) {
+          console.error(
+            `charge-recurring: fallo cobrando addon ${row.addon_key} (tenant_addons.id=${row.id}, tenant_id=${row.tenant_id}):`,
+            chargeErr.message
+          );
+
+          const nextFailedAttempts = Number(row.failed_attempts || 0) + 1;
+          const patch = {
+            failed_attempts: nextFailedAttempts,
+            updated_at: new Date().toISOString(),
+          };
+
+          // Tras N fallos consecutivos (tarjeta rechazada, etc.), se
+          // desactiva el reintento automático en vez de insistir para
+          // siempre — el tenant queda en 'manual' y puede reactivarlo
+          // desde el dashboard una vez resuelto el problema de pago.
+          if (nextFailedAttempts >= MAX_FAILED_ATTEMPTS) {
+            patch.renewal_mode = "manual";
+            console.warn(
+              `charge-recurring: addon ${row.addon_key} (tenant_addons.id=${row.id}) pasó a renewal_mode='manual' tras ${nextFailedAttempts} fallos consecutivos`
+            );
+          }
+
+          const { error: failUpdateErr } = await supabase
+            .from("tenant_addons")
+            .update(patch)
+            .eq("id", row.id);
+
+          if (failUpdateErr) {
+            console.error(
+              `charge-recurring: fallo además actualizando failed_attempts para tenant_addons.id=${row.id}:`,
+              failUpdateErr.message
+            );
+          }
+
+          failed++;
+        }
+      }
+
+      return res.json({ processed: rows.length, charged, failed, skipped });
+    } catch (err) {
+      console.error("POST /billing/addons/maintenance/charge-recurring error:", err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 /* ======================================================
    ✅ POST /signup/maintenance/sweep (sandbox)
