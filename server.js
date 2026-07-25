@@ -394,6 +394,37 @@ async function getEffectiveGroupCapacity(tenant_id) {
   }
 }
 
+// Límite efectivo genérico = límite base del plan + (cantidad activa en
+// tenant_addons para addon_key × pack_size de ese addon). Mismo patrón que
+// getEffectiveGroupCapacity, generalizado para reusar en otros recursos
+// (staff, sucursales). Tolerante a la ausencia de fila en tenant_addons:
+// retorna la base del plan.
+async function getEffectiveLimit(tenant_id, plan, capKey, addonKey) {
+  const baseLimit = getPlanCapabilities(plan)[capKey] || 0;
+
+  try {
+    const { data, error } = await supabase
+      .from("tenant_addons")
+      .select("quantity")
+      .eq("tenant_id", tenant_id)
+      .eq("addon_key", addonKey)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const packs = Number(data?.quantity) || 0;
+    const packSize = ADDON_CATALOG[addonKey]?.pack_size || 1;
+    return baseLimit + packs * packSize;
+  } catch (err) {
+    console.warn(
+      `getEffectiveLimit(${addonKey}): usando límite base del plan:`,
+      err.message
+    );
+    return baseLimit;
+  }
+}
+
 // Errores de PostgREST cuando la tabla tenant_addons todavía no fue migrada
 function isMissingAddonsTableError(err) {
   return Boolean(
@@ -3755,10 +3786,10 @@ app.post("/staff", tenantAuthWrite, async (req, res) => {
     });
 
     const plan = await getPlan(tenant_id);
-    const caps = getPlanCapabilities(plan);
     const staffCount = await getStaffCount(tenant_id);
+    const maxStaff = await getEffectiveLimit(tenant_id, plan, "max_staff", "staff");
 
-    if (staffCount >= caps.max_staff) {
+    if (staffCount >= maxStaff) {
       return res.status(403).json({
         error: "Límite de staff alcanzado",
         upgrade_required: true,
@@ -7477,8 +7508,12 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
     }
 
     const currentPlan = normalizePlanSlug(tenant.plan_slug || tenant.plan || "pro");
-    const caps = getPlanCapabilities(currentPlan);
-    const planLimit = Number(caps.max_campaign_emails_per_send || 50);
+    // Cupo restante este mes = (base del plan + add-ons "emails_campana"
+    // activos) − lo ya enviado este mes (tenant_monthly_usage). Antes esto
+    // se calculaba solo con caps.max_campaign_emails_per_send, ignorando
+    // tanto el add-on comprado como el consumo acumulado del mes.
+    const emailUsage = await checkMonthlyUsage(tenant.id, "emails_campana");
+    const planLimit = emailUsage.remaining;
 
     function normalizeEmail(value) {
       return String(value || "").trim().toLowerCase();
@@ -7704,6 +7739,13 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
           failed_count: errors.length,
         })
         .eq("id", campaignHistoryId);
+
+      // Registrar uso mensual de emails_campana — antes solo se registraba
+      // en la rama sin audiencia curada (abajo), dejando este camino sin
+      // contar contra el cupo mensual del tenant.
+      if (sent > 0) {
+        await incrementMonthlyUsage(tenant.id, "emails_campana", sent);
+      }
 
       return res.json({
         ok: true,
@@ -11371,10 +11413,10 @@ app.post("/branches", tenantAuthWrite, async (req, res) => {
 
     // 🔥 VALIDACIÓN PLAN (AQUÍ ESTÁ LO NUEVO)
     const plan = await getPlan(tenant_id);
-    const caps = getPlanCapabilities(plan);
     const branchesCount = await getBranchesCount(tenant_id);
+    const maxBranches = await getEffectiveLimit(tenant_id, plan, "max_branches", "sucursal");
 
-    if (branchesCount >= caps.max_branches) {
+    if (branchesCount >= maxBranches) {
       return res.status(403).json({
         error: "Límite de sucursales alcanzado",
         upgrade_required: true,
@@ -11512,10 +11554,15 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
     if (is_active !== undefined) {
       if (Boolean(is_active) === true && existingBranch.is_active === false) {
         const plan = await getPlan(effectiveTenantId);
-        const caps = getPlanCapabilities(plan);
         const activeBranchesCount = await getBranchesCount(effectiveTenantId);
+        const maxBranches = await getEffectiveLimit(
+          effectiveTenantId,
+          plan,
+          "max_branches",
+          "sucursal"
+        );
 
-        if (activeBranchesCount >= caps.max_branches) {
+        if (activeBranchesCount >= maxBranches) {
           return res.status(403).json({
             error: "Límite de sucursales alcanzado",
             upgrade_required: true,
