@@ -8968,12 +8968,44 @@ app.get("/billing/preview-change", tenantAuth, async (req, res) => {
     }
 
     if (isUpgradePlanChange(subscription.currentPlan, targetPlan)) {
-      const proration = calculateProration({
-        currentPlan: subscription.currentPlan,
-        newPlan: targetPlan,
-        billingEnd: subscription.billingEnd,
-        billingCycle: tenantCycle,
+      const { data: flowSub, error: flowSubErr } = await supabase
+        .from("subscriptions")
+        .select("flow_customer_id, flow_subscription_id")
+        .eq("tenant_id", tenant_id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (flowSubErr) throw flowSubErr;
+
+      if (!flowSub?.flow_customer_id || !flowSub?.flow_subscription_id) {
+        return res.json({
+          ok: true,
+          change_type: "upgrade",
+          requires_card: true,
+          current_plan: subscription.currentPlan,
+          new_plan: targetPlan,
+          billing_cycle: tenantCycle,
+          message: "Necesitas una tarjeta registrada para cambiar de plan",
+        });
+      }
+
+      const cycleMonto = getPlanCyclePrice(targetPlan, tenantCycle);
+      const newFlowPlanId = await getOrCreateFlowPlan(targetPlan, tenantCycle, cycleMonto);
+
+      // subscription/changePlanPreview calcula el prorrateo real contra la
+      // suscripción de Flow (sin aplicar el cambio ni cobrar). El monto que
+      // devuelve ya incluye IVA: los planes en Flow se crean con
+      // applyIva(monto) en getOrCreateFlowPlan, así que el prorrateo que
+      // Flow calcula internamente parte de montos brutos. No se le vuelve a
+      // aplicar applyIva() acá.
+      const preview = await flowApiRequest("/subscription/changePlanPreview", {
+        subscriptionId: flowSub.flow_subscription_id,
+        newPlanId: newFlowPlanId,
       });
+
+      const rawBalance = preview?.balance?.amount ?? preview?.balance2 ?? 0;
+      const amountToday = Math.max(0, Math.round(Number(rawBalance) || 0));
 
       return res.json({
         ok: true,
@@ -8981,12 +9013,9 @@ app.get("/billing/preview-change", tenantAuth, async (req, res) => {
         current_plan: subscription.currentPlan,
         new_plan: targetPlan,
         billing_cycle: tenantCycle,
-        amount_today: proration.amount_today,
-        credit: proration.credit,
-        charge: proration.charge,
-        days_remaining: proration.days_remaining,
+        amount_today: amountToday,
         billing_cycle_end: subscription.billingEnd.toISOString(),
-        message: "El upgrade se aplicará de inmediato con prorrateo",
+        message: "El upgrade se aplicará de inmediato",
       });
     }
 
@@ -9012,7 +9041,7 @@ app.get("/billing/preview-change", tenantAuth, async (req, res) => {
 ====================================================== */
 app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
   try {
-    const { tenant_id, new_plan, billing_cycle } = req.body;
+    const { tenant_id, new_plan } = req.body;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -9028,11 +9057,6 @@ app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
       subscription.billingStart,
       subscription.billingEnd
     );
-    // billing_cycle opcional: solo en upgrades permite cambiar de ciclo.
-    // Sin el parámetro, el comportamiento es idéntico al original.
-    const requestedCycle = billing_cycle
-      ? normalizeBillingCycle(billing_cycle)
-      : null;
 
     if (subscription.currentPlan === targetPlan) {
       return res.status(400).json({
@@ -9041,47 +9065,62 @@ app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
     }
 
     if (isUpgradePlanChange(subscription.currentPlan, targetPlan)) {
-      const isCycleSwitch = Boolean(
-        requestedCycle && requestedCycle !== tenantCycle
-      );
+      const { data: flowSub, error: flowSubErr } = await supabase
+        .from("subscriptions")
+        .select("id, flow_customer_id, flow_subscription_id")
+        .eq("tenant_id", tenant_id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
-      const proration = calculateProration({
-        currentPlan: subscription.currentPlan,
-        newPlan: targetPlan,
-        billingEnd: subscription.billingEnd,
-        billingCycle: tenantCycle,
-      });
+      if (flowSubErr) throw flowSubErr;
 
-      // Con cambio de ciclo: se acredita lo no usado del ciclo vigente y se
-      // cobra el ciclo nuevo completo, que parte hoy.
-      const newCycleCharge = isCycleSwitch
-        ? getPlanCyclePrice(targetPlan, requestedCycle)
-        : proration.charge;
-      const amountToday = isCycleSwitch
-        ? Math.max(0, newCycleCharge - proration.credit)
-        : proration.amount_today;
-
-      const updatePayload = {
-        plan_slug: targetPlan,
-        scheduled_plan_slug: null,
-        scheduled_change_at: null,
-        pending_change_type: null,
-        proration_credit: proration.credit,
-        proration_charge: newCycleCharge,
-      };
-
-      if (isCycleSwitch) {
-        const newStart = new Date();
-        updatePayload.billing_cycle_start = newStart.toISOString();
-        updatePayload.billing_cycle_end = addMonths(
-          newStart,
-          BILLING_CYCLES[requestedCycle].months
-        ).toISOString();
+      if (!flowSub?.flow_customer_id || !flowSub?.flow_subscription_id) {
+        return res.status(400).json({
+          error: "Necesitas una tarjeta registrada para cambiar de plan",
+          requires_card: true,
+        });
       }
+
+      const cycleMonto = getPlanCyclePrice(targetPlan, tenantCycle);
+      const newFlowPlanId = await getOrCreateFlowPlan(targetPlan, tenantCycle, cycleMonto);
+
+      // subscription/changePlan hace las dos cosas en una sola llamada
+      // atómica: prorratea Y cobra el saldo a la tarjeta registrada en
+      // Flow (sin startDateOfNewPlan, se aplica hoy mismo dentro del ciclo
+      // vigente — no se reinicia billing_cycle_start/end). No se llama
+      // customer/charge por separado: hacerlo cobraría la diferencia dos
+      // veces. El monto que devuelve ya incluye IVA (ver nota en
+      // GET /billing/preview-change), no se le vuelve a aplicar applyIva().
+      let changeResult;
+      try {
+        changeResult = await flowApiRequest("/subscription/changePlan", {
+          subscriptionId: flowSub.flow_subscription_id,
+          newPlanId: newFlowPlanId,
+        });
+      } catch (flowErr) {
+        console.error(
+          `POST /billing/change-plan: subscription/changePlan falló para tenant ${tenant_id}:`,
+          flowErr.message
+        );
+        return res.status(502).json({
+          error:
+            "No se pudo cobrar el cambio de plan con tu tarjeta registrada. Verifica tu tarjeta en Facturación y pago o intenta de nuevo.",
+        });
+      }
+
+      const amountCharged = Math.max(0, Math.round(Number(changeResult?.balance ?? 0) || 0));
 
       const { data, error } = await supabase
         .from("tenants")
-        .update(updatePayload)
+        .update({
+          plan_slug: targetPlan,
+          scheduled_plan_slug: null,
+          scheduled_change_at: null,
+          pending_change_type: null,
+          proration_credit: 0,
+          proration_charge: amountCharged,
+        })
         .eq("id", tenant_id)
         .select(`
           id,
@@ -9098,16 +9137,32 @@ app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
 
       if (error) throw error;
 
+      const { error: subUpdateErr } = await supabase
+        .from("subscriptions")
+        .update({
+          plan_id: targetPlan,
+          monto: cycleMonto,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", flowSub.id);
+
+      if (subUpdateErr) {
+        // El cobro y el cambio de plan en Flow ya se aplicaron; esto solo
+        // deja stale el registro local de subscriptions (plan_id/monto).
+        console.error(
+          `POST /billing/change-plan: tenant ${tenant_id} actualizado pero subscriptions no pudo actualizarse:`,
+          subUpdateErr.message
+        );
+      }
+
       return res.json({
         ok: true,
         applied: true,
         change_type: "upgrade",
-        billing_cycle: isCycleSwitch ? requestedCycle : tenantCycle,
-        amount_today: amountToday,
-        credit: proration.credit,
-        charge: newCycleCharge,
+        billing_cycle: tenantCycle,
+        amount_today: amountCharged,
         tenant: data,
-        message: "Upgrade aplicado de inmediato con prorrateo",
+        message: "Upgrade aplicado de inmediato",
       });
     }
 
@@ -9747,6 +9802,57 @@ app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) =
         .eq("id", tenant.id);
 
       if (updateError) throw updateError;
+
+      // Sincroniza la suscripción real en Flow con el plan inferior, para
+      // que el próximo cobro recurrente sea el correcto. Best-effort: si
+      // el tenant no tiene suscripción real en Flow (o la llamada falla),
+      // no bloquea el downgrade local — el acceso ya cambió en tenants,
+      // que es la fuente de verdad para permisos. subscription/changePlan
+      // sin startDateOfNewPlan se aplica de inmediato; como este endpoint
+      // corre justo al llegar (o pasar) el fin de ciclo, el prorrateo que
+      // calcule Flow debería salir en ~0 o a favor del tenant (nunca un
+      // cargo, ya que el plan nuevo es más barato) — si llegara a salir
+      // positivo por algún desfase de reloj, se loguea para revisar.
+      try {
+        const { data: flowSub, error: flowSubErr } = await supabase
+          .from("subscriptions")
+          .select("id, flow_subscription_id")
+          .eq("tenant_id", tenant.id)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (flowSubErr) throw flowSubErr;
+
+        if (flowSub?.flow_subscription_id) {
+          const cycleMonto = getPlanCyclePrice(newPlan, tenantCycle);
+          const newFlowPlanId = await getOrCreateFlowPlan(newPlan, tenantCycle, cycleMonto);
+
+          const changeResult = await flowApiRequest("/subscription/changePlan", {
+            subscriptionId: flowSub.flow_subscription_id,
+            newPlanId: newFlowPlanId,
+          });
+
+          const balance = Number(changeResult?.balance ?? 0) || 0;
+          if (balance > 0) {
+            console.warn(
+              `POST /billing/apply-scheduled-changes: downgrade tenant ${tenant.id} generó un cargo inesperado en Flow (balance=${balance}), revisar.`
+            );
+          }
+
+          const { error: subUpdateErr } = await supabase
+            .from("subscriptions")
+            .update({ plan_id: newPlan, monto: cycleMonto, updated_at: new Date().toISOString() })
+            .eq("id", flowSub.id);
+
+          if (subUpdateErr) throw subUpdateErr;
+        }
+      } catch (flowErr) {
+        console.error(
+          `POST /billing/apply-scheduled-changes: no se pudo sincronizar el downgrade de tenant ${tenant.id} con Flow:`,
+          flowErr.message
+        );
+      }
 
       // Downgrade efectivo: cancelar add-ons que el plan nuevo no soporta
       const canceledAddons = await cancelUnsupportedAddons(tenant.id, newPlan);
