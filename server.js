@@ -223,6 +223,17 @@ function getPlanCyclePrice(plan, cycle) {
   return Math.round(getPlanPrice(plan) * config.months * config.discount);
 }
 
+// Todos los precios en catálogos (PLAN_PRICES, ADDON_CATALOG, monto de
+// signup_intents/subscriptions/tenant_addons.unit_price) son netos, sin
+// IVA — así se muestran en la UI ("+ IVA"). El +19% se aplica UNA sola
+// vez, acá, justo antes de armar cada llamada real de cobro a Flow
+// (plans/create, customer/charge). Nunca se guarda el monto con IVA en
+// la base de datos ni se recalcula en el frontend.
+const IVA_RATE = 0.19;
+function applyIva(netAmount) {
+  return Math.round(netAmount * (1 + IVA_RATE));
+}
+
 /* ======================================================
    Catálogo de add-ons. Precios escalonados: pack1 = precio normal,
    pack2 (−10%), pack3+ (−15%). resets_monthly = true indica que el
@@ -2164,7 +2175,7 @@ async function getOrCreateFlowPlan(plan_id, periodicidad, monto) {
     flowPlan = await flowApiRequest("/plans/create", {
       planId: flowPlanId,
       name: `Orbyx ${plan_id} (${periodicidad})`,
-      amount: monto,
+      amount: applyIva(monto),
       currency: "CLP",
       interval: intervalConfig.interval,
       interval_count: intervalConfig.interval_count,
@@ -9284,7 +9295,7 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
     try {
       await flowApiRequest("/customer/charge", {
         customerId: addonSubscription.flow_customer_id,
-        amount: chargeAmount,
+        amount: applyIva(chargeAmount),
         subject: `Add-on: ${addon_key} x${qty}`,
         commerceOrder: `addon_${tenant_id}_${addon_key}_${Date.now()}`,
       });
@@ -9427,7 +9438,7 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
       try {
         await flowApiRequest("/customer/charge", {
           customerId: addonSubscription.flow_customer_id,
-          amount: chargeAmount,
+          amount: applyIva(chargeAmount),
           subject: `Add-on: ${addon_key} x${increment}`,
           commerceOrder: `addon_${tenant_id}_${addon_key}_${Date.now()}`,
         });
