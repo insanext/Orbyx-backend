@@ -195,4 +195,6 @@ Documentation-only changes require no build or deploy.
 - Campaign/customer flows can become tenant-wide when branch-specific behavior is expected.
 - Group booking capacity needs race-safe handling.
 - Veterinary and group booking share the public booking path.
+- `requireWriteAccess` granular per-module permission enforcement is RESOLVED (commit `dd04e05`, 2026-07-05) — do not re-open as pending.
+- Any new dashboard write endpoint guarded only by `[dashboardLimiter, requireTenantAuth, requireWriteAccess]` (not via the `tenantAuthWrite`/`tenantAuthSlugWrite`/`tenantAuthParamWrite` composites) will NOT have `role`/`tenant_id`/`permissions` populated, since only the composites call `resolveTenantMembership`. Use `requireTenantWriteAccessForResource(req, res, resourceTenantId, moduleKey)` (defined next to `resolveTenantMembership`) after fetching the resource, before mutating it.
 

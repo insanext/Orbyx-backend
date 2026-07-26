@@ -890,6 +890,52 @@ async function resolveTenantMembership(req, res, tenantId) {
   return membership;
 }
 
+// Verifica que el usuario autenticado sea miembro activo de tenantId.
+// Uso: endpoints que mutan un recurso por :id sin tenant_id/slug en la
+// request, donde el tenant real solo se conoce tras leer el recurso.
+async function requireTenantMembership(req, res, tenantId) {
+  const membership = await resolveTenantMembership(req, res, tenantId);
+  if (!membership) {
+    res.status(403).json({ error: "No tienes acceso a este negocio" });
+    return false;
+  }
+  return true;
+}
+
+// Misma lógica de permisos por módulo que requireWriteAccess, extraída
+// para poder aplicarla también en endpoints resource-based (ver arriba).
+function evaluateModuleWriteAccess(authUser, moduleKey) {
+  if (!authUser) return { allowed: true };
+  if (authUser.role === "readonly") {
+    return { allowed: false, error: "Tu rol es solo lectura. No puedes realizar esta acción." };
+  }
+  if (authUser.role === "owner" || authUser.role === "admin") {
+    return { allowed: true };
+  }
+  if (!moduleKey) return { allowed: true };
+  const permissions = authUser.permissions;
+  const moduleAccess = permissions ? permissions[moduleKey] : undefined;
+  if (moduleAccess === undefined || moduleAccess === null) return { allowed: true };
+  if (moduleAccess === false) return { allowed: false, error: "Sin acceso a este módulo" };
+  if (moduleAccess === "view") return { allowed: false, error: "Solo tienes acceso de lectura a este módulo" };
+  return { allowed: true };
+}
+
+// Combina membership + permiso de módulo para endpoints resource-based.
+async function requireTenantWriteAccessForResource(req, res, tenantId, moduleKey) {
+  const membership = await resolveTenantMembership(req, res, tenantId);
+  if (!membership) {
+    res.status(403).json({ error: "No tienes acceso a este negocio" });
+    return false;
+  }
+  const result = evaluateModuleWriteAccess(req.authenticatedUser, moduleKey);
+  if (!result.allowed) {
+    res.status(403).json({ error: result.error });
+    return false;
+  }
+  return true;
+}
+
 // Mapeo de prefijos de ruta -> módulo de permisos granulares.
 // "always": siempre permitido (soporte). "owner_admin": solo owner/admin.
 const WRITE_ACCESS_MODULE_RULES = [
@@ -8233,6 +8279,9 @@ next_control_custom_unit = null,
       return res.status(404).json({ error: "Reserva no encontrada" });
     }
 
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, appointment.tenant_id, "agenda");
+    if (!hasWriteAccess) return;
+
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .select("id, business_category")
@@ -8444,17 +8493,20 @@ app.patch("/appointments/:id/status", [dashboardLimiter, requireTenantAuth, requ
       return res.status(400).json({ error: "Estado inválido" });
     }
 
+    const { data: appt, error: apptErr } = await supabase
+      .from("appointments")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (apptErr || !appt) {
+      return res.status(404).json({ error: "Appointment no encontrado" });
+    }
+
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda");
+    if (!hasWriteAccess) return;
+
     if (status === "canceled") {
-      const { data: appt, error: apptErr } = await supabase
-        .from("appointments")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (apptErr || !appt) {
-        return res.status(404).json({ error: "Appointment no encontrado" });
-      }
-
       await deleteCalendarEventForAppointment(appt);
     }
 
@@ -8693,6 +8745,19 @@ app.patch("/appointments/:id", [dashboardLimiter, requireTenantAuth, requireWrit
       return res.status(400).json({ error: "No hay cambios para actualizar" });
     }
 
+    const { data: existingAppointment, error: existingError } = await supabase
+      .from("appointments")
+      .select("id, tenant_id")
+      .eq("id", id)
+      .single();
+
+    if (existingError || !existingAppointment) {
+      return res.status(404).json({ error: "Reserva no encontrada" });
+    }
+
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, existingAppointment.tenant_id, "agenda");
+    if (!hasWriteAccess) return;
+
     const { data, error } = await supabase
       .from("appointments")
       .update(updateData)
@@ -8775,6 +8840,19 @@ app.patch("/calendars/:id/slot-minutes", [dashboardLimiter, requireTenantAuth, r
         error: "slot_minutes debe ser un número entre 5 y 180",
       });
     }
+
+    const { data: existingCalendar, error: existingCalendarError } = await supabase
+      .from("calendars")
+      .select("id, tenant_id")
+      .eq("id", id)
+      .single();
+
+    if (existingCalendarError || !existingCalendar) {
+      return res.status(404).json({ error: "Calendario no encontrado" });
+    }
+
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, existingCalendar.tenant_id, "negocio");
+    if (!hasWriteAccess) return;
 
     const { data, error } = await supabase
       .from("calendars")
@@ -13092,6 +13170,9 @@ app.post("/upload/campaign-image", [dashboardLimiter, requireTenantAuth, require
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, business.id, "campanas");
+    if (!hasWriteAccess) return;
+
     const plan = normalizePlan(business.plan_slug);
     const limit = PLAN_LIMITS[plan] || 7;
 
@@ -13186,6 +13267,9 @@ app.delete("/campaign-images/:id", [dashboardLimiter, requireTenantAuth, require
       return res.status(404).json({ error: "Imagen no encontrada" });
     }
 
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, image.tenant_id, "campanas");
+    if (!hasWriteAccess) return;
+
     await supabase.storage.from(BUCKET).remove([image.file_path]);
 
     await supabase.from("campaign_images").delete().eq("id", id);
@@ -13209,6 +13293,8 @@ app.post("/upload/ticket-attachment", [dashboardLimiter, requireTenantAuth], upl
     const { tenant_id } = req.body;
     if (!tenant_id || !req.file)
       return res.status(400).json({ error: "tenant_id y archivo requeridos" });
+    const isMember = await requireTenantMembership(req, res, tenant_id);
+    if (!isMember) return;
     const allowed = ["image/jpeg", "image/png", "image/webp"];
     if (!allowed.includes(req.file.mimetype))
       return res.status(400).json({ error: "Solo se permiten imágenes JPG, PNG o WebP" });
@@ -13330,6 +13416,8 @@ app.post("/support/tickets/:id/messages", [dashboardLimiter, requireTenantAuth, 
       .eq("tenant_id", tenant_id)
       .single();
     if (!ticket) return res.status(404).json({ error: "Ticket no encontrado" });
+    const isMember = await requireTenantMembership(req, res, tenant_id);
+    if (!isMember) return;
     const { data, error } = await supabase
       .from("support_ticket_messages")
       .insert({
