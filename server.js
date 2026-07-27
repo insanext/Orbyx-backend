@@ -81,58 +81,93 @@ function normalizeNullableNumber(value) {
   return Number.isFinite(numberValue) ? numberValue : null;
 }
 
+// Respaldo si plan_config no está disponible (arranque del server antes
+// de la primera lectura, o problema puntual de Supabase). La fuente de
+// verdad real es la tabla plan_config, editable desde el panel admin
+// (GET/PATCH /admin/plans) — nunca se debería depender de esto en
+// operación normal.
+const DEFAULT_PLAN_CAPS = {
+  pro: {
+    max_staff: 2,
+    max_services: 999999,
+    max_branches: 1,
+    max_campaign_emails_per_send: 200,
+    max_group_capacity: 10,
+    max_wa_confirmacion: 100,
+    max_campanas_wa: 0,
+    max_ia_wa: 0,
+  },
+  premium: {
+    max_staff: 5,
+    max_services: 999999,
+    max_branches: 2,
+    max_campaign_emails_per_send: 1000,
+    max_group_capacity: 25,
+    max_wa_confirmacion: 200,
+    max_campanas_wa: 0,
+    max_ia_wa: 0,
+  },
+  vip: {
+    max_staff: 10,
+    max_services: 999999,
+    max_branches: 3,
+    max_campaign_emails_per_send: 2000,
+    max_group_capacity: 50,
+    max_wa_confirmacion: 300,
+    max_campanas_wa: 0,
+    max_ia_wa: 500,
+  },
+  platinum: {
+    max_staff: 25,
+    max_services: 999999,
+    max_branches: 10,
+    max_campaign_emails_per_send: 5000,
+    max_group_capacity: 100,
+    max_wa_confirmacion: 500,
+    max_campanas_wa: 0,
+    max_ia_wa: 1500,
+  },
+};
+
+let PLAN_CAPS_CACHE = null; // { [plan_slug]: caps } — poblado desde plan_config
+
+// Relee plan_config completo y reconstruye el cache que usa
+// getPlanCapabilities. Se llama al arrancar el server y de nuevo cada
+// vez que se edita un plan vía PATCH /admin/plans/:slug (invalidación
+// simple: re-lee todo en vez de parchear una fila puntual en memoria).
+async function refreshPlanCapsCache() {
+  try {
+    const { data, error } = await supabase.from("plan_config").select("*");
+    if (error) throw error;
+    const next = {};
+    for (const row of data || []) {
+      next[row.plan_slug] = {
+        max_staff: row.staff_limit,
+        max_services: row.services_limit,
+        max_branches: row.branches_limit,
+        max_campaign_emails_per_send: row.email_campaign_limit,
+        max_group_capacity: row.max_group_capacity,
+        max_wa_confirmacion: row.max_wa_confirmacion,
+        max_campanas_wa: row.max_campanas_wa,
+        max_ia_wa: row.max_ia_wa,
+      };
+    }
+    PLAN_CAPS_CACHE = next;
+  } catch (err) {
+    console.error("refreshPlanCapsCache error:", err.message);
+  }
+}
+refreshPlanCapsCache();
+
 function getPlanCapabilities(plan, opts = {}) {
   const normalizedPlan = String(plan || "pro").toLowerCase();
-
-  // max_services = 999999: los servicios son ilimitados en todos los planes
-  const plans = {
-    pro: {
-      max_staff: 2,
-      max_services: 999999,
-      max_branches: 1,
-      max_campaign_emails_per_send: 200,
-      max_group_capacity: 10,
-      max_wa_confirmacion: 100,
-      max_campanas_wa: 0,
-      max_ia_wa: 0,
-    },
-    premium: {
-      max_staff: 5,
-      max_services: 999999,
-      max_branches: 2,
-      max_campaign_emails_per_send: 1000,
-      max_group_capacity: 25,
-      max_wa_confirmacion: 200,
-      max_campanas_wa: 0,
-      max_ia_wa: 0,
-    },
-    vip: {
-      max_staff: 10,
-      max_services: 999999,
-      max_branches: 3,
-      max_campaign_emails_per_send: 2000,
-      max_group_capacity: 50,
-      max_wa_confirmacion: 300,
-      max_campanas_wa: 0,
-      max_ia_wa: 500,
-    },
-    platinum: {
-      max_staff: 25,
-      max_services: 999999,
-      max_branches: 10,
-      max_campaign_emails_per_send: 5000,
-      max_group_capacity: 100,
-      max_wa_confirmacion: 500,
-      max_campanas_wa: 0,
-      max_ia_wa: 1500,
-    },
-  };
+  const plans = PLAN_CAPS_CACHE || DEFAULT_PLAN_CAPS;
 
   if (normalizedPlan === "starter") {
-    return plans.pro;
+    return plans.pro || DEFAULT_PLAN_CAPS.pro;
   }
 
-  const caps = plans[normalizedPlan] || plans.pro;
+  const caps = plans[normalizedPlan] || plans.pro || DEFAULT_PLAN_CAPS.pro;
 
   // Durante versión de prueba Pro: wa_confirmacion no incluido
   if (opts.is_trial && normalizedPlan === "pro") {
@@ -232,7 +267,10 @@ function applyIva(netAmount) {
    uso se resetea mensualmente (last_reset_at). Pro puede contratar
    wa_confirmacion y emails_campana; los demás requieren premium+.
 ====================================================== */
-const ADDON_CATALOG = {
+// Respaldo si addon_config no está disponible — misma logica que
+// DEFAULT_PLAN_CAPS arriba. La fuente de verdad real es addon_config,
+// editable desde el panel admin (GET/PATCH /admin/addons).
+const DEFAULT_ADDON_CATALOG = {
   wa_confirmacion: {
     key: "wa_confirmacion",
     name: "WA confirmación+recordatorio",
@@ -332,6 +370,42 @@ const ADDON_CATALOG = {
     accumulates: false,
   },
 };
+
+let ADDON_CATALOG = { ...DEFAULT_ADDON_CATALOG };
+
+// Relee addon_config y reconstruye ADDON_CATALOG con la misma forma que
+// ya consumen isAddonAvailableForPlan/getActiveAddons/checkMonthlyUsage
+// y los endpoints de /billing/addons — ningún call site cambia.
+// "grants" no vive como columna propia: en todos los add-ons de hoy
+// grants = { [addon_key]: pack_size }, así que un solo número alcanza
+// para reconstruirlo al leer desde la tabla.
+async function refreshAddonCatalogCache() {
+  try {
+    const { data, error } = await supabase.from("addon_config").select("*");
+    if (error) throw error;
+    const next = { ...DEFAULT_ADDON_CATALOG };
+    for (const row of data || []) {
+      next[row.addon_key] = {
+        key: row.addon_key,
+        name: row.name,
+        description: row.description || "",
+        price: row.price,
+        price_pack2: row.pack2_price ?? row.price,
+        price_pack3: row.pack3_price ?? row.price,
+        pack_size: row.pack_size,
+        grants: { [row.addon_key]: row.pack_size },
+        min_plan: row.min_plan,
+        available_for: row.available_for || [],
+        resets_monthly: row.resets_monthly,
+        accumulates: row.accumulates,
+      };
+    }
+    ADDON_CATALOG = next;
+  } catch (err) {
+    console.error("refreshAddonCatalogCache error:", err.message);
+  }
+}
+refreshAddonCatalogCache();
 
 function isAddonAvailableForPlan(addonKey, plan) {
   const addon = ADDON_CATALOG[addonKey];
@@ -13661,6 +13735,127 @@ app.patch("/admin/tickets/:id/resolve", requireAdminAuth, async (req, res) => {
   } catch (err) {
     console.error("PATCH /admin/tickets/:id/resolve error:", err);
     res.status(500).json({ error: "Error marcando como resuelto" });
+  }
+});
+
+// =======================
+// ADMIN PANEL — PLANES Y ADD-ONS
+// =======================
+
+app.get("/admin/plans", requireAdminAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("plan_config").select("*");
+    if (error) throw error;
+    const sorted = (data || []).sort(
+      (a, b) => (PLAN_ORDER[a.plan_slug] || 99) - (PLAN_ORDER[b.plan_slug] || 99)
+    );
+    res.json(sorted);
+  } catch (err) {
+    console.error("GET /admin/plans error:", err.message);
+    res.status(500).json({ error: "Error obteniendo planes" });
+  }
+});
+
+const PLAN_CONFIG_EDITABLE_FIELDS = [
+  "price_monthly",
+  "price_semestral_discount_pct",
+  "price_annual_discount_pct",
+  "trial_days",
+  "staff_limit",
+  "services_limit",
+  "branches_limit",
+  "email_campaign_limit",
+  "max_wa_confirmacion",
+  "max_ia_wa",
+  "max_group_capacity",
+  "max_campanas_wa",
+  "is_active",
+];
+
+app.patch("/admin/plans/:slug", requireAdminAuth, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const updatePayload = {};
+    for (const field of PLAN_CONFIG_EDITABLE_FIELDS) {
+      if (req.body[field] !== undefined) updatePayload[field] = req.body[field];
+    }
+    if (Object.keys(updatePayload).length === 0) {
+      return res.status(400).json({ error: "No hay cambios para actualizar" });
+    }
+    updatePayload.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from("plan_config")
+      .update(updatePayload)
+      .eq("plan_slug", slug)
+      .select()
+      .single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Plan no encontrado" });
+
+    await refreshPlanCapsCache();
+    res.json(data);
+  } catch (err) {
+    console.error("PATCH /admin/plans/:slug error:", err.message);
+    res.status(500).json({ error: err.message || "Error actualizando plan" });
+  }
+});
+
+app.get("/admin/addons", requireAdminAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("addon_config").select("*");
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    console.error("GET /admin/addons error:", err.message);
+    res.status(500).json({ error: "Error obteniendo add-ons" });
+  }
+});
+
+const ADDON_CONFIG_EDITABLE_FIELDS = [
+  "name",
+  "description",
+  "price",
+  "promo_price",
+  "promo_active",
+  "promo_starts_at",
+  "promo_ends_at",
+  "pack2_price",
+  "pack3_price",
+  "pack_size",
+  "min_plan",
+  "available_for",
+  "resets_monthly",
+  "accumulates",
+  "is_active",
+];
+
+app.patch("/admin/addons/:key", requireAdminAuth, async (req, res) => {
+  try {
+    const { key } = req.params;
+    const updatePayload = {};
+    for (const field of ADDON_CONFIG_EDITABLE_FIELDS) {
+      if (req.body[field] !== undefined) updatePayload[field] = req.body[field];
+    }
+    if (Object.keys(updatePayload).length === 0) {
+      return res.status(400).json({ error: "No hay cambios para actualizar" });
+    }
+    updatePayload.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from("addon_config")
+      .update(updatePayload)
+      .eq("addon_key", key)
+      .select()
+      .single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Add-on no encontrado" });
+
+    await refreshAddonCatalogCache();
+    res.json(data);
+  } catch (err) {
+    console.error("PATCH /admin/addons/:key error:", err.message);
+    res.status(500).json({ error: err.message || "Error actualizando add-on" });
   }
 });
 
