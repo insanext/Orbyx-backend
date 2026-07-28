@@ -9488,10 +9488,13 @@ app.get("/billing/addons", tenantAuth, async (req, res) => {
        status='active' para el tenant.
      - trial_active: tenants.trial_ends_at existe, todavía no pasó, y
        no hay suscripción activa.
-     - awaiting_payment: no hay suscripción activa y NO está en trial
-       activo (cubre trial ya vencido Y planes pagos que nunca
-       completaron el registro de tarjeta o cuyo cobro recurrente
-       falló — subscriptions.status='error').
+     - awaiting_payment: no hay suscripción activa, NO está en trial
+       activo, y tampoco tiene una suscripción 'trialing' en Flow (card
+       registrada mid-trial, con el primer cobro real ya programado vía
+       trial_period_days para cuando termine el trial — ver
+       POST /billing/flow/subscribe). Cubre trial ya vencido sin ninguna
+       suscripción real Y planes pagos que nunca completaron el registro
+       de tarjeta o cuyo cobro recurrente falló (status='error').
      - dias_restantes_pago cuenta contra tenants.billing_cycle_end (se
        reusa ese dato existente en vez de inventar un período de
        gracia nuevo — se setea igual para todos los planes).
@@ -9525,6 +9528,7 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       .maybeSingle();
 
     const hasActiveSubscription = subscription?.status === "active";
+    const isTrialingInFlow = subscription?.status === "trialing";
     const subscriptionStatus = subscription?.status || "none";
 
     const now = new Date();
@@ -9532,7 +9536,7 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     const billingCycleEnd = tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null;
 
     const trialActive = Boolean(trialEndsAt && now < trialEndsAt && !hasActiveSubscription);
-    const awaitingPayment = !hasActiveSubscription && !trialActive;
+    const awaitingPayment = !hasActiveSubscription && !trialActive && !isTrialingInFlow;
     const trialExpired = Boolean(awaitingPayment && trialEndsAt && now >= trialEndsAt);
     const blocked = Boolean(awaitingPayment && billingCycleEnd && now >= billingCycleEnd);
 
@@ -10542,16 +10546,48 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
       });
     }
 
+    // Si el tenant todavía tiene trial vigente, el primer cobro real se
+    // programa recién para cuando termine (Flow lo soporta nativamente
+    // vía trial_period_days -- no inventa nada nuevo de nuestro lado).
+    // Si el trial ya venció o nunca aplicó (trial_ends_at null), se
+    // mantiene el comportamiento actual: cobro inmediato al suscribirse.
+    const { data: tenantRow } = await supabase
+      .from("tenants")
+      .select("trial_ends_at")
+      .eq("id", tenant_id)
+      .maybeSingle();
+
+    let trialPeriodDays = null;
+    if (tenantRow?.trial_ends_at) {
+      const trialEndsAt = new Date(tenantRow.trial_ends_at);
+      const now = new Date();
+      if (trialEndsAt > now) {
+        trialPeriodDays = Math.ceil((trialEndsAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+      }
+    }
+
     const flowPlanId = await getOrCreateFlowPlan(plan_id, periodicidad, monto);
 
     const flowSubscription = await flowApiRequest("/subscription/create", {
       planId: flowPlanId,
       customerId: subscription.flow_customer_id,
+      ...(trialPeriodDays ? { trial_period_days: trialPeriodDays } : {}),
     });
 
-    // status de Flow: 0=Inactive, 1=Active, 2=Trial, 4=Cancelled.
+    // status de Flow: 0=Inactive, 1=Active, 2=Trial, 4=Cancelled. Trial
+    // (2) es un estado válido y esperado cuando mandamos trial_period_days
+    // arriba -- no es un error. El webhook (/billing/flow/webhook) pasa
+    // esto a 'active' solo cuando Flow notifica el primer cobro real, al
+    // terminar el trial.
     const flowStatus = Number(flowSubscription.status);
-    const mappedStatus = flowStatus === 1 ? "active" : flowStatus === 4 ? "canceled" : "error";
+    const mappedStatus =
+      flowStatus === 1
+        ? "active"
+        : flowStatus === 2
+        ? "trialing"
+        : flowStatus === 4
+        ? "canceled"
+        : "error";
 
     if (mappedStatus === "error") {
       console.error(
