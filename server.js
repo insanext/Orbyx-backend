@@ -10188,8 +10188,36 @@ app.post("/billing/flow/create-customer", tenantAuthWrite, async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    if (!tenant.email) {
-      return res.status(400).json({ error: "El negocio no tiene un email de contacto configurado" });
+    // tenants.email es el email de contacto PÚBLICO del negocio (se
+    // muestra en la página de reservas vía GET /public/business/:slug),
+    // opcional y nunca se setea solo al crear el tenant — no debería ser
+    // requisito para poder pagar. Si está vacío, se usa el email real de
+    // la cuenta (auth.users, vía tenant_users) como fallback solo para
+    // Flow — no se escribe de vuelta en tenants.email, ese campo sigue
+    // siendo 100% opcional y editable aparte en Negocio.
+    let billingEmail = tenant.email;
+    if (!billingEmail) {
+      const { data: activeMembers } = await supabase
+        .from("tenant_users")
+        .select("user_id, role")
+        .eq("tenant_id", tenant_id)
+        .eq("is_active", true);
+
+      const ownerMembership =
+        (activeMembers || []).find((m) => m.role === "owner") || (activeMembers || [])[0];
+
+      if (ownerMembership) {
+        const { data: authUser } = await supabase.auth.admin.getUserById(
+          ownerMembership.user_id
+        );
+        billingEmail = authUser?.user?.email || null;
+      }
+    }
+
+    if (!billingEmail) {
+      return res.status(400).json({
+        error: "No encontramos un email para asociar el pago. Escríbenos a soporte@orbyx.cl.",
+      });
     }
 
     const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip;
@@ -10199,8 +10227,8 @@ app.post("/billing/flow/create-customer", tenantAuthWrite, async (req, res) => {
     let flowCustomer;
     try {
       flowCustomer = await flowApiRequest("/customer/create", {
-        email: tenant.email,
-        name: tenant.name || tenant.email,
+        email: billingEmail,
+        name: tenant.name || billingEmail,
         externalId: tenant_id,
       });
     } catch (createErr) {
