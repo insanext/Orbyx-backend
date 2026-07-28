@@ -1119,6 +1119,7 @@ const tenantAuthWrite = [dashboardLimiter, requireTenantAuth, enforceTenantId, r
 const tenantAuthSlug = [dashboardLimiter, requireTenantAuth, enforceSlugOwnership];
 const tenantAuthSlugWrite = [dashboardLimiter, requireTenantAuth, enforceSlugOwnership, requireWriteAccess];
 const tenantAuthParamWrite = [dashboardLimiter, requireTenantAuth, enforceTenantIdParam, requireWriteAccess];
+const tenantAuthParam = [dashboardLimiter, requireTenantAuth, enforceTenantIdParam];
 
 const PORT = process.env.PORT || 3000;
 
@@ -11622,6 +11623,34 @@ app.post(
     }
   }
 );
+
+/* ======================================================
+   ✅ GET /tenants/:id
+   Lectura mínima para onboarding: permite pre-llenar el formulario con
+   el name/slug/business_category que el tenant ya tenía ANTES de
+   pisarlo, y detectar si ya había completado onboarding antes (para
+   decidir si vale la pena advertir sobre un cambio de slug).
+====================================================== */
+app.get("/tenants/:id", tenantAuthParam, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from("tenants")
+      .select("id, name, slug, business_category")
+      .eq("id", id)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    return res.json({ tenant: data });
+  } catch (err) {
+    console.error("GET /tenants/:id error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 /* ======================================================
    ✅ PATCH /tenants/:id
