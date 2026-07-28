@@ -10335,6 +10335,53 @@ app.post("/billing/flow/register-card", tenantAuthWrite, async (req, res) => {
 });
 
 /* ======================================================
+   ✅ POST /billing/flow/unregister-card (sandbox)
+   Elimina la tarjeta Oneclick registrada del customer en Flow
+   (customer/unRegister). Solo el registro de tarjeta -- el customer en
+   Flow sigue existiendo, podría registrar una tarjeta nueva más
+   adelante reusando el mismo flow_customer_id. Bloqueado si hay algún
+   compromiso de cobro vigente que dependa de esa tarjeta
+   (active/trialing/card_registered) -- ahí primero hay que cancelar.
+====================================================== */
+app.post("/billing/flow/unregister-card", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.body;
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    const { data: subscription, error: subErr } = await supabase
+      .from("subscriptions")
+      .select("id, flow_customer_id, status")
+      .eq("tenant_id", tenant_id)
+      .not("flow_customer_id", "is", null)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (subErr) throw subErr;
+    if (!subscription) {
+      return res.status(404).json({ error: "No hay una tarjeta registrada para este negocio" });
+    }
+
+    if (["active", "trialing", "card_registered"].includes(subscription.status)) {
+      return res.status(400).json({
+        error: "Estás suscrito — primero cancela tu suscripción para eliminar tu tarjeta.",
+      });
+    }
+
+    await flowApiRequest("/customer/unRegister", {
+      customerId: subscription.flow_customer_id,
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /billing/flow/unregister-card error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    ✅ POST /billing/flow/register-card-callback (sandbox)
    Flow llama este callback (POST, x-www-form-urlencoded) tras el
    enrolamiento de tarjeta. No usa auth de tenant: lo invoca Flow.
@@ -10540,7 +10587,10 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
 
     if (subErr) throw subErr;
 
-    if (!subscription || subscription.status !== "card_registered") {
+    // 'canceled' también es válido acá: reactivar una suscripción cancelada
+    // reusa el mismo flow_customer_id (y la tarjeta que ya tenía
+    // registrada en Flow) sin repetir create-customer/register-card.
+    if (!subscription || !["card_registered", "canceled"].includes(subscription.status)) {
       return res.status(400).json({
         error: "Tarjeta no registrada. Completa register-card primero.",
       });
