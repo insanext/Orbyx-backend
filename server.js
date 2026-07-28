@@ -8975,13 +8975,32 @@ async function provisionTenantCore({ email, plan = "pro", billing_cycle }) {
   ).toISOString();
 
   const normalizedProvisionPlan = normalizePlanSlug(plan);
+  const isTrialProvision = normalizedProvisionPlan === "pro";
+
+  // trial_ends_at solo aplica a tenants que nacen en el plan gratuito
+  // 'pro' — se lee trial_days desde plan_config (nunca hardcodeado) para
+  // que quede consistente con lo que el panel admin de planes edite.
+  let trialEndsAt = null;
+  if (isTrialProvision) {
+    const { data: proPlanConfig } = await supabase
+      .from("plan_config")
+      .select("trial_days")
+      .eq("plan_slug", "pro")
+      .maybeSingle();
+    const trialDays = Number(proPlanConfig?.trial_days) || 30;
+    trialEndsAt = new Date(
+      Date.now() + trialDays * 24 * 60 * 60 * 1000
+    ).toISOString();
+  }
+
   const { data: tenant, error: tenantError } = await supabase
     .from("tenants")
     .insert({
       name: email,
       slug,
       plan_slug: normalizedProvisionPlan,
-      is_trial: normalizedProvisionPlan === "pro",
+      is_trial: isTrialProvision,
+      trial_ends_at: trialEndsAt,
       billing_cycle_start,
       billing_cycle_end,
       scheduled_plan_slug: null,
@@ -9453,6 +9472,128 @@ app.get("/billing/addons", tenantAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("GET /billing/addons error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ GET /billing/account-status
+   Estado de cuenta para el widget del dashboard: trial, pago y
+   contadores de WA confirmación + IA WhatsApp.
+
+   No confía en tenants.is_trial (quedaba desactualizado — nunca se
+   apagaba solo con un pago real hasta el fix del webhook de Flow más
+   arriba). El estado real se calcula así:
+     - has_active_subscription: existe una fila en subscriptions con
+       status='active' para el tenant.
+     - trial_active: tenants.trial_ends_at existe, todavía no pasó, y
+       no hay suscripción activa.
+     - awaiting_payment: no hay suscripción activa y NO está en trial
+       activo (cubre trial ya vencido Y planes pagos que nunca
+       completaron el registro de tarjeta o cuyo cobro recurrente
+       falló — subscriptions.status='error').
+     - dias_restantes_pago cuenta contra tenants.billing_cycle_end (se
+       reusa ese dato existente en vez de inventar un período de
+       gracia nuevo — se setea igual para todos los planes).
+     - blocked=true cuando awaiting_payment Y billing_cycle_end ya
+       pasó: es la señal que debe usar el middleware para bloquear el
+       dashboard salvo /billing.
+====================================================== */
+app.get("/billing/account-status", tenantAuth, async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantErr } = await supabase
+      .from("tenants")
+      .select("id, plan_slug, trial_ends_at, billing_cycle_end")
+      .eq("id", tenant_id)
+      .single();
+
+    if (tenantErr || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data: subscription } = await supabase
+      .from("subscriptions")
+      .select("status")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const hasActiveSubscription = subscription?.status === "active";
+    const subscriptionStatus = subscription?.status || "none";
+
+    const now = new Date();
+    const trialEndsAt = tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null;
+    const billingCycleEnd = tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null;
+
+    const trialActive = Boolean(trialEndsAt && now < trialEndsAt && !hasActiveSubscription);
+    const awaitingPayment = !hasActiveSubscription && !trialActive;
+    const trialExpired = Boolean(awaitingPayment && trialEndsAt && now >= trialEndsAt);
+    const blocked = Boolean(awaitingPayment && billingCycleEnd && now >= billingCycleEnd);
+
+    const msPerDay = 24 * 60 * 60 * 1000;
+    const diasRestantesTrial = trialActive
+      ? Math.max(0, Math.ceil((trialEndsAt.getTime() - now.getTime()) / msPerDay))
+      : null;
+    const diasRestantesPago = awaitingPayment && billingCycleEnd
+      ? Math.max(0, Math.ceil((billingCycleEnd.getTime() - now.getTime()) / msPerDay))
+      : null;
+
+    // Contadores WA confirmación + IA WA — misma fuente y forma que
+    // GET /billing/addons (limits.wa_confirmacion / limits.ia_wa), sin
+    // duplicar la lógica de resets/uso.
+    const normalizedPlan = normalizePlanSlug(tenant.plan_slug);
+    await resetMonthlyAddons(tenant_id);
+    const caps = getPlanCapabilities(normalizedPlan);
+    const period = now.toISOString().slice(0, 7);
+
+    const { data: addonRows } = await supabase
+      .from("tenant_addons")
+      .select("addon_key, quantity")
+      .eq("tenant_id", tenant_id)
+      .eq("status", "active");
+    const addonQty = {};
+    for (const row of addonRows || []) {
+      addonQty[row.addon_key] = Number(row.quantity) || 0;
+    }
+
+    const { data: usageRows } = await supabase
+      .from("tenant_monthly_usage")
+      .select("resource, used")
+      .eq("tenant_id", tenant_id)
+      .eq("period", period);
+    const usageMap = {};
+    for (const row of usageRows || []) {
+      usageMap[row.resource] = Number(row.used) || 0;
+    }
+
+    const usageEntry = (base, addonKey) => {
+      const addonTotal = (addonQty[addonKey] || 0) * (ADDON_CATALOG[addonKey]?.grants?.[addonKey] || 0);
+      const total = base + addonTotal;
+      const used = usageMap[addonKey] || 0;
+      return { used, total, remaining: Math.max(0, total - used) };
+    };
+
+    return res.json({
+      ok: true,
+      trial_active: trialActive,
+      trial_expired: trialExpired,
+      dias_restantes_trial: diasRestantesTrial,
+      subscription_status: subscriptionStatus,
+      awaiting_payment: awaitingPayment,
+      dias_restantes_pago: diasRestantesPago,
+      blocked,
+      blocked_reason: !blocked ? null : trialExpired ? "trial_expired" : "payment_overdue",
+      wa_confirmacion: usageEntry(caps.max_wa_confirmacion, "wa_confirmacion"),
+      ia_wa: usageEntry(caps.max_ia_wa, "ia_wa"),
+    });
+  } catch (err) {
+    console.error("GET /billing/account-status error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -10294,7 +10435,14 @@ app.post(
 
         const { error: tenantUpdateErr } = await supabase
           .from("tenants")
-          .update({ plan_slug: normalizePlanSlug(subscription.plan_id) })
+          // is_trial=false: un pago real confirmado por Flow saca al
+          // tenant del trial sin importar lo que diga is_trial hoy (ver
+          // getAccountStatus, que igual no confia en este campo para
+          // nada nuevo — esto es solo para dejarlo consistente).
+          .update({
+            plan_slug: normalizePlanSlug(subscription.plan_id),
+            is_trial: false,
+          })
           .eq("id", subscription.tenant_id);
 
         if (tenantUpdateErr) {
