@@ -10694,7 +10694,7 @@ app.post("/billing/flow/cancel-subscription", tenantAuthWrite, async (req, res) 
       .from("subscriptions")
       .select("id, status, flow_subscription_id")
       .eq("tenant_id", tenant_id)
-      .in("status", ["active", "card_registered"])
+      .in("status", ["active", "card_registered", "trialing"])
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
