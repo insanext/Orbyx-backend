@@ -150,6 +150,16 @@ Implemented 2026-08-01. Confirmation + reminder only — WhatsApp AI conversatio
 - **Debug logging still live in prod as of 2026-08-02**: `server.js`'s WA confirmation block (in `POST /appointments/slot`) and `whatsapp.js`'s `sendWhatsAppTemplate` both have verbose `[WA] ...` console logs added while chasing the double-prefix bug and error 63016 (raw Twilio payload, raw response/error, cupo check results, a 15s manual timeout via `Promise.race` since the Twilio SDK v6 client exposes no timeout option without a custom `httpClient`). None of this is gated behind a debug flag — it logs on every real send. Worth trimming once the integration is confirmed stable in production, but intentionally left in for now since active troubleshooting is still ongoing (see error 63016 below).
 - **Known unresolved issue as of 2026-08-02**: confirmation sends reach Twilio (`queued`/`sent` in Twilio Console) but end up `Undelivered`/`Failed` with error 63016 ("Outside messaging window. For WhatsApp, use a Message Template instead."), despite `contentSid`/`contentVariables` being sent correctly (verified: no `body`/`mediaUrl` mixed in, correct JSON-string format). Per Twilio's own docs this error can fire even with a valid `contentSid` if the underlying Content Template's WhatsApp approval status isn't actually "Approved", or its content type isn't eligible for business-initiated messages. **Needs to be checked in Twilio Console → Content Template Builder** for `TEMPLATE_CONFIRMACION_SID` (`HX01cc29af2e1cca0a1e12a88c6bb9a0f6`) — this is a Twilio/Meta-side config check, not a code fix.
 
+## Account Status Widget — Realtime Cupo (added 2026-08-02)
+
+`orbyx-web/components/billing/AccountStatusWidget.tsx`'s "Estado de mi cuenta" dropdown now updates its `wa_confirmacion`/`ia_wa` usage pills live instead of only on initial fetch.
+
+- Subscribes to `postgres_changes` (`event: "*"`) on `tenant_monthly_usage`, filtered by `tenant_id=eq.${tenantId}`, in a `useEffect` gated on `open` (the dropdown's open state) — subscribes on open, `supabase.removeChannel()` on close/unmount. Reuses the exact same channel pattern already established in `dashboard/[slug]/layout.tsx`'s appointment-notification channel, not a new one.
+- Incoming rows are matched against the current `YYYY-MM` period client-side (`row.period !== currentPeriod` rows are ignored) and stored in a local `liveUsage` override map, layered on top of (not replacing) the `status` object from `useAccountStatus` — keeps the initial-fetch hook untouched.
+- A brief boxShadow pulse (900ms, `pulseField` state) highlights whichever pill (`wa_confirmacion` or `ia_wa`) just changed.
+- Threshold-based alert coloring (`getUsageAlertState`, both counters, independent): `<80%` normal, `80–99%` amber + "Cerca del límite", `>=100%` red + "Cupo agotado este mes". Replaced the old ad-hoc `nearLimit` (remaining ≤ 10%) heuristic.
+- **Requires `2026-08-02-tenant-monthly-usage-rls.sql` to actually be run** — without RLS + the table being in the `supabase_realtime` publication, either no events arrive at all (table not in publication) or, worse, events arrive for every tenant, not just the current one (RLS not enabled) — see Security Rules above. Not yet confirmed as run against prod as of session end.
+
 ## Business Categories
 
 Known categories:
@@ -183,6 +193,7 @@ Preserve:
 | `orbyx-web/lib/use-theme.ts` | Dashboard theme: `clasico`, `nocturno`, `orbyx-dashboard-theme`, `data-theme` |
 | `email.js` | Booking confirmation email |
 | `whatsapp.js` | WhatsApp confirmation/reminder send (Twilio) |
+| `orbyx-web/components/billing/AccountStatusWidget.tsx` | Account status pill/dropdown, WA notification toggles, Realtime cupo subscription |
 
 ## Security Rules
 
@@ -190,6 +201,7 @@ Preserve:
 - Validate tenant ownership before mutating branches, staff, services, appointments, customers, or pets.
 - Preserve cancel token checks for public cancellation.
 - Keep uploads server-side and validate file type, size, and ownership when modifying upload behavior.
+- **Supabase Realtime tenant isolation**: a client-side `filter: tenant_id=eq.X` on a `postgres_changes` subscription is NOT a security boundary by itself — Realtime only respects it if the table has RLS enabled with a matching SELECT policy. Before adding a new Realtime subscription from the frontend (anon-key client) on any table, confirm RLS is enabled with a tenant-scoped policy; don't assume the client-side filter is sufficient. `tenant_monthly_usage` was fixed this way in `2026-08-02-tenant-monthly-usage-rls.sql`. `appointments` (already used for Realtime in `dashboard/[slug]/layout.tsx`'s notification bell) was found to have the same gap during that work and is still unresolved — see Known Risks.
 
 ## Important Commands
 
@@ -226,4 +238,5 @@ Documentation-only changes require no build or deploy.
 - `requireWriteAccess` granular per-module permission enforcement is RESOLVED (commit `dd04e05`, 2026-07-05) — do not re-open as pending.
 - Any new dashboard write endpoint guarded only by `[dashboardLimiter, requireTenantAuth, requireWriteAccess]` (not via the `tenantAuthWrite`/`tenantAuthSlugWrite`/`tenantAuthParamWrite` composites) will NOT have `role`/`tenant_id`/`permissions` populated, since only the composites call `resolveTenantMembership`. Use `requireTenantWriteAccessForResource(req, res, resourceTenantId, moduleKey)` (defined next to `resolveTenantMembership`) after fetching the resource, before mutating it.
 - PENDING before public launch: no screen in the product (checkout-premium, or the "Suscribirme" button in `dashboard/[slug]/billing`) shows a real recurring-charge consent checkbox/legal text before redirecting to Flow's card form. `texto_autorizacion_version` is hardcoded to `"v1"` in `POST /billing/flow/create-customer` calls — pre-existing gap, not introduced by the Suscribirme button, just not made worse by it. Needs a real consent UI before relying on `consentimiento` for anything legally meaningful.
+- **`appointments` table has no RLS policy (found 2026-08-02, not yet fixed)** despite already being used for Supabase Realtime (`dashboard/[slug]/layout.tsx`'s notification bell, filtered client-side by `tenant_id`). Since a client-side Realtime filter isn't a security boundary without a matching RLS SELECT policy, any authenticated dashboard user could potentially subscribe to another tenant's `appointments` INSERT/UPDATE events (customer names, phones, appointment times) — verify live in Supabase Dashboard before assuming it's actually exploitable (repo `.sql` files can lag prod state), then fix following the same pattern as `2026-08-02-tenant-monthly-usage-rls.sql`. A background task was flagged for this; check before redoing the investigation from scratch.
 
