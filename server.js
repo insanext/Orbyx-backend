@@ -19,6 +19,11 @@ const {
   sendSignupRecoveryEmail,
   sendSignupStuckAlertEmail,
 } = require("./email");
+const {
+  sendWhatsAppTemplate,
+  formatDateCL,
+  formatTimeCL,
+} = require("./whatsapp");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -5362,13 +5367,13 @@ if (customerData && typeof customerData === "object" && Object.keys(customerData
       `https://www.orbyx.cl/cancel/${apptUpdated.id}?token=${cancelToken}` +
       `&redirect=${encodeURIComponent(bookingUrl)}`;
 
-if (normalizedEmail) {
-  const { data: tenantInfo } = await supabase
+const { data: tenantInfo } = await supabase
   .from("tenants")
-  .select("name, address, phone, business_category")
+  .select("name, address, phone, business_category, wa_confirmation_enabled")
   .eq("id", cal.tenant_id)
   .single();
 
+if (normalizedEmail) {
 const emailCustomerData = req.body?.customer_data || {};
 
 await sendBookingEmail({
@@ -5384,6 +5389,38 @@ await sendBookingEmail({
   petName: petName || null,
   petSpecies: petSpecies || null,
 });
+}
+
+// Confirmación por WhatsApp — best-effort, nunca bloquea la creación de la
+// cita. Si el tenant no tiene el toggle activo o ya superó su cupo mensual
+// (wa_confirmacion, compartido con el recordatorio), simplemente se omite.
+if (tenantInfo?.wa_confirmation_enabled) {
+  const waUsage = await checkMonthlyUsage(cal.tenant_id, "wa_confirmacion");
+  if (waUsage.allowed) {
+    const waResult = await sendWhatsAppTemplate({
+      to: normalizedPhone,
+      contentSid: process.env.TEMPLATE_CONFIRMACION_SID,
+      variables: {
+        1: String(customer_name).trim(),
+        2: tenantInfo?.name || "Tu negocio",
+        3: formatDateCL(start),
+        4: formatTimeCL(start),
+        5: tenantInfo?.address || serviceName || "",
+      },
+    });
+    if (waResult.ok) {
+      await incrementMonthlyUsage(cal.tenant_id, "wa_confirmacion");
+    } else {
+      console.warn(
+        `WhatsApp confirmación no enviado (tenant ${cal.tenant_id}):`,
+        waResult.reason
+      );
+    }
+  } else {
+    console.warn(
+      `WhatsApp confirmación omitido: tenant ${cal.tenant_id} alcanzó su cupo mensual (wa_confirmacion).`
+    );
+  }
 }
 
     return res.status(201).json({
@@ -11677,6 +11714,9 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
       max_booking_days_ahead,
       business_category,
       business_subcategory,
+      wa_confirmation_enabled,
+      wa_reminder_enabled,
+      wa_reminder_hours_before,
     } = req.body;
 
     if (!id) {
@@ -11868,6 +11908,17 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
         }),
         ...(business_subcategory !== undefined && {
           business_subcategory: business_subcategory ? String(business_subcategory).trim().toLowerCase() : null,
+        }),
+        ...(wa_confirmation_enabled !== undefined && {
+          wa_confirmation_enabled: Boolean(wa_confirmation_enabled),
+        }),
+        ...(wa_reminder_enabled !== undefined && {
+          wa_reminder_enabled: Boolean(wa_reminder_enabled),
+        }),
+        ...(wa_reminder_hours_before !== undefined && {
+          wa_reminder_hours_before: [1, 2].includes(Number(wa_reminder_hours_before))
+            ? Number(wa_reminder_hours_before)
+            : 1,
         }),
         ...(newSlug ? { slug: newSlug } : {}),
       })
@@ -13230,6 +13281,120 @@ app.get("/jobs/send-reminders", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+/* ======================================================
+   🔔 RECORDATORIO POR WHATSAPP (1h/2h antes, por tenant)
+   Pensado para un cron externo (cron-job.org) cada 15-30 min, con el
+   mismo header x-maintenance-secret que /signup/maintenance/sweep y
+   /billing/addons/maintenance/charge-recurring.
+====================================================== */
+app.post(
+  "/whatsapp/maintenance/send-reminders",
+  publicLimiter,
+  requireSignupMaintenanceSecret,
+  async (req, res) => {
+    try {
+      const now = new Date();
+      // Debe ser >= al intervalo real del cron externo, para no dejar citas
+      // sin cubrir entre una corrida y la siguiente.
+      const marginMs = 30 * 60 * 1000;
+
+      // Ventana amplia que cubre tanto reminder_hours=1 como =2 (+ margen).
+      // El filtro fino por tenant (horas exactas configuradas) se hace
+      // abajo, fila por fila, porque reminder_hours varía por tenant.
+      const windowStart = new Date(now.getTime() + 1 * 60 * 60 * 1000);
+      const windowEnd = new Date(now.getTime() + 2 * 60 * 60 * 1000 + marginMs);
+
+      const { data: appointments, error } = await supabase
+        .from("appointments")
+        .select("id, tenant_id, customer_name, customer_phone, start_at")
+        .eq("status", "booked")
+        .eq("wa_recordatorio_enviado", false)
+        .gte("start_at", windowStart.toISOString())
+        .lte("start_at", windowEnd.toISOString());
+
+      if (error) {
+        return res.status(500).json({ error: error.message });
+      }
+
+      let sent = 0;
+      let skippedByCap = 0;
+
+      for (const appt of appointments || []) {
+        if (!appt.customer_phone) continue;
+
+        const { data: tenantInfo } = await supabase
+          .from("tenants")
+          .select("name, address, wa_reminder_enabled, wa_reminder_hours_before")
+          .eq("id", appt.tenant_id)
+          .single();
+
+        if (!tenantInfo?.wa_reminder_enabled) continue;
+
+        const reminderHours = [1, 2].includes(Number(tenantInfo.wa_reminder_hours_before))
+          ? Number(tenantInfo.wa_reminder_hours_before)
+          : 1;
+
+        const targetSendAt = new Date(
+          new Date(appt.start_at).getTime() - reminderHours * 60 * 60 * 1000
+        );
+
+        // Todavía no llega la hora de enviar este recordatorio en particular.
+        if (now.getTime() < targetSendAt.getTime()) continue;
+        // Ya pasó la ventana de margen (el cron se atrasó o esta cita quedó
+        // fuera de rango) — no reenviar fuera de tiempo.
+        if (now.getTime() > targetSendAt.getTime() + marginMs) continue;
+
+        const waUsage = await checkMonthlyUsage(appt.tenant_id, "wa_confirmacion");
+        if (!waUsage.allowed) {
+          console.warn(
+            `WhatsApp recordatorio omitido: tenant ${appt.tenant_id} alcanzó su cupo mensual (wa_confirmacion).`
+          );
+          skippedByCap++;
+          continue;
+        }
+
+        const waResult = await sendWhatsAppTemplate({
+          to: appt.customer_phone,
+          contentSid: process.env.TEMPLATE_RECORDATORIO_SID,
+          variables: {
+            1: appt.customer_name || "",
+            2: tenantInfo.name || "Tu negocio",
+            3: formatTimeCL(appt.start_at),
+            4: tenantInfo.address || "",
+          },
+        });
+
+        if (!waResult.ok) {
+          console.warn(
+            `WhatsApp recordatorio no enviado (tenant ${appt.tenant_id}):`,
+            waResult.reason
+          );
+          continue;
+        }
+
+        await incrementMonthlyUsage(appt.tenant_id, "wa_confirmacion");
+
+        // Se marca enviado ANTES que nada más pueda fallar después: evita
+        // reenvíos si el cron vuelve a correr dentro de la misma ventana.
+        await supabase
+          .from("appointments")
+          .update({ wa_recordatorio_enviado: true })
+          .eq("id", appt.id);
+
+        sent++;
+      }
+
+      return res.json({
+        ok: true,
+        reminders_sent: sent,
+        skipped_by_cap: skippedByCap,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 /* ======================================================
    ✅ ONBOARDING SETUP

@@ -10,6 +10,7 @@ Orbyx is a multi-tenant SaaS booking platform.
 - Backend: Node.js + Express monolith in root `server.js`.
 - Database/storage: Supabase.
 - Email: Resend through `email.js`.
+- WhatsApp: Twilio through `whatsapp.js` (Content Templates, confirmation + reminder only — see "WhatsApp (Twilio) Integration" below).
 - Calendar: Google Calendar OAuth/API, using `calendar_connections` and legacy `calendar_tokens`.
 
 Most business logic lives in `server.js`. Most frontend dashboard/public pages are client components with page-local state and direct `fetch`.
@@ -123,6 +124,22 @@ Google Calendar failure must not delete a valid local booking.
 - Veterinary close flow creates followups and marks appointments completed.
 - Agenda visual availability is not the source of truth; backend booking validation is.
 
+## WhatsApp (Twilio) Integration
+
+Implemented 2026-08-01. Confirmation + reminder only — WhatsApp AI conversational (`max_ia_wa`) is a separate, not-yet-implemented piece.
+
+- Send wrapper: `whatsapp.js`, `sendWhatsAppTemplate({ to, contentSid, variables })` — mirrors `email.js`'s error-isolation pattern exactly: internal try/catch, never throws, returns `{ ok, reason }`. `to` must already be E.164 with `+` (e.g. `+56912345678`); the `whatsapp:` prefix is added inside the function. `variables` is a plain object with numeric keys (`{ 1: "...", 2: "..." }`), JSON.stringify'd into Twilio's `contentVariables`.
+- Twilio client uses API Key auth (`twilio(TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, { accountSid: TWILIO_ACCOUNT_SID })`), not the classic auth token. Sends directly from `TWILIO_WHATSAPP_NUMBER` (assumed to already include `+`) — no Messaging Service SID is used or required.
+- Env vars (already set in Render, redeployed 2026-08-01): `TWILIO_ACCOUNT_SID`, `TWILIO_API_KEY_SID`, `TWILIO_API_KEY_SECRET`, `TWILIO_WHATSAPP_NUMBER`, `TEMPLATE_CONFIRMACION_SID`, `TEMPLATE_RECORDATORIO_SID`.
+- Two independent per-tenant toggles, plain columns on `tenants` (no JSON settings bag — matches the table's existing convention): `wa_confirmation_enabled` (bool, default false), `wa_reminder_enabled` (bool, default false), `wa_reminder_hours_before` (smallint, 1 or 2, default 1). All default OFF for every tenant — nothing sends until explicitly enabled. Exposed through `PATCH /tenants/:id` (same conditional-spread pattern as `business_category`/`business_subcategory`) but **there is no dashboard UI yet** to flip them — activate per tenant via direct SQL until a settings screen is built.
+- Confirmation (event-driven): hooked into `POST /appointments/slot` right after the existing Resend email call. Checks `tenants.wa_confirmation_enabled`, then `checkMonthlyUsage(tenant_id, "wa_confirmacion")` before sending; increments via `incrementMonthlyUsage` only on a successful send. Template vars in order: `{{1}}` customer name, `{{2}}` business name, `{{3}}` date (`formatDateCL`), `{{4}}` time (`formatTimeCL`), `{{5}}` address or service name as fallback.
+- Reminder (time-driven cron): `POST /whatsapp/maintenance/send-reminders`, guarded by the existing `requireSignupMaintenanceSecret` + `publicLimiter` (same pattern/secret as `/signup/maintenance/sweep` and `/billing/addons/maintenance/charge-recurring` — header `x-maintenance-secret`, env var `SIGNUP_MAINTENANCE_SECRET`). Meant to be hit by an external cron (cron-job.org) every 15-30 min. Pulls `booked` appointments with `wa_recordatorio_enviado = false` inside a wide window (`now+1h` to `now+2h+30min`), then per-row resolves the tenant's actual `wa_reminder_hours_before` and only sends if `now` falls inside that specific target-time ± 30min margin. Sets `appointments.wa_recordatorio_enviado = true` right after a successful send to prevent duplicate sends across cron runs. Template vars in order: `{{1}}` customer name, `{{2}}` business name, `{{3}}` time, `{{4}}` address.
+- **Confirmation and reminder share one monthly counter**: both call `checkMonthlyUsage`/`incrementMonthlyUsage` with resource `"wa_confirmacion"` — this matches the existing `addon_config` addon definition (`"WA confirmación+recordatorio"`, `grants: { wa_confirmacion: 50 }`) which was already designed for a shared pool, not two separate counters. `plan_config.max_wa_confirmacion` is the per-plan base cap; `GET /billing/account-status` and `GET /billing/addons` already read/display this counter and needed no changes.
+- Both send paths are best-effort and never block/break their caller: a missing toggle, an exhausted cupo, or a Twilio failure all just `console.warn` and continue — appointment creation and the reminder loop are unaffected.
+- Migration: `2026-08-01-whatsapp-twilio-toggles.sql` (repo root) — adds the 3 `tenants` columns, `appointments.wa_recordatorio_enviado`, and a partial index for the reminder cron's query.
+- **Known gap**: `GET /jobs/send-reminders` (the pre-existing 24h *email* reminder job, unrelated to this WhatsApp reminder) has no auth check at all — flagged but intentionally not touched this session, since it's a separate pre-existing concern.
+- **Not built this session (explicitly out of scope)**: no dashboard UI for the 2 toggles; WhatsApp AI conversational (`max_ia_wa`) sending — that's Piece 2, future session.
+
 ## Business Categories
 
 Known categories:
@@ -155,6 +172,7 @@ Preserve:
 | `orbyx-web/app/dashboard/[slug]/business/page.tsx` | Business settings, hours, booking fields |
 | `orbyx-web/lib/use-theme.ts` | Dashboard theme: `clasico`, `nocturno`, `orbyx-dashboard-theme`, `data-theme` |
 | `email.js` | Booking confirmation email |
+| `whatsapp.js` | WhatsApp confirmation/reminder send (Twilio) |
 
 ## Security Rules
 
