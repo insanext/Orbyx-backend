@@ -37,6 +37,12 @@ function toWhatsAppAddress(value) {
   return trimmed.startsWith("whatsapp:") ? trimmed : `whatsapp:${trimmed}`;
 }
 
+// Mismo dominio self-referencing que ya usan los callbacks de Flow en
+// server.js (urlCallback/url_return apuntan a orbyx-backend.onrender.com
+// hardcodeado). Twilio hace POST acá cada vez que cambia el status del
+// mensaje (queued -> sent -> delivered/read, o failed/undelivered).
+const STATUS_CALLBACK_URL = "https://orbyx-backend.onrender.com/whatsapp/status-callback";
+
 // Envía un mensaje de WhatsApp usando un Content Template ya aprobado.
 // `to` debe venir en formato E.164 con "+" (ej: +56912345678). Nunca lanza:
 // siempre devuelve { ok, reason } para que el flujo que llama (creación de
@@ -65,6 +71,7 @@ async function sendWhatsAppTemplate({ to, contentSid, variables }) {
       contentVariables: JSON.stringify(variables || {}),
       from: toWhatsAppAddress(process.env.TWILIO_WHATSAPP_NUMBER),
       to: toWhatsAppAddress(to),
+      statusCallback: STATUS_CALLBACK_URL,
     };
 
     // Payload completo, tal cual se manda a Twilio — para confirmar

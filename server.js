@@ -11,6 +11,7 @@ const rateLimit = require("express-rate-limit");
 const { google } = require("googleapis");
 const crypto = require("crypto");
 const PDFDocument = require("pdfkit");
+const twilio = require("twilio");
 const {
   sendBookingEmail,
   sendInvitationEmail,
@@ -663,6 +664,21 @@ async function incrementMonthlyUsage(tenant_id, resource, amount = 1) {
     }
   } catch (err) {
     console.warn("incrementMonthlyUsage error:", err.message);
+  }
+}
+
+// Registra un envío de WhatsApp en whatsapp_message_log para que el cupo
+// mensual (tenant_monthly_usage) se descuente recién cuando Twilio confirme
+// "delivered" vía POST /whatsapp/status-callback, no en el momento del
+// intento de envío — un intento que termina failed/undelivered (ej. error
+// 63016) no debe consumir cupo real.
+async function trackWhatsAppMessage({ messageSid, tenantId, resource }) {
+  try {
+    await supabase
+      .from("whatsapp_message_log")
+      .insert({ message_sid: messageSid, tenant_id: tenantId, resource });
+  } catch (err) {
+    console.warn("trackWhatsAppMessage error:", err.message);
   }
 }
 
@@ -5421,7 +5437,11 @@ if (tenantInfo?.wa_confirmation_enabled) {
       },
     });
     if (waResult.ok) {
-      await incrementMonthlyUsage(cal.tenant_id, "wa_confirmacion");
+      await trackWhatsAppMessage({
+        messageSid: waResult.sid,
+        tenantId: cal.tenant_id,
+        resource: "wa_confirmacion",
+      });
     } else {
       console.warn(
         `WhatsApp confirmación no enviado (tenant ${cal.tenant_id}):`,
@@ -13441,7 +13461,11 @@ app.post(
           continue;
         }
 
-        await incrementMonthlyUsage(appt.tenant_id, "wa_confirmacion");
+        await trackWhatsAppMessage({
+          messageSid: waResult.sid,
+          tenantId: appt.tenant_id,
+          resource: "wa_confirmacion",
+        });
 
         // Se marca enviado ANTES que nada más pueda fallar después: evita
         // reenvíos si el cron vuelve a correr dentro de la misma ventana.
@@ -13460,6 +13484,84 @@ app.post(
       });
     } catch (err) {
       return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+/* ======================================================
+   🔔 POST /whatsapp/status-callback
+   Twilio llama este endpoint (x-www-form-urlencoded) cada vez que cambia
+   el status de un mensaje enviado (queued -> sent -> delivered/read, o
+   failed/undelivered) — configurado como `statusCallback` en
+   whatsapp.js. El cupo mensual (tenant_monthly_usage) se descuenta
+   RECIÉN ACÁ, cuando el status llega a "delivered" — no en el momento
+   del intento de envío — para que un envío que Twilio acepta (queued/sent)
+   pero termina failed/undelivered (ej. error 63016) no consuma cupo real.
+   Autenticación: firma X-Twilio-Signature (HMAC-SHA1 con el Auth Token
+   clásico de la cuenta — TWILIO_AUTH_TOKEN, distinto de las API Key usadas
+   para enviar). Es el mecanismo que Twilio mismo recomienda para verificar
+   que un webhook realmente vino de ellos; no se usa el patrón de secreto
+   compartido (x-maintenance-secret) porque Twilio no permite mandar
+   headers custom en un Status Callback, solo la URL.
+====================================================== */
+app.post(
+  "/whatsapp/status-callback",
+  publicLimiter,
+  express.urlencoded({ extended: true }),
+  async (req, res) => {
+    // Siempre responder rápido — Twilio no necesita saber qué hicimos
+    // internamente, y no queremos que reintente por un error nuestro.
+    try {
+      const authToken = process.env.TWILIO_AUTH_TOKEN;
+      if (!authToken) {
+        console.error(
+          "POST /whatsapp/status-callback: TWILIO_AUTH_TOKEN no configurado — no se puede validar el origen, request ignorada"
+        );
+        return res.status(200).send();
+      }
+
+      const twilioSignature = req.headers["x-twilio-signature"];
+      const callbackUrl = "https://orbyx-backend.onrender.com/whatsapp/status-callback";
+      const isValid =
+        typeof twilioSignature === "string" &&
+        twilio.validateRequest(authToken, twilioSignature, callbackUrl, req.body);
+
+      if (!isValid) {
+        console.warn("POST /whatsapp/status-callback: firma inválida, request descartada");
+        return res.status(403).send();
+      }
+
+      const messageSid = req.body?.MessageSid;
+      const messageStatus = req.body?.MessageStatus;
+
+      if (!messageSid || !messageStatus) {
+        return res.status(200).send();
+      }
+
+      const { data: logRow } = await supabase
+        .from("whatsapp_message_log")
+        .select("id, tenant_id, resource, counted")
+        .eq("message_sid", messageSid)
+        .maybeSingle();
+
+      if (!logRow) {
+        // Mensaje que no rastreamos nosotros (no debería pasar) — no reventar.
+        return res.status(200).send();
+      }
+
+      const updates = { status: messageStatus, updated_at: new Date().toISOString() };
+
+      if (messageStatus === "delivered" && !logRow.counted) {
+        await incrementMonthlyUsage(logRow.tenant_id, logRow.resource);
+        updates.counted = true;
+      }
+
+      await supabase.from("whatsapp_message_log").update(updates).eq("id", logRow.id);
+
+      return res.status(200).send();
+    } catch (err) {
+      console.error("POST /whatsapp/status-callback error:", err.message);
+      return res.status(200).send();
     }
   }
 );
