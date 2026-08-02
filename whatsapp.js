@@ -67,9 +67,11 @@ async function sendWhatsAppTemplate({ to, contentSid, variables }) {
       to: toWhatsAppAddress(to),
     };
 
-    console.log(
-      `[WA] Llamando a Twilio messages.create — from=${payload.from} to=${payload.to} contentSid=${payload.contentSid}`
-    );
+    // Payload completo, tal cual se manda a Twilio — para confirmar
+    // visualmente que solo viaja contentSid + contentVariables (nunca
+    // body/mediaUrl mezclados, que es la causa más común del error 63016
+    // incluso cuando se usa un template).
+    console.log("[WA] Payload completo a Twilio:", JSON.stringify(payload));
 
     // El SDK de Twilio (v6) no expone un timeout configurable en el
     // constructor público sin implementar un httpClient custom. En vez de
