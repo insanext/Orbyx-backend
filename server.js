@@ -9561,7 +9561,9 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
 
     const { data: tenant, error: tenantErr } = await supabase
       .from("tenants")
-      .select("id, plan_slug, trial_ends_at, billing_cycle_end")
+      .select(
+        "id, plan_slug, trial_ends_at, billing_cycle_end, wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before"
+      )
       .eq("id", tenant_id)
       .single();
 
@@ -9645,6 +9647,11 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       blocked_reason: !blocked ? null : trialExpired ? "trial_expired" : "payment_overdue",
       wa_confirmacion: usageEntry(caps.max_wa_confirmacion, "wa_confirmacion"),
       ia_wa: usageEntry(caps.max_ia_wa, "ia_wa"),
+      wa_confirmation_enabled: Boolean(tenant.wa_confirmation_enabled),
+      wa_reminder_enabled: Boolean(tenant.wa_reminder_enabled),
+      wa_reminder_hours_before: [1, 2].includes(Number(tenant.wa_reminder_hours_before))
+        ? Number(tenant.wa_reminder_hours_before)
+        : 1,
     });
   } catch (err) {
     console.error("GET /billing/account-status error:", err.message);
@@ -11948,6 +11955,55 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
       tenant: data,
       ...(newSlug ? { slug: newSlug } : {}),
     });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ PATCH /tenants/:id/whatsapp-settings
+   Endpoint chico y aislado (no reusa PATCH /tenants/:id) a propósito:
+   PATCH /tenants/:id exige `name` y pone en null cualquier otro campo
+   opcional que no venga en el body — perfecto para el formulario
+   completo de Negocio, pero destructivo si se llamara con un payload
+   parcial de solo estos 3 toggles desde un widget chico (borraría
+   phone/address/email/logo/etc. del tenant). Este endpoint solo toca
+   wa_confirmation_enabled, wa_reminder_enabled y wa_reminder_hours_before.
+====================================================== */
+app.patch("/tenants/:id/whatsapp-settings", tenantAuthParamWrite, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before } = req.body;
+
+    const updates = {};
+    if (wa_confirmation_enabled !== undefined) {
+      updates.wa_confirmation_enabled = Boolean(wa_confirmation_enabled);
+    }
+    if (wa_reminder_enabled !== undefined) {
+      updates.wa_reminder_enabled = Boolean(wa_reminder_enabled);
+    }
+    if (wa_reminder_hours_before !== undefined) {
+      updates.wa_reminder_hours_before = [1, 2].includes(Number(wa_reminder_hours_before))
+        ? Number(wa_reminder_hours_before)
+        : 1;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: "Nada para actualizar" });
+    }
+
+    const { data, error } = await supabase
+      .from("tenants")
+      .update(updates)
+      .eq("id", id)
+      .select("wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before")
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({ ok: true, ...data });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
