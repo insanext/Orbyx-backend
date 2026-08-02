@@ -5367,11 +5367,19 @@ if (customerData && typeof customerData === "object" && Object.keys(customerData
       `https://www.orbyx.cl/cancel/${apptUpdated.id}?token=${cancelToken}` +
       `&redirect=${encodeURIComponent(bookingUrl)}`;
 
-const { data: tenantInfo } = await supabase
+const { data: tenantInfo, error: tenantInfoError } = await supabase
   .from("tenants")
   .select("name, address, phone, business_category, wa_confirmation_enabled")
   .eq("id", cal.tenant_id)
   .single();
+
+// Log incondicional (no depende de que el toggle esté activo) para poder
+// confirmar en los logs de Render que el código SÍ llega hasta acá y qué
+// valor real leyó, sin tener que adivinar si el bloque de abajo se está
+// saltando en silencio.
+console.log(
+  `[WA] tenant=${cal.tenant_id} wa_confirmation_enabled=${tenantInfo?.wa_confirmation_enabled} tenantInfoError=${tenantInfoError?.message || "none"}`
+);
 
 if (normalizedEmail) {
 const emailCustomerData = req.body?.customer_data || {};
@@ -5395,7 +5403,11 @@ await sendBookingEmail({
 // cita. Si el tenant no tiene el toggle activo o ya superó su cupo mensual
 // (wa_confirmacion, compartido con el recordatorio), simplemente se omite.
 if (tenantInfo?.wa_confirmation_enabled) {
+  console.log(`[WA] Intentando enviar WhatsApp de confirmación para tenant ${cal.tenant_id}`);
   const waUsage = await checkMonthlyUsage(cal.tenant_id, "wa_confirmacion");
+  console.log(
+    `[WA] cupo tenant=${cal.tenant_id} allowed=${waUsage.allowed} used=${waUsage.used} limit=${waUsage.limit}`
+  );
   if (waUsage.allowed) {
     const waResult = await sendWhatsAppTemplate({
       to: normalizedPhone,
