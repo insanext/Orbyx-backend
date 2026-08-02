@@ -682,6 +682,78 @@ async function trackWhatsAppMessage({ messageSid, tenantId, resource }) {
   }
 }
 
+// Envía la confirmación de reserva (email + WhatsApp) — extraído de
+// POST /appointments/slot para poder reutilizarlo EXACTO (mismos templates,
+// misma lógica de cupo) desde POST /appointments/:id/deposit/confirm, sin
+// duplicar código ni crear nada nuevo en Twilio. `startAt` acepta Date o
+// string ISO. `petName`/`petSpecies` son opcionales — al confirmar un
+// depósito no se re-resuelven desde la mascota (limitación conocida, ver
+// CLAUDE.md: la confirmación disparada desde ahí sale sin datos de mascota
+// incluso para tenants veterinarios).
+async function sendBookingConfirmations({
+  tenantId,
+  tenantInfo,
+  customerName,
+  normalizedEmail,
+  normalizedPhone,
+  serviceName,
+  startAt,
+  cancelUrl,
+  petName,
+  petSpecies,
+}) {
+  const start = startAt instanceof Date ? startAt : new Date(startAt);
+
+  if (normalizedEmail) {
+    await sendBookingEmail({
+      email: normalizedEmail,
+      customerName,
+      businessName: tenantInfo?.name || "Tu negocio",
+      serviceName: serviceName || "Reserva",
+      startAt: start.toISOString(),
+      cancelUrl,
+      address: tenantInfo?.address || null,
+      phone: tenantInfo?.phone || null,
+      businessCategory: tenantInfo?.business_category || null,
+      petName: petName || null,
+      petSpecies: petSpecies || null,
+    });
+  }
+
+  // Confirmación por WhatsApp — best-effort, nunca bloquea al caller. Si el
+  // tenant no tiene el toggle activo o ya superó su cupo mensual
+  // (wa_confirmacion, compartido con el recordatorio), simplemente se omite.
+  if (tenantInfo?.wa_confirmation_enabled) {
+    console.log(`[WA] Intentando enviar WhatsApp de confirmación para tenant ${tenantId}`);
+    const waUsage = await checkMonthlyUsage(tenantId, "wa_confirmacion");
+    console.log(
+      `[WA] cupo tenant=${tenantId} allowed=${waUsage.allowed} used=${waUsage.used} limit=${waUsage.limit}`
+    );
+    if (waUsage.allowed) {
+      const waResult = await sendWhatsAppTemplate({
+        to: normalizedPhone,
+        contentSid: process.env.TEMPLATE_CONFIRMACION_SID,
+        variables: {
+          1: customerName,
+          2: tenantInfo?.name || "Tu negocio",
+          3: formatDateCL(start),
+          4: formatTimeCL(start),
+          5: tenantInfo?.address || serviceName || "",
+        },
+      });
+      if (waResult.ok) {
+        await trackWhatsAppMessage({ messageSid: waResult.sid, tenantId, resource: "wa_confirmacion" });
+      } else {
+        console.warn(`WhatsApp confirmación no enviado (tenant ${tenantId}):`, waResult.reason);
+      }
+    } else {
+      console.warn(
+        `WhatsApp confirmación omitido: tenant ${tenantId} alcanzó su cupo mensual (wa_confirmacion).`
+      );
+    }
+  }
+}
+
 function getPlanLevel(plan) {
   return PLAN_ORDER[normalizePlanSlug(plan)] || PLAN_ORDER.pro;
 }
@@ -4780,13 +4852,15 @@ const {
 
     const { data: tenantConfig, error: tenantConfigError } = await supabase
       .from("tenants")
-      .select("min_booking_notice_minutes, max_booking_days_ahead")
+      .select("min_booking_notice_minutes, max_booking_days_ahead, deposit_required")
       .eq("id", cal.tenant_id)
       .single();
 
     if (tenantConfigError || !tenantConfig) {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
+
+    const tenantRequiresDeposit = Boolean(tenantConfig.deposit_required);
 
     const minBookingNoticeMinutes = Number(
       tenantConfig.min_booking_notice_minutes || 0
@@ -5109,6 +5183,16 @@ if ((overlappingAppointments || []).length > 0) {
 
     const cancelToken = crypto.randomBytes(24).toString("hex");
 
+    // Depósito previo: la cita se crea "booked" igual que cualquier otra (así
+    // bloquea el horario usando toda la lógica de disponibilidad existente,
+    // sin tocarla) más un estado de revisión aparte con un hold de 15 min.
+    // Ver 2026-08-02-deposit-required.sql para la explicación completa de
+    // por qué no se usa un status nuevo.
+    const DEPOSIT_HOLD_MINUTES = 15;
+    const depositHoldExpiresAt = tenantRequiresDeposit
+      ? new Date(Date.now() + DEPOSIT_HOLD_MINUTES * 60 * 1000).toISOString()
+      : null;
+
     const { data: apptRows, error: insErr } = await supabase
       .from("appointments")
       .insert({
@@ -5131,6 +5215,10 @@ reason: reason || null,
 notes: notes || null,
 next_control_at: next_control_at || null,
         cancel_token: cancelToken,
+        ...(tenantRequiresDeposit && {
+          deposit_status: "pending",
+          deposit_hold_expires_at: depositHoldExpiresAt,
+        }),
       })
       .select("*");
 
@@ -5397,68 +5485,35 @@ console.log(
   `[WA] tenant=${cal.tenant_id} wa_confirmation_enabled=${tenantInfo?.wa_confirmation_enabled} tenantInfoError=${tenantInfoError?.message || "none"}`
 );
 
-if (normalizedEmail) {
-const emailCustomerData = req.body?.customer_data || {};
-
-await sendBookingEmail({
-  email: normalizedEmail,
-  customerName: String(customer_name).trim(),
-  businessName: tenantInfo?.name || "Tu negocio",
-  serviceName: serviceName || "Reserva",
-  startAt: start.toISOString(),
-  cancelUrl,
-  address: tenantInfo?.address || null,
-  phone: tenantInfo?.phone || null,
-  businessCategory: tenantInfo?.business_category || null,
-  petName: petName || null,
-  petSpecies: petSpecies || null,
-});
-}
-
-// Confirmación por WhatsApp — best-effort, nunca bloquea la creación de la
-// cita. Si el tenant no tiene el toggle activo o ya superó su cupo mensual
-// (wa_confirmacion, compartido con el recordatorio), simplemente se omite.
-if (tenantInfo?.wa_confirmation_enabled) {
-  console.log(`[WA] Intentando enviar WhatsApp de confirmación para tenant ${cal.tenant_id}`);
-  const waUsage = await checkMonthlyUsage(cal.tenant_id, "wa_confirmacion");
-  console.log(
-    `[WA] cupo tenant=${cal.tenant_id} allowed=${waUsage.allowed} used=${waUsage.used} limit=${waUsage.limit}`
-  );
-  if (waUsage.allowed) {
-    const waResult = await sendWhatsAppTemplate({
-      to: normalizedPhone,
-      contentSid: process.env.TEMPLATE_CONFIRMACION_SID,
-      variables: {
-        1: String(customer_name).trim(),
-        2: tenantInfo?.name || "Tu negocio",
-        3: formatDateCL(start),
-        4: formatTimeCL(start),
-        5: tenantInfo?.address || serviceName || "",
-      },
-    });
-    if (waResult.ok) {
-      await trackWhatsAppMessage({
-        messageSid: waResult.sid,
-        tenantId: cal.tenant_id,
-        resource: "wa_confirmacion",
-      });
-    } else {
-      console.warn(
-        `WhatsApp confirmación no enviado (tenant ${cal.tenant_id}):`,
-        waResult.reason
-      );
-    }
-  } else {
-    console.warn(
-      `WhatsApp confirmación omitido: tenant ${cal.tenant_id} alcanzó su cupo mensual (wa_confirmacion).`
-    );
-  }
+// Si el tenant exige depósito, la confirmación (email + WhatsApp) NO se
+// manda ahora — se manda recién cuando el tenant aprueba el comprobante
+// desde POST /appointments/:id/deposit/confirm (mismo helper, mismos
+// templates). El cliente ve el estado "pendiente de depósito" en la propia
+// respuesta de este endpoint, sin un mensaje aparte.
+if (!tenantRequiresDeposit) {
+  await sendBookingConfirmations({
+    tenantId: cal.tenant_id,
+    tenantInfo,
+    customerName: String(customer_name).trim(),
+    normalizedEmail,
+    normalizedPhone,
+    serviceName,
+    startAt: start,
+    cancelUrl,
+    petName,
+    petSpecies,
+  });
 }
 
     return res.status(201).json({
       ok: true,
       appointment: apptUpdated,
       cancel_url: cancelUrl,
+      ...(tenantRequiresDeposit && {
+        deposit_required: true,
+        deposit_hold_expires_at: depositHoldExpiresAt,
+        deposit_upload_token: cancelToken,
+      }),
       google: {
         calendarId: googleCalendarId,
         event_id: eventId,
@@ -8675,6 +8730,303 @@ return res.json({
 });
 
 /* ======================================================
+   💰 DEPÓSITO PREVIO — revisión, comprobante, liberación de hold
+   Ver 2026-08-02-deposit-required.sql para la arquitectura completa
+   (por qué no hay un status "pending_deposit" nuevo).
+====================================================== */
+
+// POST /appointments/:id/deposit-receipt
+// Público (llamado desde la página de reservas, sin login) — protegido con
+// el mismo cancel_token que ya existe para la cancelación pública, no un
+// mecanismo nuevo. Solo asocia un path de Storage ya subido; la subida en
+// sí la hace el Next.js API route (upload-deposit-receipt) directo a
+// Supabase Storage, igual que el logo del negocio.
+app.post("/appointments/:id/deposit-receipt", publicLimiter, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { token, receipt_path } = req.body;
+
+    if (!receipt_path || !String(receipt_path).trim()) {
+      return res.status(400).json({ error: "receipt_path es obligatorio" });
+    }
+
+    const { data: appt, error: apptErr } = await supabase
+      .from("appointments")
+      .select("id, cancel_token, deposit_status")
+      .eq("id", id)
+      .single();
+
+    if (apptErr || !appt) {
+      return res.status(404).json({ error: "Reserva no encontrada" });
+    }
+
+    if (!token || !appt.cancel_token || token !== appt.cancel_token) {
+      return res.status(403).json({ error: "Token inválido para esta reserva" });
+    }
+
+    if (appt.deposit_status !== "pending") {
+      return res.status(409).json({
+        error: "Esta reserva ya no está pendiente de depósito.",
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("appointments")
+      .update({ deposit_receipt_path: String(receipt_path).trim() })
+      .eq("id", id)
+      .select("id, deposit_receipt_path")
+      .single();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    return res.json({ ok: true, appointment: data });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /appointments/pending-deposits?tenant_id=X
+// Lista para el panel "Depósitos pendientes" de Agenda y para calcular el
+// badge numérico (el frontend hace COUNT en el cliente sobre este mismo
+// array — es una lista corta por diseño, ya que un hold dura 15 minutos).
+app.get("/appointments/pending-deposits", tenantAuth, async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+
+    const { data, error } = await supabase
+      .from("appointments")
+      .select(
+        "id, customer_name, service_name_snapshot, start_at, deposit_receipt_path, deposit_hold_expires_at, branch_id, staff_id"
+      )
+      .eq("tenant_id", tenant_id)
+      .eq("deposit_status", "pending")
+      .order("deposit_hold_expires_at", { ascending: true });
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    return res.json({ ok: true, deposits: data || [] });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /appointments/:id/deposit-receipt-url
+// Genera un signed URL de corta duración para ver el comprobante — el
+// bucket es privado a propósito (documento financiero), así que nunca hay
+// una URL pública fija guardada en la fila, solo el path.
+app.get(
+  "/appointments/:id/deposit-receipt-url",
+  [dashboardLimiter, requireTenantAuth, requireWriteAccess],
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const { data: appt, error: apptErr } = await supabase
+        .from("appointments")
+        .select("tenant_id, deposit_receipt_path")
+        .eq("id", id)
+        .single();
+
+      if (apptErr || !appt) {
+        return res.status(404).json({ error: "Reserva no encontrada" });
+      }
+
+      const hasAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda");
+      if (!hasAccess) return;
+
+      if (!appt.deposit_receipt_path) {
+        return res.status(404).json({ error: "Esta reserva no tiene comprobante subido" });
+      }
+
+      const { data, error } = await supabase.storage
+        .from("deposit-receipts")
+        .createSignedUrl(appt.deposit_receipt_path, 300);
+
+      if (error) return res.status(500).json({ error: error.message });
+
+      return res.json({ ok: true, url: data.signedUrl });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// POST /appointments/:id/deposit/confirm
+// El tenant aprueba el comprobante: dispara la MISMA confirmación
+// (email + WhatsApp, mismo TEMPLATE_CONFIRMACION_SID) que una reserva
+// normal recibe al crearse, vía sendBookingConfirmations().
+app.post(
+  "/appointments/:id/deposit/confirm",
+  [dashboardLimiter, requireTenantAuth, requireWriteAccess],
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const { data: appt, error: apptErr } = await supabase
+        .from("appointments")
+        .select("*")
+        .eq("id", id)
+        .single();
+
+      if (apptErr || !appt) {
+        return res.status(404).json({ error: "Reserva no encontrada" });
+      }
+
+      const hasAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda");
+      if (!hasAccess) return;
+
+      if (appt.deposit_status !== "pending") {
+        return res.status(409).json({ error: "Este depósito ya no está pendiente de revisión." });
+      }
+
+      const { data: updated, error: updErr } = await supabase
+        .from("appointments")
+        .update({ deposit_status: "confirmed", deposit_hold_expires_at: null })
+        .eq("id", id)
+        .select("*")
+        .single();
+
+      if (updErr) return res.status(500).json({ error: updErr.message });
+
+      const { data: tenantInfo } = await supabase
+        .from("tenants")
+        .select("name, slug, address, phone, business_category, wa_confirmation_enabled")
+        .eq("id", appt.tenant_id)
+        .single();
+
+      const bookingUrl = tenantInfo?.slug
+        ? `https://www.orbyx.cl/${tenantInfo.slug}`
+        : "https://www.orbyx.cl";
+      const cancelUrl =
+        `https://www.orbyx.cl/cancel/${appt.id}?token=${appt.cancel_token}` +
+        `&redirect=${encodeURIComponent(bookingUrl)}`;
+
+      await sendBookingConfirmations({
+        tenantId: appt.tenant_id,
+        tenantInfo,
+        customerName: appt.customer_name,
+        normalizedEmail: appt.customer_email,
+        normalizedPhone: appt.customer_phone,
+        serviceName: appt.service_name_snapshot,
+        startAt: appt.start_at,
+        cancelUrl,
+      });
+
+      return res.json({ ok: true, appointment: updated });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// POST /appointments/:id/deposit/reject
+// Cancela de inmediato (sin esperar el hold de 15 min) y libera el horario.
+// No se envía ningún aviso automático al cliente esta sesión — no existe un
+// Content Template de WhatsApp aprobado para "depósito rechazado" (crear uno
+// requiere aprobación de Meta/Twilio, fuera de alcance hoy) y reutilizar
+// sendBookingEmail no aplica porque su copy es de confirmación, no de
+// rechazo. El tenant contacta al cliente directamente. Queda anotado como
+// mejora futura en CLAUDE.md.
+app.post(
+  "/appointments/:id/deposit/reject",
+  [dashboardLimiter, requireTenantAuth, requireWriteAccess],
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const { data: appt, error: apptErr } = await supabase
+        .from("appointments")
+        .select("*")
+        .eq("id", id)
+        .single();
+
+      if (apptErr || !appt) {
+        return res.status(404).json({ error: "Reserva no encontrada" });
+      }
+
+      const hasAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda");
+      if (!hasAccess) return;
+
+      if (appt.deposit_status !== "pending") {
+        return res.status(409).json({ error: "Este depósito ya no está pendiente de revisión." });
+      }
+
+      await deleteCalendarEventForAppointment(appt);
+
+      const { data: updated, error: updErr } = await supabase
+        .from("appointments")
+        .update({
+          status: "canceled",
+          canceled_at: new Date().toISOString(),
+          deposit_status: "rejected",
+          deposit_hold_expires_at: null,
+        })
+        .eq("id", id)
+        .select("*")
+        .single();
+
+      if (updErr) return res.status(500).json({ error: updErr.message });
+
+      if (updated?.customer_id) {
+        await recalculateCustomerStats(updated.customer_id);
+      }
+
+      return res.json({ ok: true, appointment: updated });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// POST /appointments/maintenance/release-expired-deposits
+// Cron externo (cron-job.org), mismo patrón/secreto que los otros jobs de
+// mantenimiento. Libera (cancela) cualquier cita cuyo hold de 15 min ya
+// venció sin que el tenant la haya confirmado o rechazado.
+app.post(
+  "/appointments/maintenance/release-expired-deposits",
+  publicLimiter,
+  requireSignupMaintenanceSecret,
+  async (req, res) => {
+    try {
+      const nowIso = new Date().toISOString();
+
+      const { data: expired, error } = await supabase
+        .from("appointments")
+        .select("*")
+        .eq("deposit_status", "pending")
+        .lt("deposit_hold_expires_at", nowIso);
+
+      if (error) return res.status(500).json({ error: error.message });
+
+      let released = 0;
+      for (const appt of expired || []) {
+        await deleteCalendarEventForAppointment(appt);
+
+        await supabase
+          .from("appointments")
+          .update({
+            status: "canceled",
+            canceled_at: new Date().toISOString(),
+            deposit_status: "expired",
+            deposit_hold_expires_at: null,
+          })
+          .eq("id", appt.id);
+
+        if (appt.customer_id) {
+          await recalculateCustomerStats(appt.customer_id);
+        }
+
+        released++;
+      }
+
+      return res.json({ ok: true, released });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+/* ======================================================
    ✅ CANCEL (DELETE y POST compat)
 ====================================================== */
 async function cancelById(id, token, res) {
@@ -9582,7 +9934,7 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     const { data: tenant, error: tenantErr } = await supabase
       .from("tenants")
       .select(
-        "id, plan_slug, trial_ends_at, billing_cycle_end, wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before"
+        "id, plan_slug, trial_ends_at, billing_cycle_end, wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name"
       )
       .eq("id", tenant_id)
       .single();
@@ -9672,6 +10024,12 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       wa_reminder_hours_before: [1, 2].includes(Number(tenant.wa_reminder_hours_before))
         ? Number(tenant.wa_reminder_hours_before)
         : 1,
+      deposit_required: Boolean(tenant.deposit_required),
+      deposit_bank_name: tenant.deposit_bank_name || "",
+      deposit_account_type: tenant.deposit_account_type || "",
+      deposit_account_number: tenant.deposit_account_number || "",
+      deposit_holder_rut: tenant.deposit_holder_rut || "",
+      deposit_holder_name: tenant.deposit_holder_name || "",
     });
   } catch (err) {
     console.error("GET /billing/account-status error:", err.message);
@@ -12017,6 +12375,73 @@ app.patch("/tenants/:id/whatsapp-settings", tenantAuthParamWrite, async (req, re
       .update(updates)
       .eq("id", id)
       .select("wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before")
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({ ok: true, ...data });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ PATCH /tenants/:id/deposit-settings
+   Mismo motivo que whatsapp-settings: endpoint chico y aislado, no
+   PATCH /tenants/:id (ese exige `name` y pone en null cualquier campo
+   opcional ausente — destructivo si se llamara con un payload parcial
+   desde este widget). El frontend valida que los 5 campos bancarios estén
+   completos ANTES de dejar activar el toggle; el backend actualiza
+   cualquier subconjunto de campos que venga en el body, igual que
+   whatsapp-settings, para permitir guardado campo a campo.
+====================================================== */
+app.patch("/tenants/:id/deposit-settings", tenantAuthParamWrite, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      deposit_required,
+      deposit_bank_name,
+      deposit_account_type,
+      deposit_account_number,
+      deposit_holder_rut,
+      deposit_holder_name,
+    } = req.body;
+
+    const updates = {};
+    if (deposit_required !== undefined) {
+      updates.deposit_required = Boolean(deposit_required);
+    }
+    if (deposit_bank_name !== undefined) {
+      updates.deposit_bank_name = deposit_bank_name ? String(deposit_bank_name).trim() : null;
+    }
+    if (deposit_account_type !== undefined) {
+      updates.deposit_account_type = deposit_account_type ? String(deposit_account_type).trim() : null;
+    }
+    if (deposit_account_number !== undefined) {
+      updates.deposit_account_number = deposit_account_number
+        ? String(deposit_account_number).trim()
+        : null;
+    }
+    if (deposit_holder_rut !== undefined) {
+      updates.deposit_holder_rut = deposit_holder_rut ? String(deposit_holder_rut).trim() : null;
+    }
+    if (deposit_holder_name !== undefined) {
+      updates.deposit_holder_name = deposit_holder_name ? String(deposit_holder_name).trim() : null;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: "Nada para actualizar" });
+    }
+
+    const { data, error } = await supabase
+      .from("tenants")
+      .update(updates)
+      .eq("id", id)
+      .select(
+        "deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name"
+      )
       .single();
 
     if (error) {
