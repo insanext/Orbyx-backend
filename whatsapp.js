@@ -60,16 +60,61 @@ async function sendWhatsAppTemplate({ to, contentSid, variables }) {
       return { ok: false, reason: "missing_sender" };
     }
 
-    await twilioClient.messages.create({
+    const payload = {
       contentSid,
       contentVariables: JSON.stringify(variables || {}),
       from: toWhatsAppAddress(process.env.TWILIO_WHATSAPP_NUMBER),
       to: toWhatsAppAddress(to),
-    });
+    };
 
-    return { ok: true };
+    console.log(
+      `[WA] Llamando a Twilio messages.create — from=${payload.from} to=${payload.to} contentSid=${payload.contentSid}`
+    );
+
+    // El SDK de Twilio (v6) no expone un timeout configurable en el
+    // constructor público sin implementar un httpClient custom. En vez de
+    // eso, se corre una carrera contra un timeout manual: si Twilio no
+    // responde en SEND_TIMEOUT_MS, se loguea explícitamente como timeout en
+    // vez de quedar colgado en silencio. Esto no cancela la request real —
+    // si el timeout se dispara y la request original responde más tarde,
+    // igual queda logueada abajo (etiquetada "tardía") para saber si
+    // realmente era lentitud de Twilio y no un fallo total.
+    const SEND_TIMEOUT_MS = 15000;
+    let timedOut = false;
+    const createPromise = twilioClient.messages.create(payload);
+
+    createPromise
+      .then((lateMessage) => {
+        if (timedOut) {
+          console.log(
+            `[WA] Twilio respondió DESPUÉS del timeout local — sid=${lateMessage.sid} status=${lateMessage.status}`
+          );
+        }
+      })
+      .catch((lateError) => {
+        if (timedOut) {
+          console.error(
+            `[WA] Twilio respondió con error DESPUÉS del timeout local — message=${lateError.message} code=${lateError.code} status=${lateError.status} moreInfo=${lateError.moreInfo}`
+          );
+        }
+      });
+
+    const message = await Promise.race([
+      createPromise,
+      new Promise((_, reject) =>
+        setTimeout(() => {
+          timedOut = true;
+          reject(Object.assign(new Error(`Timeout: Twilio no respondió en ${SEND_TIMEOUT_MS}ms`), { code: "local_timeout" }));
+        }, SEND_TIMEOUT_MS)
+      ),
+    ]);
+
+    console.log(`[WA] Twilio OK — sid=${message.sid} status=${message.status}`);
+    return { ok: true, sid: message.sid };
   } catch (error) {
-    console.error("Error enviando WhatsApp:", error.message);
+    console.error(
+      `[WA] Twilio ERROR — message=${error.message} code=${error.code} status=${error.status} moreInfo=${error.moreInfo}`
+    );
     return { ok: false, reason: "send_error", error: error.message };
   }
 }
