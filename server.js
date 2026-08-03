@@ -701,6 +701,8 @@ async function sendBookingConfirmations({
   cancelUrl,
   petName,
   petSpecies,
+  branchAddress,
+  customerInstructions,
 }) {
   const start = startAt instanceof Date ? startAt : new Date(startAt);
 
@@ -712,11 +714,12 @@ async function sendBookingConfirmations({
       serviceName: serviceName || "Reserva",
       startAt: start.toISOString(),
       cancelUrl,
-      address: tenantInfo?.address || null,
+      address: branchAddress || tenantInfo?.address || null,
       phone: tenantInfo?.phone || null,
       businessCategory: tenantInfo?.business_category || null,
       petName: petName || null,
       petSpecies: petSpecies || null,
+      customerInstructions: customerInstructions || null,
     });
   }
 
@@ -4905,6 +4908,7 @@ let bufferAfter = 0;
 let serviceName = null;
 let isGroup = false;
 let capacity = 1;
+let customerInstructions = null;
 
 if (service_id) {
   const { data: service, error: serviceErr } = await supabase
@@ -4927,6 +4931,7 @@ if (service_id) {
   serviceName = service.name;
   isGroup = Boolean(service.is_group);
   capacity = Number(service.capacity || 1);
+  customerInstructions = service.customer_instructions || null;
 }
 
     let bookingQuery = supabase
@@ -5477,6 +5482,12 @@ const { data: tenantInfo, error: tenantInfoError } = await supabase
   .eq("id", cal.tenant_id)
   .single();
 
+const { data: branchInfoForEmail } = await supabase
+  .from("branches")
+  .select("address")
+  .eq("id", resolvedBranchId)
+  .maybeSingle();
+
 // Log incondicional (no depende de que el toggle esté activo) para poder
 // confirmar en los logs de Render que el código SÍ llega hasta acá y qué
 // valor real leyó, sin tener que adivinar si el bloque de abajo se está
@@ -5502,6 +5513,8 @@ if (!tenantRequiresDeposit) {
     cancelUrl,
     petName,
     petSpecies,
+    branchAddress: branchInfoForEmail?.address || null,
+    customerInstructions,
   });
 }
 
@@ -8894,6 +8907,22 @@ app.post(
         .eq("id", appt.tenant_id)
         .single();
 
+      const { data: branchInfoForEmail } = appt.branch_id
+        ? await supabase
+            .from("branches")
+            .select("address")
+            .eq("id", appt.branch_id)
+            .maybeSingle()
+        : { data: null };
+
+      const { data: serviceInfoForEmail } = appt.service_id
+        ? await supabase
+            .from("services")
+            .select("customer_instructions")
+            .eq("id", appt.service_id)
+            .maybeSingle()
+        : { data: null };
+
       const bookingUrl = tenantInfo?.slug
         ? `https://www.orbyx.cl/${tenantInfo.slug}`
         : "https://www.orbyx.cl";
@@ -8910,6 +8939,8 @@ app.post(
         serviceName: appt.service_name_snapshot,
         startAt: appt.start_at,
         cancelUrl,
+        branchAddress: branchInfoForEmail?.address || null,
+        customerInstructions: serviceInfoForEmail?.customer_instructions || null,
       });
 
       return res.json({ ok: true, appointment: updated });
@@ -12942,6 +12973,7 @@ const {
   active = true,
   is_group = false,
   capacity = 1,
+  customer_instructions,
 } = req.body;
 
     if (!tenant_id || !name || !duration_minutes) {
@@ -12992,6 +13024,9 @@ const {
         active: Boolean(active),
   is_group: Boolean(is_group),
   capacity: Number(capacity || 1),
+  customer_instructions: customer_instructions
+    ? String(customer_instructions).trim()
+    : null,
       })
       .select()
       .single();
@@ -13030,6 +13065,7 @@ const {
   active,
   is_group,
   capacity,
+  customer_instructions,
 } = req.body;
 
     if (!id) {
@@ -13099,6 +13135,11 @@ const {
     if (active !== undefined) updateData.active = Boolean(active);
 if (is_group !== undefined) updateData.is_group = Boolean(is_group);
 if (capacity !== undefined) updateData.capacity = Number(capacity);
+if (customer_instructions !== undefined)
+  updateData.customer_instructions =
+    customer_instructions === null
+      ? null
+      : String(customer_instructions).trim();
 
 
     const { data, error } = await supabase

@@ -32,6 +32,7 @@ async function sendBookingEmail({
   businessCategory,
   petName,
   petSpecies,
+  customerInstructions,
 }) {
   try {
     // 👇 evita que explote en local
@@ -59,6 +60,22 @@ async function sendBookingEmail({
         </div>
       `
         : "";
+
+    const instructionsHtml = customerInstructions
+      ? `
+        <div style="background:#fffbeb; border:1px solid #fde68a; border-radius:14px; padding:16px; margin-top:16px;">
+          <p style="margin:0 0 6px; font-size:13px; font-weight:bold; color:#92400e; text-transform:uppercase; letter-spacing:0.05em;">
+            📋 Instrucciones importantes
+          </p>
+          <p style="margin:0; font-size:14px; color:#78350f; white-space:pre-line;">${String(
+            customerInstructions
+          )
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")}</p>
+        </div>
+      `
+      : "";
 
     await resend.emails.send({
       from: "Orbyx <reservas@notificaciones.orbyx.cl>",
@@ -109,6 +126,8 @@ async function sendBookingEmail({
           ${petHtml}
 
         </div>
+
+        ${instructionsHtml}
 
         <div style="text-align:center; margin-top:24px;">
           <a href="${cancelUrl}" style="background:#0f172a; color:white; padding:12px 20px; border-radius:12px; text-decoration:none; font-weight:bold;">
