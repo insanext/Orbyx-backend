@@ -12,6 +12,7 @@ const { google } = require("googleapis");
 const crypto = require("crypto");
 const PDFDocument = require("pdfkit");
 const twilio = require("twilio");
+const cron = require("node-cron");
 const {
   sendBookingEmail,
   sendInvitationEmail,
@@ -4909,6 +4910,7 @@ let serviceName = null;
 let isGroup = false;
 let capacity = 1;
 let customerInstructions = null;
+let serviceRequiresDeposit = false;
 
 if (service_id) {
   const { data: service, error: serviceErr } = await supabase
@@ -4932,7 +4934,15 @@ if (service_id) {
   isGroup = Boolean(service.is_group);
   capacity = Number(service.capacity || 1);
   customerInstructions = service.customer_instructions || null;
+  serviceRequiresDeposit = Boolean(service.requires_deposit);
 }
+
+// El interruptor maestro del tenant (tenantRequiresDeposit) habilita el
+// sistema completo (config de datos bancarios, etc.), pero el flujo de
+// depósito en una reserva puntual solo se activa si además el servicio
+// reservado tiene requires_deposit=true. Sin service_id no hay forma de
+// saber esto, así que no se exige depósito.
+const appointmentRequiresDeposit = tenantRequiresDeposit && serviceRequiresDeposit;
 
     let bookingQuery = supabase
   .from("appointments")
@@ -5190,11 +5200,11 @@ if ((overlappingAppointments || []).length > 0) {
 
     // Depósito previo: la cita se crea "booked" igual que cualquier otra (así
     // bloquea el horario usando toda la lógica de disponibilidad existente,
-    // sin tocarla) más un estado de revisión aparte con un hold de 15 min.
+    // sin tocarla) más un estado de revisión aparte con un hold de 10 min.
     // Ver 2026-08-02-deposit-required.sql para la explicación completa de
     // por qué no se usa un status nuevo.
-    const DEPOSIT_HOLD_MINUTES = 15;
-    const depositHoldExpiresAt = tenantRequiresDeposit
+    const DEPOSIT_HOLD_MINUTES = 10;
+    const depositHoldExpiresAt = appointmentRequiresDeposit
       ? new Date(Date.now() + DEPOSIT_HOLD_MINUTES * 60 * 1000).toISOString()
       : null;
 
@@ -5220,7 +5230,7 @@ reason: reason || null,
 notes: notes || null,
 next_control_at: next_control_at || null,
         cancel_token: cancelToken,
-        ...(tenantRequiresDeposit && {
+        ...(appointmentRequiresDeposit && {
           deposit_status: "pending",
           deposit_hold_expires_at: depositHoldExpiresAt,
         }),
@@ -5496,12 +5506,13 @@ console.log(
   `[WA] tenant=${cal.tenant_id} wa_confirmation_enabled=${tenantInfo?.wa_confirmation_enabled} tenantInfoError=${tenantInfoError?.message || "none"}`
 );
 
-// Si el tenant exige depósito, la confirmación (email + WhatsApp) NO se
-// manda ahora — se manda recién cuando el tenant aprueba el comprobante
+// Si el servicio reservado exige depósito (interruptor maestro del tenant
+// Y requires_deposit del servicio), la confirmación (email + WhatsApp) NO
+// se manda ahora — se manda recién cuando el tenant aprueba el comprobante
 // desde POST /appointments/:id/deposit/confirm (mismo helper, mismos
 // templates). El cliente ve el estado "pendiente de depósito" en la propia
 // respuesta de este endpoint, sin un mensaje aparte.
-if (!tenantRequiresDeposit) {
+if (!appointmentRequiresDeposit) {
   await sendBookingConfirmations({
     tenantId: cal.tenant_id,
     tenantInfo,
@@ -5522,7 +5533,7 @@ if (!tenantRequiresDeposit) {
       ok: true,
       appointment: apptUpdated,
       cancel_url: cancelUrl,
-      ...(tenantRequiresDeposit && {
+      ...(appointmentRequiresDeposit && {
         deposit_required: true,
         deposit_hold_expires_at: depositHoldExpiresAt,
         deposit_upload_token: cancelToken,
@@ -8801,7 +8812,7 @@ app.post("/appointments/:id/deposit-receipt", publicLimiter, async (req, res) =>
 // GET /appointments/pending-deposits?tenant_id=X
 // Lista para el panel "Depósitos pendientes" de Agenda y para calcular el
 // badge numérico (el frontend hace COUNT en el cliente sobre este mismo
-// array — es una lista corta por diseño, ya que un hold dura 15 minutos).
+// array — es una lista corta por diseño, ya que un hold dura 10 minutos).
 app.get("/appointments/pending-deposits", tenantAuth, async (req, res) => {
   try {
     const { tenant_id } = req.query;
@@ -8951,7 +8962,7 @@ app.post(
 );
 
 // POST /appointments/:id/deposit/reject
-// Cancela de inmediato (sin esperar el hold de 15 min) y libera el horario.
+// Cancela de inmediato (sin esperar el hold de 10 min) y libera el horario.
 // No se envía ningún aviso automático al cliente esta sesión — no existe un
 // Content Template de WhatsApp aprobado para "depósito rechazado" (crear uno
 // requiere aprobación de Meta/Twilio, fuera de alcance hoy) y reutilizar
@@ -9009,9 +9020,48 @@ app.post(
   }
 );
 
+// Libera (cancela) cualquier cita cuyo hold de depósito ya venció sin que
+// el tenant la haya confirmado o rechazado. Extraído como función nombrada
+// para poder llamarla tanto desde el endpoint HTTP (cron externo, sigue
+// funcionando igual) como desde el cron interno de node-cron.
+async function releaseExpiredDeposits() {
+  const nowIso = new Date().toISOString();
+
+  const { data: expired, error } = await supabase
+    .from("appointments")
+    .select("*")
+    .eq("deposit_status", "pending")
+    .lt("deposit_hold_expires_at", nowIso);
+
+  if (error) throw new Error(error.message);
+
+  let released = 0;
+  for (const appt of expired || []) {
+    await deleteCalendarEventForAppointment(appt);
+
+    await supabase
+      .from("appointments")
+      .update({
+        status: "canceled",
+        canceled_at: new Date().toISOString(),
+        deposit_status: "expired",
+        deposit_hold_expires_at: null,
+      })
+      .eq("id", appt.id);
+
+    if (appt.customer_id) {
+      await recalculateCustomerStats(appt.customer_id);
+    }
+
+    released++;
+  }
+
+  return { released };
+}
+
 // POST /appointments/maintenance/release-expired-deposits
 // Cron externo (cron-job.org), mismo patrón/secreto que los otros jobs de
-// mantenimiento. Libera (cancela) cualquier cita cuyo hold de 15 min ya
+// mantenimiento. Libera (cancela) cualquier cita cuyo hold de 10 min ya
 // venció sin que el tenant la haya confirmado o rechazado.
 app.post(
   "/appointments/maintenance/release-expired-deposits",
@@ -9019,38 +9069,8 @@ app.post(
   requireSignupMaintenanceSecret,
   async (req, res) => {
     try {
-      const nowIso = new Date().toISOString();
-
-      const { data: expired, error } = await supabase
-        .from("appointments")
-        .select("*")
-        .eq("deposit_status", "pending")
-        .lt("deposit_hold_expires_at", nowIso);
-
-      if (error) return res.status(500).json({ error: error.message });
-
-      let released = 0;
-      for (const appt of expired || []) {
-        await deleteCalendarEventForAppointment(appt);
-
-        await supabase
-          .from("appointments")
-          .update({
-            status: "canceled",
-            canceled_at: new Date().toISOString(),
-            deposit_status: "expired",
-            deposit_hold_expires_at: null,
-          })
-          .eq("id", appt.id);
-
-        if (appt.customer_id) {
-          await recalculateCustomerStats(appt.customer_id);
-        }
-
-        released++;
-      }
-
-      return res.json({ ok: true, released });
+      const result = await releaseExpiredDeposits();
+      return res.json({ ok: true, ...result });
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
@@ -11900,14 +11920,12 @@ function requireSignupMaintenanceSecret(req, res, next) {
    calificar hasta que pasen 30 días de nuevo).
    Mismo header/secret que /signup/maintenance/sweep.
 ====================================================== */
-app.post(
-  "/billing/addons/maintenance/charge-recurring",
-  publicLimiter,
-  requireSignupMaintenanceSecret,
-  async (req, res) => {
+// Extraída como función nombrada para poder llamarla tanto desde el
+// endpoint HTTP (cron externo, sigue funcionando igual) como desde el
+// cron interno de node-cron.
+async function chargeRecurringAddons() {
     const MAX_FAILED_ATTEMPTS = 3;
 
-    try {
       const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
       // last_charged_at NULL cuenta como "vencido" también: cubre filas
@@ -12007,7 +12025,17 @@ app.post(
         }
       }
 
-      return res.json({ processed: rows.length, charged, failed, skipped });
+  return { processed: rows.length, charged, failed, skipped };
+}
+
+app.post(
+  "/billing/addons/maintenance/charge-recurring",
+  publicLimiter,
+  requireSignupMaintenanceSecret,
+  async (req, res) => {
+    try {
+      const result = await chargeRecurringAddons();
+      return res.json(result);
     } catch (err) {
       console.error("POST /billing/addons/maintenance/charge-recurring error:", err.message);
       return res.status(500).json({ error: err.message });
@@ -12025,63 +12053,71 @@ app.post(
       (se usa updated_at tanto para medir el tiempo detenido como para
       no re-alertar en la misma corrida).
 ====================================================== */
+// Extraída como función nombrada para poder llamarla tanto desde el
+// endpoint HTTP (cron externo, sigue funcionando igual) como desde el
+// cron interno de node-cron.
+async function sweepSignupIntents() {
+  const now = new Date();
+  const expiredCutoff = new Date(now.getTime() - 48 * 60 * 60 * 1000).toISOString();
+  const stuckCutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+
+  const { data: expired, error: expireErr } = await supabase
+    .from("signup_intents")
+    .update({ status: "expired", updated_at: now.toISOString() })
+    .eq("status", "started")
+    .lt("created_at", expiredCutoff)
+    .select("id");
+
+  if (expireErr) throw expireErr;
+
+  const { data: stuck, error: stuckErr } = await supabase
+    .from("signup_intents")
+    .select("id, email, plan_id, monto, status, updated_at")
+    .in("status", ["paid", "tenant_creation_failed"])
+    .lt("updated_at", stuckCutoff);
+
+  if (stuckErr) throw stuckErr;
+
+  let alerted = 0;
+  for (const row of stuck || []) {
+    try {
+      await sendSignupStuckAlertEmail({
+        to: "camilo.merino.m@gmail.com",
+        signupIntentId: row.id,
+        email: row.email,
+        planId: row.plan_id,
+        monto: row.monto,
+      });
+
+      await supabase
+        .from("signup_intents")
+        .update({ updated_at: new Date().toISOString() })
+        .eq("id", row.id);
+
+      alerted++;
+    } catch (alertErr) {
+      console.error(
+        `signup_intent ${row.id}: fallo enviando alerta interna:`,
+        alertErr.message
+      );
+    }
+  }
+
+  return {
+    ok: true,
+    expired: expired?.length || 0,
+    alerted,
+  };
+}
+
 app.post(
   "/signup/maintenance/sweep",
   publicLimiter,
   requireSignupMaintenanceSecret,
   async (req, res) => {
     try {
-      const now = new Date();
-      const expiredCutoff = new Date(now.getTime() - 48 * 60 * 60 * 1000).toISOString();
-      const stuckCutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-
-      const { data: expired, error: expireErr } = await supabase
-        .from("signup_intents")
-        .update({ status: "expired", updated_at: now.toISOString() })
-        .eq("status", "started")
-        .lt("created_at", expiredCutoff)
-        .select("id");
-
-      if (expireErr) throw expireErr;
-
-      const { data: stuck, error: stuckErr } = await supabase
-        .from("signup_intents")
-        .select("id, email, plan_id, monto, status, updated_at")
-        .in("status", ["paid", "tenant_creation_failed"])
-        .lt("updated_at", stuckCutoff);
-
-      if (stuckErr) throw stuckErr;
-
-      let alerted = 0;
-      for (const row of stuck || []) {
-        try {
-          await sendSignupStuckAlertEmail({
-            to: "camilo.merino.m@gmail.com",
-            signupIntentId: row.id,
-            email: row.email,
-            planId: row.plan_id,
-            monto: row.monto,
-          });
-
-          await supabase
-            .from("signup_intents")
-            .update({ updated_at: new Date().toISOString() })
-            .eq("id", row.id);
-
-          alerted++;
-        } catch (alertErr) {
-          console.error(
-            `signup_intent ${row.id}: fallo enviando alerta interna:`,
-            alertErr.message
-          );
-        }
-      }
-
-      return res.json({
-        ok: true,
-        expired: expired?.length || 0,
-        alerted,
-      });
+      const result = await sweepSignupIntents();
+      return res.json(result);
     } catch (err) {
       console.error("POST /signup/maintenance/sweep error:", err.message);
       return res.status(500).json({ error: err.message });
@@ -12974,6 +13010,7 @@ const {
   is_group = false,
   capacity = 1,
   customer_instructions,
+  requires_deposit = false,
 } = req.body;
 
     if (!tenant_id || !name || !duration_minutes) {
@@ -13027,6 +13064,7 @@ const {
   customer_instructions: customer_instructions
     ? String(customer_instructions).trim()
     : null,
+  requires_deposit: Boolean(requires_deposit),
       })
       .select()
       .single();
@@ -13066,6 +13104,7 @@ const {
   is_group,
   capacity,
   customer_instructions,
+  requires_deposit,
 } = req.body;
 
     if (!id) {
@@ -13140,6 +13179,8 @@ if (customer_instructions !== undefined)
     customer_instructions === null
       ? null
       : String(customer_instructions).trim();
+if (requires_deposit !== undefined)
+  updateData.requires_deposit = Boolean(requires_deposit);
 
 
     const { data, error } = await supabase
@@ -14953,6 +14994,49 @@ app.patch("/admin/addons/:key", requireAdminAuth, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Servidor listo en http://localhost:${PORT}`);
+});
+
+// =======================
+// TAREAS PROGRAMADAS INTERNAS (node-cron)
+// =======================
+// Reemplazan la necesidad de crons externos (cron-job.org) para estos 3
+// jobs: llaman directo a la misma función que ya usa el endpoint HTTP
+// equivalente, así que el comportamiento y el resultado son idénticos.
+// Los 3 endpoints HTTP siguen funcionando igual (protegidos con
+// x-maintenance-secret) — esto es solo una vía adicional de disparo.
+
+cron.schedule("*/5 * * * *", async () => {
+  console.log("[CRON] release-expired-deposits: iniciando...");
+  try {
+    const result = await releaseExpiredDeposits();
+    console.log(`[CRON] release-expired-deposits: terminado — released=${result.released}`);
+  } catch (err) {
+    console.error("[CRON] release-expired-deposits: falló —", err.message);
+  }
+});
+
+cron.schedule("0 4 * * *", async () => {
+  console.log("[CRON] signup/maintenance/sweep: iniciando...");
+  try {
+    const result = await sweepSignupIntents();
+    console.log(
+      `[CRON] signup/maintenance/sweep: terminado — expired=${result.expired} alerted=${result.alerted}`
+    );
+  } catch (err) {
+    console.error("[CRON] signup/maintenance/sweep: falló —", err.message);
+  }
+});
+
+cron.schedule("0 5 * * *", async () => {
+  console.log("[CRON] billing/addons/maintenance/charge-recurring: iniciando...");
+  try {
+    const result = await chargeRecurringAddons();
+    console.log(
+      `[CRON] billing/addons/maintenance/charge-recurring: terminado — processed=${result.processed} charged=${result.charged} failed=${result.failed} skipped=${result.skipped}`
+    );
+  } catch (err) {
+    console.error("[CRON] billing/addons/maintenance/charge-recurring: falló —", err.message);
+  }
 });
 
 app.get("/api/pets/:slug", tenantAuthSlug, async (req, res) => {
