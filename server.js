@@ -20,6 +20,7 @@ const {
   sendEmailChangeVerificationToNewEmail,
   sendSignupRecoveryEmail,
   sendSignupStuckAlertEmail,
+  sendLegalAcceptanceConfirmationEmail,
 } = require("./email");
 const {
   sendWhatsAppTemplate,
@@ -9531,6 +9532,106 @@ async function linkTenantOwner({ tenant_id, user_id }) {
   if (userError) throw userError;
 }
 
+// Versiones/URLs de los documentos legales vigentes. Deben coincidir con lo
+// publicado en orbyx-web (app/terminos, app/privacidad) — si se publica una
+// nueva versión de cualquiera de los dos, actualizar acá también.
+const LEGAL_TERMS_VERSION = "1.0";
+const LEGAL_TERMS_URL = "https://www.orbyx.cl/terminos";
+const LEGAL_PRIVACY_VERSION = "2.0";
+const LEGAL_PRIVACY_URL = "https://www.orbyx.cl/privacidad";
+
+function extractClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) {
+    return String(forwarded).split(",")[0].trim() || null;
+  }
+  return req.ip || null;
+}
+
+// Registra la aceptación de Términos+Privacidad de un registro recién
+// completado (el checkbox obligatorio en /signup y /checkout-premium ya
+// impidió llegar hasta acá sin haberlos aceptado) y envía la copia íntegra
+// del contrato por correo. Nunca lanza: cualquier falla se loguea y no debe
+// bloquear el registro del usuario.
+async function recordLegalAcceptancesAndSendConfirmation({
+  tenant_id,
+  user_id,
+  email,
+  business_name,
+  ip_address,
+  user_agent,
+}) {
+  let termsRowId = null;
+  try {
+    const acceptedAt = new Date().toISOString();
+    const { data: rows, error: insertErr } = await supabase
+      .from("legal_acceptances")
+      .insert([
+        {
+          tenant_id,
+          user_id,
+          document_type: "terms",
+          document_version: LEGAL_TERMS_VERSION,
+          document_url: LEGAL_TERMS_URL,
+          accepted_at: acceptedAt,
+          ip_address,
+          user_agent,
+        },
+        {
+          tenant_id,
+          user_id,
+          document_type: "privacy",
+          document_version: LEGAL_PRIVACY_VERSION,
+          document_url: LEGAL_PRIVACY_URL,
+          accepted_at: acceptedAt,
+          ip_address,
+          user_agent,
+        },
+      ])
+      .select("id, document_type");
+
+    if (insertErr) throw insertErr;
+    termsRowId = (rows || []).find((r) => r.document_type === "terms")?.id || null;
+  } catch (err) {
+    console.error(
+      `recordLegalAcceptancesAndSendConfirmation: error insertando legal_acceptances (tenant ${tenant_id}):`,
+      err.message
+    );
+    return;
+  }
+
+  const MAX_EMAIL_ATTEMPTS = 2;
+  for (let attempt = 1; attempt <= MAX_EMAIL_ATTEMPTS; attempt++) {
+    const result = await sendLegalAcceptanceConfirmationEmail({
+      to: email,
+      businessName: business_name,
+      termsVersion: LEGAL_TERMS_VERSION,
+      termsUrl: LEGAL_TERMS_URL,
+      privacyVersion: LEGAL_PRIVACY_VERSION,
+      privacyUrl: LEGAL_PRIVACY_URL,
+      acceptedAt: new Date().toISOString(),
+    });
+
+    if (result.ok) {
+      if (termsRowId) {
+        await supabase
+          .from("legal_acceptances")
+          .update({ confirmation_email_sent_at: new Date().toISOString() })
+          .eq("id", termsRowId);
+      }
+      return;
+    }
+
+    console.error(
+      `recordLegalAcceptancesAndSendConfirmation: intento ${attempt}/${MAX_EMAIL_ATTEMPTS} de envío falló (tenant ${tenant_id}):`,
+      result.reason
+    );
+    if (attempt < MAX_EMAIL_ATTEMPTS) {
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+}
+
 /* ======================================================
    ✅ SAAS: Provision tenant + owner user + main calendar
 ====================================================== */
@@ -9555,6 +9656,15 @@ app.post("/tenants/provision", async (req, res) => {
 
     const { tenant, calendar, branch } = await provisionTenantCore({ email, plan, billing_cycle });
     await linkTenantOwner({ tenant_id: tenant.id, user_id });
+
+    await recordLegalAcceptancesAndSendConfirmation({
+      tenant_id: tenant.id,
+      user_id,
+      email,
+      business_name: null,
+      ip_address: extractClientIp(req),
+      user_agent: req.headers["user-agent"] || null,
+    });
 
     return res.json({
       ok: true,
@@ -11882,6 +11992,15 @@ app.post("/signup/claim-account", publicLimiter, async (req, res) => {
     }
 
     await linkTenantOwner({ tenant_id: intent.tenant_id, user_id: authUser.id });
+
+    await recordLegalAcceptancesAndSendConfirmation({
+      tenant_id: intent.tenant_id,
+      user_id: authUser.id,
+      email: intent.email,
+      business_name: intent.business_name || null,
+      ip_address: extractClientIp(req),
+      user_agent: req.headers["user-agent"] || null,
+    });
 
     const { data: tenant } = await supabase
       .from("tenants")
