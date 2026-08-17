@@ -14193,6 +14193,48 @@ app.post(
 );
 
 /* ======================================================
+   🔔 GET/POST /webhooks/meta-whatsapp
+   Endpoint requerido por Meta para habilitar el webhook de WhatsApp
+   Business API (necesario para max_ia_wa, todavía no implementado —
+   ver CLAUDE.md). Por ahora solo satisface el handshake de suscripción
+   y responde 200 a los eventos entrantes sin procesarlos ni persistirlos.
+   - GET: verificación de suscripción vía hub.mode/hub.verify_token/
+     hub.challenge, comparado contra META_WEBHOOK_VERIFY_TOKEN (mismo
+     patrón de comparación directa que requireSignupMaintenanceSecret).
+     No se loguea el verify_token recibido.
+   - POST: responde 200 de inmediato (Meta reintenta si tarda más de
+     unos segundos) antes de cualquier procesamiento.
+====================================================== */
+app.get("/webhooks/meta-whatsapp", publicLimiter, (req, res) => {
+  const mode = req.query["hub.mode"];
+  const verifyToken = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (
+    mode === "subscribe" &&
+    typeof verifyToken === "string" &&
+    verifyToken === process.env.META_WEBHOOK_VERIFY_TOKEN
+  ) {
+    return res.status(200).type("text/plain").send(challenge ?? "");
+  }
+
+  return res.status(403).send();
+});
+
+app.post("/webhooks/meta-whatsapp", publicLimiter, (req, res) => {
+  res.status(200).send();
+
+  try {
+    const eventType = req.body?.object || req.body?.field;
+    if (eventType) {
+      console.log(`POST /webhooks/meta-whatsapp: evento recibido (${eventType})`);
+    }
+  } catch (err) {
+    console.error("POST /webhooks/meta-whatsapp error:", err.message);
+  }
+});
+
+/* ======================================================
    ✅ ONBOARDING SETUP
 ====================================================== */
 app.post("/onboarding/setup", async (req, res) => {
