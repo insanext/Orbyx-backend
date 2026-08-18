@@ -424,6 +424,31 @@ refreshAddonCatalogCache();
 const LOW_BALANCE_RECHARGE_THRESHOLD = 10;
 const LOW_BALANCE_RECHARGE_MAX_FAILED_ATTEMPTS = 3;
 
+// Precio de UNA unidad específica de un addon, por su índice 0-based entre
+// todas las unidades que el tenant llegue a tener (0 = primera unidad,
+// 1 = segunda, 2+ = tercera en adelante). Fuente única de verdad para el
+// precio escalonado — reemplaza el patrón anterior de "un solo tier para
+// todo el lote nuevo", que subcobraba compras de más de 1 unidad (bug
+// reportado 2026-08-18: PATCH /billing/addons/quantity y el preview del
+// frontend cobraban increment × unitPrice-de-la-última-compra en vez de
+// sumar el tier real de cada unidad nueva).
+function addonUnitTierPrice(addonKey, unitIndex) {
+  const addon = ADDON_CATALOG[addonKey];
+  if (unitIndex >= 2) return addon.price_pack3 ?? addon.price;
+  if (unitIndex >= 1) return addon.price_pack2 ?? addon.price;
+  return addon.price;
+}
+
+// Suma el precio real de cada unidad nueva en su tier correspondiente al
+// agregar `addCount` unidades a un addon que ya tiene `currentQty` activas.
+function tieredAddonChargeAmount(addonKey, currentQty, addCount) {
+  let total = 0;
+  for (let i = 0; i < addCount; i++) {
+    total += addonUnitTierPrice(addonKey, currentQty + i);
+  }
+  return total;
+}
+
 function isAddonAvailableForPlan(addonKey, plan) {
   const addon = ADDON_CATALOG[addonKey];
   if (!addon) return false;
@@ -10246,8 +10271,6 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
       });
     }
 
-    const addon = ADDON_CATALOG[addon_key];
-
     const qty = Math.max(1, parseInt(quantity, 10) || 1);
     const cycle = normalizeBillingCycle(billing_cycle);
 
@@ -10277,13 +10300,14 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
 
     if (existingError) throw existingError;
 
-    // Precio escalonado según cantidad actual antes de agregar
+    // Cobra el tier real de CADA unidad nueva (ver tieredAddonChargeAmount),
+    // no un solo tier aplicado a todo el lote.
     const currentQty = existing ? Number(existing.quantity) : 0;
-    let unitPrice = addon.price;
-    if (currentQty >= 2) unitPrice = addon.price_pack3 ?? addon.price;
-    else if (currentQty >= 1) unitPrice = addon.price_pack2 ?? addon.price;
-
-    const chargeAmount = unitPrice * qty;
+    const chargeAmount = tieredAddonChargeAmount(addon_key, currentQty, qty);
+    // unit_price guardado = tier de la última unidad de este lote (precio
+    // marginal vigente) — usado luego por chargeRecurringAddons para
+    // renovar toda la quantity a esa tarifa plana.
+    const unitPrice = addonUnitTierPrice(addon_key, currentQty + qty - 1);
 
     const { data: addonSubscription, error: addonSubErr } = await supabase
       .from("subscriptions")
@@ -10424,14 +10448,20 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
 
     const now = new Date().toISOString();
     let justCharged = false;
+    let updatedUnitPrice = existing.unit_price;
 
     if (qty > existing.quantity) {
-      // No prorrateo fino en esta iteración: cobra precio unitario × la
-      // cantidad nueva agregada (el incremento), no la diferencia proporcional
-      // al ciclo de facturación restante.
+      // Cobra el tier real de CADA unidad nueva (ver tieredAddonChargeAmount),
+      // no un solo tier (el de la última compra) aplicado a todo el
+      // incremento — ver bug reportado 2026-08-18. Tampoco se prorratea
+      // fino al ciclo de facturación restante, eso sigue igual que antes.
       const increment = qty - existing.quantity;
-      const unitPrice = existing.unit_price ?? ADDON_CATALOG[addon_key].price;
-      const chargeAmount = unitPrice * increment;
+      const currentQty = Number(existing.quantity) || 0;
+      const chargeAmount = tieredAddonChargeAmount(addon_key, currentQty, increment);
+      // Precio marginal vigente tras esta compra (tier de la última unidad
+      // agregada) — se guarda para que chargeRecurringAddons renueve la
+      // quantity completa a esa tarifa, igual que ya hacía antes.
+      updatedUnitPrice = addonUnitTierPrice(addon_key, currentQty + increment - 1);
 
       const { data: addonSubscription, error: addonSubErr } = await supabase
         .from("subscriptions")
@@ -10493,7 +10523,7 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
       .update({
         quantity: qty,
         updated_at: now,
-        ...(justCharged ? { last_charged_at: now } : {}),
+        ...(justCharged ? { last_charged_at: now, unit_price: updatedUnitPrice } : {}),
       })
       .eq("id", existing.id)
       .select()
@@ -16403,4 +16433,3 @@ app.get("/account/email-change/status", [dashboardLimiter, requireTenantAuth], a
     return res.status(500).json({ error: "Error interno", detail: err.message });
   }
 });
-
