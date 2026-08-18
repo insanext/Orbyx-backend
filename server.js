@@ -415,6 +415,15 @@ async function refreshAddonCatalogCache() {
 }
 refreshAddonCatalogCache();
 
+// Recarga automática por saldo bajo de mensajes (solo wa_confirmacion, ver
+// checkMonthlyUsage/triggerLowBalanceRecharge más abajo). Umbral de
+// "remaining" que dispara el cobro, y tope de fallos consecutivos antes de
+// apagar el flag — mismo criterio/valor que MAX_FAILED_ATTEMPTS usa para
+// renewal_mode en chargeRecurringAddons, pero declarado a nivel de módulo
+// porque acá lo usan dos funciones distintas.
+const LOW_BALANCE_RECHARGE_THRESHOLD = 10;
+const LOW_BALANCE_RECHARGE_MAX_FAILED_ATTEMPTS = 3;
+
 function isAddonAvailableForPlan(addonKey, plan) {
   const addon = ADDON_CATALOG[addonKey];
   if (!addon) return false;
@@ -431,7 +440,7 @@ function getAddonsForPlan(plan) {
 async function getActiveAddons(tenant_id) {
   const { data, error } = await supabase
     .from("tenant_addons")
-    .select("id, addon_key, quantity, billing_cycle, status, activated_at, unit_price, last_reset_at, renewal_mode, last_charged_at")
+    .select("id, addon_key, quantity, billing_cycle, status, activated_at, unit_price, last_reset_at, renewal_mode, last_charged_at, low_balance_recharge_enabled, low_balance_recharge_consented_at")
     .eq("tenant_id", tenant_id)
     .eq("status", "active");
 
@@ -609,16 +618,18 @@ async function checkMonthlyUsage(tenant_id, resource) {
 
   // Capacidad de add-ons activos para este recurso
   let addonCap = 0;
+  let addonRow = null;
   const addonDef = ADDON_CATALOG[resource];
   if (addonDef) {
     try {
-      const { data: addonRow } = await supabase
+      const { data } = await supabase
         .from("tenant_addons")
-        .select("quantity")
+        .select("id, quantity, low_balance_recharge_enabled, low_balance_recharge_in_progress")
         .eq("tenant_id", tenant_id)
         .eq("addon_key", resource)
         .eq("status", "active")
         .maybeSingle();
+      addonRow = data;
       const qty = Number(addonRow?.quantity) || 0;
       addonCap = qty * (addonDef.grants[resource] || 0);
     } catch (_) {}
@@ -640,6 +651,23 @@ async function checkMonthlyUsage(tenant_id, resource) {
   } catch (_) {}
 
   const remaining = Math.max(0, total - used);
+
+  // Recarga automática por saldo bajo: fire-and-forget, nunca bloquea ni
+  // afecta el resultado de checkMonthlyUsage — mismo patrón que
+  // sendInvitationEmail(...).catch(...) ya usado en este archivo. Solo
+  // wa_confirmacion la soporta por ahora (ver PATCH
+  // /billing/addons/low-balance-recharge).
+  if (
+    resource === "wa_confirmacion" &&
+    remaining <= LOW_BALANCE_RECHARGE_THRESHOLD &&
+    addonRow?.low_balance_recharge_enabled === true &&
+    addonRow?.low_balance_recharge_in_progress === false
+  ) {
+    triggerLowBalanceRecharge(tenant_id, addonRow.id).catch((err) =>
+      console.error(`triggerLowBalanceRecharge tenant ${tenant_id}:`, err.message)
+    );
+  }
+
   return { allowed: total > 0 && used < total, limit: total, base: baseCap, addon: addonCap, used, remaining };
 }
 
@@ -10634,6 +10662,108 @@ app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
 });
 
 /* ======================================================
+   ✅ PATCH /billing/addons/low-balance-recharge
+   body: { tenant_id, addon_key: "wa_confirmacion", enabled: boolean,
+           consent_accepted?: boolean }
+   Solo cambia flags — no cobra nada acá. El cobro real ocurre en
+   triggerLowBalanceRecharge(), disparado desde checkMonthlyUsage() cuando
+   remaining cae bajo LOW_BALANCE_RECHARGE_THRESHOLD.
+====================================================== */
+app.patch("/billing/addons/low-balance-recharge", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id, addon_key, enabled, consent_accepted } = req.body;
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!addon_key || !ADDON_CATALOG[addon_key]) {
+      return res.status(400).json({
+        error: `addon_key inválido. Válidos: ${Object.keys(ADDON_CATALOG).join(", ")}`,
+      });
+    }
+
+    if (typeof enabled !== "boolean") {
+      return res.status(400).json({ error: "enabled debe ser boolean" });
+    }
+
+    // Ownership: el tenant debe existir; la mutación filtra por tenant_id.
+    try {
+      await getPlan(tenant_id);
+    } catch {
+      return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    const { data: existing, error: existingError } = await supabase
+      .from("tenant_addons")
+      .select("id, low_balance_recharge_enabled, low_balance_recharge_consented_at")
+      .eq("tenant_id", tenant_id)
+      .eq("addon_key", addon_key)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (existingError) throw existingError;
+
+    if (!existing) {
+      return res.status(404).json({
+        error: "El tenant no tiene ese add-on activo",
+      });
+    }
+
+    const patch = { updated_at: new Date().toISOString() };
+
+    if (enabled) {
+      // Primera activación real (nunca antes habilitado/consentido):
+      // exige consentimiento explícito en este request.
+      const isFirstActivation =
+        !existing.low_balance_recharge_enabled || !existing.low_balance_recharge_consented_at;
+
+      if (isFirstActivation && consent_accepted !== true) {
+        return res.status(400).json({
+          error: "Debes aceptar el consentimiento de cobro automático para activar esta opción",
+        });
+      }
+
+      patch.low_balance_recharge_enabled = true;
+      patch.low_balance_recharge_failed_attempts = 0;
+      if (isFirstActivation) {
+        patch.low_balance_recharge_consented_at = new Date().toISOString();
+      }
+    } else {
+      // Al desactivar no se toca consented_at: queda como registro
+      // histórico de cuándo se aceptó por última vez.
+      patch.low_balance_recharge_enabled = false;
+    }
+
+    const { data, error } = await supabase
+      .from("tenant_addons")
+      .update(patch)
+      .eq("id", existing.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      low_balance_recharge_enabled: data.low_balance_recharge_enabled,
+      low_balance_recharge_consented_at: data.low_balance_recharge_consented_at,
+    });
+  } catch (err) {
+    console.error("PATCH /billing/addons/low-balance-recharge error:", err.message);
+
+    if (isMissingAddonsTableError(err)) {
+      return res.status(503).json({
+        error:
+          "La tabla tenant_addons no existe aún. Ejecuta tenant_addons.sql en el SQL editor de Supabase.",
+      });
+    }
+
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    ✅ POST /billing/apply-scheduled-changes
    Lo puedes disparar manualmente o desde cron
 ====================================================== */
@@ -12145,6 +12275,126 @@ async function chargeRecurringAddons() {
       }
 
   return { processed: rows.length, charged, failed, skipped };
+}
+
+/* ======================================================
+   Recarga automática por saldo bajo de mensajes (wa_confirmacion)
+   Disparada fire-and-forget desde checkMonthlyUsage() cuando remaining cae
+   a LOW_BALANCE_RECHARGE_THRESHOLD o menos. Reutiliza el mismo precio
+   escalonado y la misma llamada a /customer/charge que
+   POST /billing/addons/activate (~10253-10287 en este archivo) para 1
+   unidad, y el mismo "otorgamiento" (quantity += 1, sin tocar
+   tenant_monthly_usage — el cap se recalcula en vivo, ver checkMonthlyUsage).
+   También resetea last_charged_at en éxito, igual que chargeRecurringAddons,
+   para que el cron mensual no vuelva a cobrar la quantity completa pocos
+   días después de una recarga por umbral reciente.
+====================================================== */
+async function triggerLowBalanceRecharge(tenant_id, addonId) {
+  // Lock atómico: si el UPDATE no afecta ninguna fila, otra llamada
+  // concurrente (u otro envío en curso) ya se lo adjudicó — no hacer nada más.
+  const { data: claimed, error: claimErr } = await supabase
+    .from("tenant_addons")
+    .update({
+      low_balance_recharge_in_progress: true,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", addonId)
+    .eq("low_balance_recharge_in_progress", false)
+    .select("id, quantity, low_balance_recharge_failed_attempts")
+    .maybeSingle();
+
+  if (claimErr) {
+    console.error(
+      `triggerLowBalanceRecharge: fallo reclamando lock (tenant_addons.id=${addonId}):`,
+      claimErr.message
+    );
+    return;
+  }
+
+  if (!claimed) return;
+
+  try {
+    const { data: subscription, error: subErr } = await supabase
+      .from("subscriptions")
+      .select("id, flow_customer_id")
+      .eq("tenant_id", tenant_id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (subErr) throw subErr;
+
+    if (!subscription || !subscription.flow_customer_id) {
+      throw new Error("tenant sin flow_customer_id (sin tarjeta registrada)");
+    }
+
+    // Mismo precio escalonado que POST /billing/addons/activate: el tier
+    // lo decide la quantity ANTES de sumar la nueva unidad.
+    const addon = ADDON_CATALOG.wa_confirmacion;
+    const currentQty = Number(claimed.quantity) || 0;
+    let unitPrice = addon.price;
+    if (currentQty >= 2) unitPrice = addon.price_pack3 ?? addon.price;
+    else if (currentQty >= 1) unitPrice = addon.price_pack2 ?? addon.price;
+
+    await flowApiRequest("/customer/charge", {
+      customerId: subscription.flow_customer_id,
+      amount: applyIva(unitPrice),
+      subject: "Add-on: wa_confirmacion x1 (recarga automática por saldo bajo)",
+      commerceOrder: `addon_lowbalance_${tenant_id}_wa_confirmacion_${Date.now()}`,
+    });
+
+    const { error: successErr } = await supabase
+      .from("tenant_addons")
+      .update({
+        quantity: currentQty + 1,
+        unit_price: unitPrice,
+        last_charged_at: new Date().toISOString(),
+        low_balance_recharge_in_progress: false,
+        low_balance_recharge_failed_attempts: 0,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", addonId);
+
+    if (successErr) throw successErr;
+
+    console.log(
+      `triggerLowBalanceRecharge: tenant ${tenant_id} recargado +1 wa_confirmacion (tenant_addons.id=${addonId}, nueva quantity=${currentQty + 1})`
+    );
+  } catch (err) {
+    console.error(
+      `triggerLowBalanceRecharge: fallo cobrando tenant ${tenant_id} (tenant_addons.id=${addonId}):`,
+      err.message
+    );
+
+    const nextFailedAttempts = Number(claimed.low_balance_recharge_failed_attempts || 0) + 1;
+    const patch = {
+      low_balance_recharge_in_progress: false,
+      low_balance_recharge_failed_attempts: nextFailedAttempts,
+      updated_at: new Date().toISOString(),
+    };
+
+    // Tras N fallos consecutivos (tarjeta rechazada, etc.), se apaga el
+    // flag en vez de seguir reintentando en cada envío — mismo criterio
+    // que chargeRecurringAddons usa para renewal_mode.
+    if (nextFailedAttempts >= LOW_BALANCE_RECHARGE_MAX_FAILED_ATTEMPTS) {
+      patch.low_balance_recharge_enabled = false;
+      console.warn(
+        `triggerLowBalanceRecharge: tenant ${tenant_id} (tenant_addons.id=${addonId}) pasó a low_balance_recharge_enabled=false tras ${nextFailedAttempts} fallos consecutivos`
+      );
+    }
+
+    const { error: failUpdateErr } = await supabase
+      .from("tenant_addons")
+      .update(patch)
+      .eq("id", addonId);
+
+    if (failUpdateErr) {
+      console.error(
+        `triggerLowBalanceRecharge: fallo además liberando el lock para tenant_addons.id=${addonId}:`,
+        failUpdateErr.message
+      );
+    }
+  }
 }
 
 app.post(
@@ -16153,3 +16403,4 @@ app.get("/account/email-change/status", [dashboardLimiter, requireTenantAuth], a
     return res.status(500).json({ error: "Error interno", detail: err.message });
   }
 });
+
