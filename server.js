@@ -9601,6 +9601,37 @@ function extractClientIp(req) {
   return req.ip || null;
 }
 
+// Registro histórico de consentimiento de cobro automático de add-ons
+// (PATCH /billing/addons/renewal-mode y PATCH /billing/addons/
+// low-balance-recharge) — nunca se actualiza, se inserta una fila nueva en
+// cada activación, incluso si el tenant ya había aceptado antes. Mismo
+// criterio que recordLegalAcceptancesAndSendConfirmation: nunca lanza,
+// cualquier falla se loguea y no debe bloquear la respuesta del endpoint
+// que lo llama.
+async function recordAddonAutoChargeConsent({
+  tenant_id,
+  addon_key,
+  consent_type,
+  req,
+  amount_shown,
+  text_shown,
+}) {
+  try {
+    const { error } = await supabase.from("addon_auto_charge_consents").insert({
+      tenant_id,
+      addon_key,
+      consent_type,
+      ip_address: extractClientIp(req),
+      user_agent: req.headers["user-agent"] || null,
+      amount_shown,
+      text_shown,
+    });
+    if (error) throw error;
+  } catch (err) {
+    console.warn("recordAddonAutoChargeConsent error:", err.message);
+  }
+}
+
 // Registra la aceptación de Términos+Privacidad de un registro recién
 // completado (el checkbox obligatorio en /signup y /checkout-premium ya
 // impidió llegar hasta acá sin haberlos aceptado) y envía la copia íntegra
@@ -10626,7 +10657,7 @@ app.post("/billing/addons/cancel", tenantAuthWrite, async (req, res) => {
 ====================================================== */
 app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
   try {
-    const { tenant_id, addon_key, renewal_mode } = req.body;
+    const { tenant_id, addon_key, renewal_mode, consent_accepted, text_shown } = req.body;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -10653,7 +10684,7 @@ app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
 
     const { data: existing, error: existingError } = await supabase
       .from("tenant_addons")
-      .select("id")
+      .select("id, renewal_mode, quantity, unit_price")
       .eq("tenant_id", tenant_id)
       .eq("addon_key", addon_key)
       .eq("status", "active")
@@ -10667,6 +10698,21 @@ app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
       });
     }
 
+    // Solo exige consentimiento al ACTIVAR (manual -> automatico) — no al
+    // desactivar, ni si ya estaba en automatico (no-op).
+    const isActivating = renewal_mode === "automatico" && existing.renewal_mode !== "automatico";
+
+    if (isActivating) {
+      if (consent_accepted !== true) {
+        return res.status(400).json({
+          error: "Debes aceptar el consentimiento de cobro automático para activar esta opción",
+        });
+      }
+      if (typeof text_shown !== "string" || !text_shown.trim()) {
+        return res.status(400).json({ error: "Falta el texto de consentimiento mostrado" });
+      }
+    }
+
     const { data, error } = await supabase
       .from("tenant_addons")
       .update({ renewal_mode, updated_at: new Date().toISOString() })
@@ -10675,6 +10721,17 @@ app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
       .single();
 
     if (error) throw error;
+
+    if (isActivating) {
+      await recordAddonAutoChargeConsent({
+        tenant_id,
+        addon_key,
+        consent_type: "renewal_mode",
+        req,
+        amount_shown: Number(existing.unit_price || 0) * Number(existing.quantity || 0),
+        text_shown,
+      });
+    }
 
     return res.json({ ok: true, renewal_mode: data.renewal_mode });
   } catch (err) {
@@ -10701,7 +10758,7 @@ app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
 ====================================================== */
 app.patch("/billing/addons/low-balance-recharge", tenantAuthWrite, async (req, res) => {
   try {
-    const { tenant_id, addon_key, enabled, consent_accepted } = req.body;
+    const { tenant_id, addon_key, enabled, consent_accepted, text_shown } = req.body;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -10726,7 +10783,7 @@ app.patch("/billing/addons/low-balance-recharge", tenantAuthWrite, async (req, r
 
     const { data: existing, error: existingError } = await supabase
       .from("tenant_addons")
-      .select("id, low_balance_recharge_enabled, low_balance_recharge_consented_at")
+      .select("id, quantity, low_balance_recharge_enabled, low_balance_recharge_consented_at")
       .eq("tenant_id", tenant_id)
       .eq("addon_key", addon_key)
       .eq("status", "active")
@@ -10741,6 +10798,7 @@ app.patch("/billing/addons/low-balance-recharge", tenantAuthWrite, async (req, r
     }
 
     const patch = { updated_at: new Date().toISOString() };
+    let shouldRecordConsent = false;
 
     if (enabled) {
       // Primera activación real (nunca antes habilitado/consentido):
@@ -10748,16 +10806,22 @@ app.patch("/billing/addons/low-balance-recharge", tenantAuthWrite, async (req, r
       const isFirstActivation =
         !existing.low_balance_recharge_enabled || !existing.low_balance_recharge_consented_at;
 
-      if (isFirstActivation && consent_accepted !== true) {
-        return res.status(400).json({
-          error: "Debes aceptar el consentimiento de cobro automático para activar esta opción",
-        });
+      if (isFirstActivation) {
+        if (consent_accepted !== true) {
+          return res.status(400).json({
+            error: "Debes aceptar el consentimiento de cobro automático para activar esta opción",
+          });
+        }
+        if (typeof text_shown !== "string" || !text_shown.trim()) {
+          return res.status(400).json({ error: "Falta el texto de consentimiento mostrado" });
+        }
       }
 
       patch.low_balance_recharge_enabled = true;
       patch.low_balance_recharge_failed_attempts = 0;
       if (isFirstActivation) {
         patch.low_balance_recharge_consented_at = new Date().toISOString();
+        shouldRecordConsent = true;
       }
     } else {
       // Al desactivar no se toca consented_at: queda como registro
@@ -10773,6 +10837,21 @@ app.patch("/billing/addons/low-balance-recharge", tenantAuthWrite, async (req, r
       .single();
 
     if (error) throw error;
+
+    if (shouldRecordConsent) {
+      // consent_type='low_balance_recharge' — low_balance_recharge_consented_at
+      // sigue siendo el flag rápido de "ya aceptó alguna vez" (evita repetir
+      // el modal al reactivar), pero el registro histórico de verdad ahora
+      // vive en addon_auto_charge_consents.
+      await recordAddonAutoChargeConsent({
+        tenant_id,
+        addon_key,
+        consent_type: "low_balance_recharge",
+        req,
+        amount_shown: addonUnitTierPrice(addon_key, Number(existing.quantity) || 0),
+        text_shown,
+      });
+    }
 
     return res.json({
       ok: true,
