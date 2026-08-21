@@ -13330,25 +13330,25 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
         .replace(/-+/g, "-")
         .replace(/^-|-$/g, "");
 
-      if (!normalizedSlug) {
-        return res.status(400).json({ error: "slug no puede estar vacio" });
+      // Si viene vacío (o el usuario no lo tocó), se mantiene el slug existente
+      // en vez de rechazar el update completo.
+      if (normalizedSlug) {
+        const { data: duplicateBranch, error: duplicateError } = await supabase
+          .from("branches")
+          .select("id")
+          .eq("tenant_id", effectiveTenantId)
+          .eq("slug", normalizedSlug)
+          .neq("id", id)
+          .maybeSingle();
+
+        if (duplicateError) throw duplicateError;
+
+        if (duplicateBranch) {
+          return res.status(409).json({ error: "Ya existe una sucursal con ese slug" });
+        }
+
+        updateData.slug = normalizedSlug;
       }
-
-      const { data: duplicateBranch, error: duplicateError } = await supabase
-        .from("branches")
-        .select("id")
-        .eq("tenant_id", effectiveTenantId)
-        .eq("slug", normalizedSlug)
-        .neq("id", id)
-        .maybeSingle();
-
-      if (duplicateError) throw duplicateError;
-
-      if (duplicateBranch) {
-        return res.status(409).json({ error: "Ya existe una sucursal con ese slug" });
-      }
-
-      updateData.slug = normalizedSlug;
     }
 
     if (is_active !== undefined) {
