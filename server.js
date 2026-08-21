@@ -11036,7 +11036,11 @@ app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) =
       // el próximo run del cron lo vuelva a intentar) y solo se deja un
       // warning para revisión manual — mismo patrón de manejo de fallos
       // que usa chargeRecurringAddons para casos que no se pueden
-      // completar automáticamente.
+      // completar automáticamente. Este chequeo (y el skip que provoca)
+      // envuelve SOLO el bloque de cambio de plan en sí (tenants.update,
+      // sync con Flow, cancelUnsupportedAddons) — resetMonthlyAddons más
+      // abajo es mantenimiento del tenant independiente del downgrade y
+      // debe seguir corriendo siempre, tenga o no exceso de recursos.
       const downgradeLimitCheck = await checkDowngradeResourceLimits(
         tenant.id,
         newPlan
@@ -11047,98 +11051,100 @@ app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) =
           `POST /billing/apply-scheduled-changes: downgrade de tenant ${tenant.id} a ${newPlan} bloqueado — ${downgradeLimitCheck.message}. Requiere revisión manual.`
         );
         blockedByLimits++;
-        continue;
-      }
+      } else {
+        // El nuevo ciclo conserva la duración del ciclo anterior del tenant
+        // (mensual renueva igual que antes con addOneMonth-equivalente).
+        const tenantCycle = inferBillingCycle(
+          tenant.billing_cycle_start,
+          tenant.billing_cycle_end
+        );
+        const newStart = new Date();
+        const newEnd = addMonths(newStart, BILLING_CYCLES[tenantCycle].months);
 
-      // El nuevo ciclo conserva la duración del ciclo anterior del tenant
-      // (mensual renueva igual que antes con addOneMonth-equivalente).
-      const tenantCycle = inferBillingCycle(
-        tenant.billing_cycle_start,
-        tenant.billing_cycle_end
-      );
-      const newStart = new Date();
-      const newEnd = addMonths(newStart, BILLING_CYCLES[tenantCycle].months);
+        const { error: updateError } = await supabase
+          .from("tenants")
+          .update({
+            plan_slug: newPlan,
+            billing_cycle_start: newStart.toISOString(),
+            billing_cycle_end: newEnd.toISOString(),
+            scheduled_plan_slug: null,
+            scheduled_change_at: null,
+            pending_change_type: null,
+            proration_credit: 0,
+            proration_charge: 0,
+          })
+          .eq("id", tenant.id);
 
-      const { error: updateError } = await supabase
-        .from("tenants")
-        .update({
-          plan_slug: newPlan,
-          billing_cycle_start: newStart.toISOString(),
-          billing_cycle_end: newEnd.toISOString(),
-          scheduled_plan_slug: null,
-          scheduled_change_at: null,
-          pending_change_type: null,
-          proration_credit: 0,
-          proration_charge: 0,
-        })
-        .eq("id", tenant.id);
+        if (updateError) throw updateError;
 
-      if (updateError) throw updateError;
-
-      // Sincroniza la suscripción real en Flow con el plan inferior, para
-      // que el próximo cobro recurrente sea el correcto. Best-effort: si
-      // el tenant no tiene suscripción real en Flow (o la llamada falla),
-      // no bloquea el downgrade local — el acceso ya cambió en tenants,
-      // que es la fuente de verdad para permisos. subscription/changePlan
-      // sin startDateOfNewPlan se aplica de inmediato; como este endpoint
-      // corre justo al llegar (o pasar) el fin de ciclo, el prorrateo que
-      // calcule Flow debería salir en ~0 o a favor del tenant (nunca un
-      // cargo, ya que el plan nuevo es más barato) — si llegara a salir
-      // positivo por algún desfase de reloj, se loguea para revisar.
-      try {
-        const { data: flowSub, error: flowSubErr } = await supabase
-          .from("subscriptions")
-          .select("id, flow_subscription_id")
-          .eq("tenant_id", tenant.id)
-          .order("created_at", { ascending: false })
-          .limit(1)
-          .maybeSingle();
-
-        if (flowSubErr) throw flowSubErr;
-
-        if (flowSub?.flow_subscription_id) {
-          const cycleMonto = getPlanCyclePrice(newPlan, tenantCycle);
-          const newFlowPlanId = await getOrCreateFlowPlan(newPlan, tenantCycle, cycleMonto);
-
-          const changeResult = await flowApiRequest("/subscription/changePlan", {
-            subscriptionId: flowSub.flow_subscription_id,
-            newPlanId: newFlowPlanId,
-          });
-
-          const balance = Number(changeResult?.balance ?? 0) || 0;
-          if (balance > 0) {
-            console.warn(
-              `POST /billing/apply-scheduled-changes: downgrade tenant ${tenant.id} generó un cargo inesperado en Flow (balance=${balance}), revisar.`
-            );
-          }
-
-          const { error: subUpdateErr } = await supabase
+        // Sincroniza la suscripción real en Flow con el plan inferior, para
+        // que el próximo cobro recurrente sea el correcto. Best-effort: si
+        // el tenant no tiene suscripción real en Flow (o la llamada falla),
+        // no bloquea el downgrade local — el acceso ya cambió en tenants,
+        // que es la fuente de verdad para permisos. subscription/changePlan
+        // sin startDateOfNewPlan se aplica de inmediato; como este endpoint
+        // corre justo al llegar (o pasar) el fin de ciclo, el prorrateo que
+        // calcule Flow debería salir en ~0 o a favor del tenant (nunca un
+        // cargo, ya que el plan nuevo es más barato) — si llegara a salir
+        // positivo por algún desfase de reloj, se loguea para revisar.
+        try {
+          const { data: flowSub, error: flowSubErr } = await supabase
             .from("subscriptions")
-            .update({ plan_id: newPlan, monto: cycleMonto, updated_at: new Date().toISOString() })
-            .eq("id", flowSub.id);
+            .select("id, flow_subscription_id")
+            .eq("tenant_id", tenant.id)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
 
-          if (subUpdateErr) throw subUpdateErr;
+          if (flowSubErr) throw flowSubErr;
+
+          if (flowSub?.flow_subscription_id) {
+            const cycleMonto = getPlanCyclePrice(newPlan, tenantCycle);
+            const newFlowPlanId = await getOrCreateFlowPlan(newPlan, tenantCycle, cycleMonto);
+
+            const changeResult = await flowApiRequest("/subscription/changePlan", {
+              subscriptionId: flowSub.flow_subscription_id,
+              newPlanId: newFlowPlanId,
+            });
+
+            const balance = Number(changeResult?.balance ?? 0) || 0;
+            if (balance > 0) {
+              console.warn(
+                `POST /billing/apply-scheduled-changes: downgrade tenant ${tenant.id} generó un cargo inesperado en Flow (balance=${balance}), revisar.`
+              );
+            }
+
+            const { error: subUpdateErr } = await supabase
+              .from("subscriptions")
+              .update({ plan_id: newPlan, monto: cycleMonto, updated_at: new Date().toISOString() })
+              .eq("id", flowSub.id);
+
+            if (subUpdateErr) throw subUpdateErr;
+          }
+        } catch (flowErr) {
+          console.error(
+            `POST /billing/apply-scheduled-changes: no se pudo sincronizar el downgrade de tenant ${tenant.id} con Flow:`,
+            flowErr.message
+          );
         }
-      } catch (flowErr) {
-        console.error(
-          `POST /billing/apply-scheduled-changes: no se pudo sincronizar el downgrade de tenant ${tenant.id} con Flow:`,
-          flowErr.message
-        );
+
+        // Downgrade efectivo: cancelar add-ons que el plan nuevo no soporta
+        const canceledAddons = await cancelUnsupportedAddons(tenant.id, newPlan);
+
+        if (canceledAddons.length > 0) {
+          console.log(
+            `Downgrade tenant ${tenant.id} a ${newPlan}: add-ons cancelados → ${canceledAddons.join(", ")}`
+          );
+        }
+
+        applied++;
       }
 
-      // Downgrade efectivo: cancelar add-ons que el plan nuevo no soporta
-      const canceledAddons = await cancelUnsupportedAddons(tenant.id, newPlan);
-
-      // Resetear add-ons mensuales con facturación vencida
+      // Resetear add-ons mensuales con facturación vencida — mantenimiento
+      // independiente del downgrade (ver comentario arriba), corre siempre
+      // para el tenant, se haya aplicado el downgrade o haya quedado
+      // bloqueado por exceso de staff/sucursales.
       await resetMonthlyAddons(tenant.id);
-
-      if (canceledAddons.length > 0) {
-        console.log(
-          `Downgrade tenant ${tenant.id} a ${newPlan}: add-ons cancelados → ${canceledAddons.join(", ")}`
-        );
-      }
-
-      applied++;
     }
 
     return res.json({
