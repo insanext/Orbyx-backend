@@ -67,12 +67,12 @@ const PLAN_LIMITS = {
 };
 
 function normalizePlan(plan) {
-  if (!plan) return "pro";
+  if (!plan) return "starter";
   const p = plan.toLowerCase();
   if (p === "premium") return "premium";
   if (p === "vip") return "vip";
   if (p === "platinum") return "platinum";
-  return "pro";
+  return "starter";
 }
 
 function isValidMime(mime) {
@@ -95,45 +95,32 @@ function normalizeNullableNumber(value) {
 // (GET/PATCH /admin/plans) — nunca se debería depender de esto en
 // operación normal.
 const DEFAULT_PLAN_CAPS = {
-  pro: {
+  starter: {
     max_staff: 2,
     max_services: 999999,
     max_branches: 1,
-    max_campaign_emails_per_send: 200,
-    max_group_capacity: 10,
+    max_campaign_emails_per_send: 0,
+    max_group_capacity: 5,
     max_wa_confirmacion: 100,
     max_campanas_wa: 0,
-    max_ia_wa: 0,
   },
-  premium: {
+  business: {
     max_staff: 5,
     max_services: 999999,
     max_branches: 2,
-    max_campaign_emails_per_send: 1000,
-    max_group_capacity: 25,
-    max_wa_confirmacion: 200,
+    max_campaign_emails_per_send: 500,
+    max_group_capacity: 10,
+    max_wa_confirmacion: 250,
     max_campanas_wa: 0,
-    max_ia_wa: 0,
   },
-  vip: {
+  premium: {
     max_staff: 10,
     max_services: 999999,
     max_branches: 3,
-    max_campaign_emails_per_send: 2000,
-    max_group_capacity: 50,
-    max_wa_confirmacion: 300,
-    max_campanas_wa: 0,
-    max_ia_wa: 500,
-  },
-  platinum: {
-    max_staff: 25,
-    max_services: 999999,
-    max_branches: 10,
-    max_campaign_emails_per_send: 5000,
-    max_group_capacity: 100,
-    max_wa_confirmacion: 500,
-    max_campanas_wa: 0,
-    max_ia_wa: 1500,
+    max_campaign_emails_per_send: 1500,
+    max_group_capacity: 25,
+    max_wa_confirmacion: 400,
+    max_campanas_wa: 50,
   },
 };
 
@@ -157,7 +144,6 @@ async function refreshPlanCapsCache() {
         max_group_capacity: row.max_group_capacity,
         max_wa_confirmacion: row.max_wa_confirmacion,
         max_campanas_wa: row.max_campanas_wa,
-        max_ia_wa: row.max_ia_wa,
       };
     }
     PLAN_CAPS_CACHE = next;
@@ -168,17 +154,13 @@ async function refreshPlanCapsCache() {
 refreshPlanCapsCache();
 
 function getPlanCapabilities(plan, opts = {}) {
-  const normalizedPlan = String(plan || "pro").toLowerCase();
+  const normalizedPlan = String(plan || "starter").toLowerCase();
   const plans = PLAN_CAPS_CACHE || DEFAULT_PLAN_CAPS;
 
-  if (normalizedPlan === "starter") {
-    return plans.pro || DEFAULT_PLAN_CAPS.pro;
-  }
+  const caps = plans[normalizedPlan] || plans.starter || DEFAULT_PLAN_CAPS.starter;
 
-  const caps = plans[normalizedPlan] || plans.pro || DEFAULT_PLAN_CAPS.pro;
-
-  // Durante versión de prueba Pro: wa_confirmacion no incluido
-  if (opts.is_trial && normalizedPlan === "pro") {
+  // Durante trial (plan starter): wa_confirmacion no incluido
+  if (opts.is_trial && normalizedPlan === "starter") {
     return { ...caps, max_wa_confirmacion: 0 };
   }
 
@@ -186,17 +168,15 @@ function getPlanCapabilities(plan, opts = {}) {
 }
 
 const PLAN_PRICES = {
-  pro: 12990,
-  premium: 29990,
-  vip: 54990,
-  platinum: 149990,
+  starter: 14990,
+  business: 29990,
+  premium: 54990,
 };
 
 const PLAN_ORDER = {
-  pro: 1,
-  premium: 2,
-  vip: 3,
-  platinum: 4,
+  starter: 1,
+  business: 2,
+  premium: 3,
 };
 
 const BILLING_CYCLE_DAYS = 30;
@@ -237,19 +217,27 @@ function inferBillingCycle(billingStart, billingEnd) {
 }
 
 function getPriorityByPlan(plan) {
-  const map = { pro: "normal", premium: "media", vip: "alta", platinum: "maxima" };
-  return map[String(plan || "pro").toLowerCase()] ?? "normal";
+  const map = { starter: "normal", business: "media", premium: "alta" };
+  return map[String(plan || "starter").toLowerCase()] ?? "normal";
 }
 
+// Reconoce tanto los slugs nuevos (starter/business/premium) como los slugs
+// viejos pre-migración 2026-08-21 (pro/vip/platinum) — necesario mientras
+// existan tenants NO migrados automáticamente (ver informe de migración:
+// tenants con suscripción Flow activa que se dejaron sin tocar a propósito).
+// Sin este alias, esos tenants caerían al fallback "starter" y perderían
+// sus límites reales aunque su fila en `tenants` siga intacta. Usa el mismo
+// mapeo que la migración de datos: pro→starter, vip/platinum→premium.
 function normalizePlanSlug(plan) {
-  const normalized = String(plan || "pro").toLowerCase();
-  if (normalized === "starter") return "pro";
+  const normalized = String(plan || "starter").toLowerCase();
+  if (normalized === "pro") return "starter";
+  if (normalized === "vip" || normalized === "platinum") return "premium";
   if (PLAN_ORDER[normalized]) return normalized;
-  return "pro";
+  return "starter";
 }
 
 function getPlanPrice(plan) {
-  return PLAN_PRICES[normalizePlanSlug(plan)] || PLAN_PRICES.pro;
+  return PLAN_PRICES[normalizePlanSlug(plan)] || PLAN_PRICES.starter;
 }
 
 // Total del ciclo: mensual = precio; semestral = precio × 6 × 0.90; anual = precio × 12 × 0.85
@@ -288,8 +276,8 @@ const DEFAULT_ADDON_CATALOG = {
     price_pack3: 2542,
     pack_size: 50,
     grants: { wa_confirmacion: 50 },
-    min_plan: "pro",
-    available_for: ["pro", "premium", "vip", "platinum"],
+    min_plan: "starter",
+    available_for: ["starter", "business", "premium"],
     resets_monthly: true,
     accumulates: false,
   },
@@ -298,40 +286,26 @@ const DEFAULT_ADDON_CATALOG = {
     name: "Campañas WhatsApp",
     description: "50 msgs campaña marketing adicionales/mes",
     price: 6990,
-    price_pack2: 6291,
-    price_pack3: 5942,
+    price_pack2: 6990,
+    price_pack3: 6990,
     pack_size: 50,
     grants: { campanas_wa: 50 },
-    min_plan: "vip",
-    available_for: ["vip", "platinum"],
-    resets_monthly: true,
-    accumulates: false,
-  },
-  ia_wa: {
-    key: "ia_wa",
-    name: "IA WhatsApp",
-    description: "500 conversaciones IA adicionales/mes",
-    price: 14990,
-    price_pack2: 13491,
-    price_pack3: 12742,
-    pack_size: 500,
-    grants: { ia_wa: 500 },
-    min_plan: "vip",
-    available_for: ["vip", "platinum"],
+    min_plan: "premium",
+    available_for: ["premium"],
     resets_monthly: true,
     accumulates: false,
   },
   emails_campana: {
     key: "emails_campana",
     name: "Pack emails campaña",
-    description: "2.000 correos campaña adicionales/mes",
+    description: "500 correos campaña adicionales/mes",
     price: 1990,
     price_pack2: 1990,
     price_pack3: 1990,
-    pack_size: 2000,
-    grants: { emails_campana: 2000 },
-    min_plan: "pro",
-    available_for: ["pro", "premium", "vip", "platinum"],
+    pack_size: 500,
+    grants: { emails_campana: 500 },
+    min_plan: "business",
+    available_for: ["business", "premium"],
     resets_monthly: true,
     accumulates: false,
   },
@@ -344,8 +318,8 @@ const DEFAULT_ADDON_CATALOG = {
     price_pack3: 5990,
     pack_size: 1,
     grants: { staff: 1 },
-    min_plan: "premium",
-    available_for: ["premium", "vip", "platinum"],
+    min_plan: "starter",
+    available_for: ["starter", "business", "premium"],
     resets_monthly: false,
     accumulates: false,
   },
@@ -358,8 +332,8 @@ const DEFAULT_ADDON_CATALOG = {
     price_pack3: 9990,
     pack_size: 1,
     grants: { sucursal: 1 },
-    min_plan: "premium",
-    available_for: ["premium", "vip", "platinum"],
+    min_plan: "starter",
+    available_for: ["starter", "business", "premium"],
     resets_monthly: false,
     accumulates: false,
   },
@@ -367,13 +341,13 @@ const DEFAULT_ADDON_CATALOG = {
     key: "group_capacity",
     name: "+ Cupos grupales",
     description: "25 cupos adicionales por slot grupal",
-    price: 4900,
-    price_pack2: 4900,
-    price_pack3: 4900,
+    price: 4990,
+    price_pack2: 4990,
+    price_pack3: 4990,
     pack_size: 25,
     grants: { group_capacity: 25 },
-    min_plan: "premium",
-    available_for: ["premium", "vip", "platinum"],
+    min_plan: "starter",
+    available_for: ["starter", "business", "premium"],
     resets_monthly: false,
     accumulates: false,
   },
@@ -719,7 +693,6 @@ async function resetMonthlyAddons(tenant_id) {
 const MONTHLY_RESOURCE_CAP_KEY = {
   wa_confirmacion: "max_wa_confirmacion",
   campanas_wa: "max_campanas_wa",
-  ia_wa: "max_ia_wa",
   emails_campana: "max_campaign_emails_per_send",
 };
 
@@ -903,7 +876,7 @@ async function sendBookingConfirmations({
 }
 
 function getPlanLevel(plan) {
-  return PLAN_ORDER[normalizePlanSlug(plan)] || PLAN_ORDER.pro;
+  return PLAN_ORDER[normalizePlanSlug(plan)] || PLAN_ORDER.starter;
 }
 
 function isUpgradePlanChange(currentPlan, newPlan) {
@@ -1019,7 +992,7 @@ async function getTenantSubscriptionRow(tenant_id) {
 
   if (error) throw error;
 
-  const currentPlan = normalizePlanSlug(data?.plan_slug || data?.plan || "pro");
+  const currentPlan = normalizePlanSlug(data?.plan_slug || data?.plan || "starter");
   const { billingStart, billingEnd } = ensureBillingDates(data);
 
   return {
@@ -1067,7 +1040,7 @@ async function getPlan(tenant_id) {
 
   if (error) throw error;
 
-  return normalizePlanSlug(data?.plan_slug || data?.plan || "pro");
+  return normalizePlanSlug(data?.plan_slug || data?.plan || "starter");
 }
 
 async function getServicesCount(tenant_id) {
@@ -7929,7 +7902,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    const currentPlan = normalizePlanSlug(tenant.plan_slug || tenant.plan || "pro");
+    const currentPlan = normalizePlanSlug(tenant.plan_slug || tenant.plan || "starter");
     // Cupo restante este mes = (base del plan + add-ons "emails_campana"
     // activos) − lo ya enviado este mes (tenant_monthly_usage). Antes esto
     // se calculaba solo con caps.max_campaign_emails_per_send, ignorando
@@ -8409,7 +8382,7 @@ app.post("/campaigns/save-whatsapp", tenantAuthSlugWrite, async (req, res) => {
     const normalizedChannel = String(channel || "whatsapp").trim().toLowerCase();
     const normalizedSegment = String(segment).trim().toLowerCase();
     const normalizedSort = String(sort || "oldest").trim().toLowerCase();
-    const normalizedPlan = normalizePlanSlug(plan || "pro");
+    const normalizedPlan = normalizePlanSlug(plan || "starter");
 
     if (normalizedChannel !== "whatsapp") {
       return res.status(400).json({
@@ -9588,7 +9561,7 @@ app.get("/_ping", (req, res) => {
 // provisionTenantCore/linkTenantOwner: lógica interna de /tenants/provision
 // extraída para reusarse desde el flujo de signup pagado (premium/vip/platinum),
 // donde el tenant se crea antes de que exista un user_id de Supabase Auth.
-async function provisionTenantCore({ email, plan = "pro", billing_cycle }) {
+async function provisionTenantCore({ email, plan = "starter", billing_cycle }) {
   const provisionCycle = normalizeBillingCycle(billing_cycle);
 
   const baseSlug = String(email).split("@")[0] || "tenant";
@@ -9609,19 +9582,19 @@ async function provisionTenantCore({ email, plan = "pro", billing_cycle }) {
   ).toISOString();
 
   const normalizedProvisionPlan = normalizePlanSlug(plan);
-  const isTrialProvision = normalizedProvisionPlan === "pro";
+  const isTrialProvision = normalizedProvisionPlan === "starter";
 
   // trial_ends_at solo aplica a tenants que nacen en el plan gratuito
-  // 'pro' — se lee trial_days desde plan_config (nunca hardcodeado) para
+  // 'starter' — se lee trial_days desde plan_config (nunca hardcodeado) para
   // que quede consistente con lo que el panel admin de planes edite.
   let trialEndsAt = null;
   if (isTrialProvision) {
-    const { data: proPlanConfig } = await supabase
+    const { data: starterPlanConfig } = await supabase
       .from("plan_config")
       .select("trial_days")
-      .eq("plan_slug", "pro")
+      .eq("plan_slug", "starter")
       .maybeSingle();
-    const trialDays = Number(proPlanConfig?.trial_days) || 30;
+    const trialDays = Number(starterPlanConfig?.trial_days) || 30;
     trialEndsAt = new Date(
       Date.now() + trialDays * 24 * 60 * 60 * 1000
     ).toISOString();
@@ -9828,7 +9801,7 @@ async function recordLegalAcceptancesAndSendConfirmation({
 ====================================================== */
 app.post("/tenants/provision", async (req, res) => {
   try {
-    const { user_id, email, plan = "pro", billing_cycle } = req.body;
+    const { user_id, email, plan = "starter", billing_cycle } = req.body;
 
     if (!user_id || !email) {
       return res.status(400).json({ error: "Faltan campos: user_id, email" });
@@ -10241,7 +10214,6 @@ app.get("/billing/addons", tenantAuth, async (req, res) => {
           },
           wa_confirmacion: usageEntry(caps.max_wa_confirmacion, "wa_confirmacion"),
           campanas_wa: usageEntry(caps.max_campanas_wa || 0, "campanas_wa"),
-          ia_wa: usageEntry(caps.max_ia_wa, "ia_wa"),
           emails_campana: usageEntry(caps.max_campaign_emails_per_send, "emails_campana"),
           group_capacity: {
             base: caps.max_group_capacity,
@@ -10270,7 +10242,7 @@ app.get("/billing/addons", tenantAuth, async (req, res) => {
 /* ======================================================
    ✅ GET /billing/account-status
    Estado de cuenta para el widget del dashboard: trial, pago y
-   contadores de WA confirmación + IA WhatsApp.
+   contador de WA confirmación.
 
    No confía en tenants.is_trial (quedaba desactualizado — nunca se
    apagaba solo con un pago real hasta el fix del webhook de Flow más
@@ -10341,8 +10313,8 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       ? Math.max(0, Math.ceil((billingCycleEnd.getTime() - now.getTime()) / msPerDay))
       : null;
 
-    // Contadores WA confirmación + IA WA — misma fuente y forma que
-    // GET /billing/addons (limits.wa_confirmacion / limits.ia_wa), sin
+    // Contador WA confirmación — misma fuente y forma que
+    // GET /billing/addons (limits.wa_confirmacion), sin
     // duplicar la lógica de resets/uso.
     const normalizedPlan = normalizePlanSlug(tenant.plan_slug);
     await resetMonthlyAddons(tenant_id);
@@ -10387,7 +10359,6 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       blocked,
       blocked_reason: !blocked ? null : trialExpired ? "trial_expired" : "payment_overdue",
       wa_confirmacion: usageEntry(caps.max_wa_confirmacion, "wa_confirmacion"),
-      ia_wa: usageEntry(caps.max_ia_wa, "ia_wa"),
       wa_confirmation_enabled: Boolean(tenant.wa_confirmation_enabled),
       wa_reminder_enabled: Boolean(tenant.wa_reminder_enabled),
       wa_reminder_hours_before: [1, 2].includes(Number(tenant.wa_reminder_hours_before))
@@ -11854,7 +11825,7 @@ app.get("/billing/flow/payment-history", tenantAuthWrite, async (req, res) => {
 // =======================
 // SIGNUP PAGADO — PREMIUM/VIP/PLATINUM (pago primero, tenant después)
 // =======================
-const PAID_SIGNUP_PLANS = new Set(["premium", "vip", "platinum"]);
+const PAID_SIGNUP_PLANS = new Set(["business", "premium"]);
 
 /* ======================================================
    ✅ POST /signup/start-paid (sandbox)
@@ -11874,7 +11845,7 @@ app.post("/signup/start-paid", publicLimiter, async (req, res) => {
     const normalizedPlan = String(plan_id).toLowerCase();
     if (!PAID_SIGNUP_PLANS.has(normalizedPlan)) {
       return res.status(400).json({
-        error: "plan_id debe ser premium, vip o platinum. El plan Pro usa el onboarding normal.",
+        error: "plan_id debe ser business o premium. El plan starter usa el onboarding normal.",
       });
     }
 
@@ -15574,7 +15545,6 @@ const PLAN_CONFIG_EDITABLE_FIELDS = [
   "branches_limit",
   "email_campaign_limit",
   "max_wa_confirmacion",
-  "max_ia_wa",
   "max_group_capacity",
   "max_campanas_wa",
   "is_active",
