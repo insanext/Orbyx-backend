@@ -364,9 +364,22 @@ let ADDON_CATALOG = { ...DEFAULT_ADDON_CATALOG };
 // "grants" no vive como columna propia: en todos los add-ons de hoy
 // grants = { [addon_key]: pack_size }, así que un solo número alcanza
 // para reconstruirlo al leer desde la tabla.
+// Filtra is_active:true a propósito (fix 2026-08-21): un addon
+// desactivado (ej. ia_wa, retirado del producto pero con su fila
+// conservada en vez de borrada) NO debe terminar en ADDON_CATALOG —
+// si no se filtra acá, POST /billing/addons/activate lo sigue aceptando
+// porque solo chequea `ADDON_CATALOG[addon_key]` y
+// isAddonAvailableForPlan, ninguno de los dos mira is_active. A
+// diferencia de refreshPlanCapsCache (que SÍ debe traer las filas
+// inactivas de plan_config, para no romper las capacidades de tenants
+// legacy no migrados — ver LEGACY_PLAN_SLUGS), acá no hay ningún
+// caso que necesite ver un addon retirado en el catálogo vigente.
 async function refreshAddonCatalogCache() {
   try {
-    const { data, error } = await supabase.from("addon_config").select("*");
+    const { data, error } = await supabase
+      .from("addon_config")
+      .select("*")
+      .eq("is_active", true);
     if (error) throw error;
     const next = { ...DEFAULT_ADDON_CATALOG };
     for (const row of data || []) {
