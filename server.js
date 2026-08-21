@@ -221,18 +221,21 @@ function getPriorityByPlan(plan) {
   return map[String(plan || "starter").toLowerCase()] ?? "normal";
 }
 
-// Reconoce tanto los slugs nuevos (starter/business/premium) como los slugs
-// viejos pre-migración 2026-08-21 (pro/vip/platinum) — necesario mientras
-// existan tenants NO migrados automáticamente (ver informe de migración:
-// tenants con suscripción Flow activa que se dejaron sin tocar a propósito).
-// Sin este alias, esos tenants caerían al fallback "starter" y perderían
-// sus límites reales aunque su fila en `tenants` siga intacta. Usa el mismo
-// mapeo que la migración de datos: pro→starter, vip/platinum→premium.
+// Slugs viejos pre-migración 2026-08-21 que YA NO están en PLAN_ORDER pero
+// cuya fila en plan_config se conservó a propósito (is_active:false, no
+// borrada) — ver tenants con suscripción Flow activa que se dejaron sin
+// migrar automáticamente. Deben pasar intactos, NO alias a un slug nuevo:
+// getPlanCapabilities() indexa directamente por el string que reciba, así
+// que devolver el slug literal aquí es lo que le permite encontrar la fila
+// ORIGINAL (staff/sucursales/wa reales) en vez de las del plan nuevo
+// (más chico) al que "sonarían parecido". Confundir esto downgradeaba en
+// silencio las capacidades de esos tenants sin tocar su fila en `tenants`.
+const LEGACY_PLAN_SLUGS = new Set(["pro", "vip", "platinum"]);
+
 function normalizePlanSlug(plan) {
   const normalized = String(plan || "starter").toLowerCase();
-  if (normalized === "pro") return "starter";
-  if (normalized === "vip" || normalized === "platinum") return "premium";
   if (PLAN_ORDER[normalized]) return normalized;
+  if (LEGACY_PLAN_SLUGS.has(normalized)) return normalized;
   return "starter";
 }
 
@@ -9581,7 +9584,15 @@ async function provisionTenantCore({ email, plan = "starter", billing_cycle }) {
     BILLING_CYCLES[provisionCycle].months
   ).toISOString();
 
-  const normalizedProvisionPlan = normalizePlanSlug(plan);
+  // "pro" es el alias histórico del plan gratuito (ahora "starter") — se
+  // resuelve SOLO acá, para signups nuevos. normalizePlanSlug ya NO hace
+  // este alias en general (rompería getPlanCapabilities para los tenants
+  // viejos no migrados que todavía tienen plan_slug="pro" en su fila real
+  // — ver LEGACY_PLAN_SLUGS más arriba). Acá no hay ese riesgo: un tenant
+  // recién creado nunca tuvo capacidades "pro" que preservar.
+  const requestedProvisionPlan =
+    String(plan || "starter").toLowerCase() === "pro" ? "starter" : plan;
+  const normalizedProvisionPlan = normalizePlanSlug(requestedProvisionPlan);
   const isTrialProvision = normalizedProvisionPlan === "starter";
 
   // trial_ends_at solo aplica a tenants que nacen en el plan gratuito
