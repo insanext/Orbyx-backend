@@ -533,6 +533,42 @@ async function getEffectiveLimit(tenant_id, plan, capKey, addonKey) {
   }
 }
 
+// Igual que getEffectiveLimit, pero para un plan HIPOTÉTICO en vez del plan
+// actual del tenant — sirve para previsualizar el límite que tendría un
+// recurso bajo un downgrade todavía no aplicado. Si el add-on ya no estaría
+// disponible en ese plan (misma regla que isAddonAvailableForPlan, la que
+// usa cancelUnsupportedAddons para decidir qué cancelar en el downgrade
+// real), no lo suma: simula que ya fue cancelado.
+async function getEffectiveLimitForPlan(tenant_id, plan, capKey, addonKey) {
+  const baseLimit = getPlanCapabilities(plan)[capKey] || 0;
+
+  if (!isAddonAvailableForPlan(addonKey, plan)) {
+    return baseLimit;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("tenant_addons")
+      .select("quantity")
+      .eq("tenant_id", tenant_id)
+      .eq("addon_key", addonKey)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const packs = Number(data?.quantity) || 0;
+    const packSize = ADDON_CATALOG[addonKey]?.pack_size || 1;
+    return baseLimit + packs * packSize;
+  } catch (err) {
+    console.warn(
+      `getEffectiveLimitForPlan(${addonKey}): usando límite base del plan:`,
+      err.message
+    );
+    return baseLimit;
+  }
+}
+
 // Errores de PostgREST cuando la tabla tenant_addons todavía no fue migrada
 function isMissingAddonsTableError(err) {
   return Boolean(
@@ -583,6 +619,60 @@ async function cancelUnsupportedAddons(tenant_id, newPlan) {
     );
     return [];
   }
+}
+
+// Valida que un downgrade a targetPlan no deje al tenant con más staff o
+// sucursales activas de las que el plan destino permite (considerando qué
+// add-ons de staff/sucursal sobrevivirían al cambio, ver
+// getEffectiveLimitForPlan). Solo reporta — no desactiva ni borra nada.
+// Devuelve null si todo entra dentro del límite, o { excesses, message }
+// con el detalle de qué recurso(s) exceden y por cuánto.
+async function checkDowngradeResourceLimits(tenant_id, targetPlan) {
+  const [activeStaffCount, activeBranchesCount, maxStaff, maxBranches] =
+    await Promise.all([
+      getActiveStaffCount(tenant_id),
+      getBranchesCount(tenant_id),
+      getEffectiveLimitForPlan(tenant_id, targetPlan, "max_staff", "staff"),
+      getEffectiveLimitForPlan(
+        tenant_id,
+        targetPlan,
+        "max_branches",
+        "sucursal"
+      ),
+    ]);
+
+  const excesses = [];
+
+  if (activeStaffCount > maxStaff) {
+    excesses.push({
+      resource: "staff",
+      label: "staff activo",
+      current: activeStaffCount,
+      limit: maxStaff,
+      excess: activeStaffCount - maxStaff,
+    });
+  }
+
+  if (activeBranchesCount > maxBranches) {
+    excesses.push({
+      resource: "branches",
+      label: "sucursales activas",
+      current: activeBranchesCount,
+      limit: maxBranches,
+      excess: activeBranchesCount - maxBranches,
+    });
+  }
+
+  if (excesses.length === 0) return null;
+
+  const message = excesses
+    .map(
+      (e) =>
+        `${e.current} ${e.label} (el plan ${targetPlan} permite máximo ${e.limit}, ${e.excess} de más)`
+    )
+    .join("; ");
+
+  return { excesses, message };
 }
 
 // Resetea add-ons con resets_monthly:true cuando han pasado ≥30 días desde el último reset.
@@ -945,6 +1035,23 @@ async function getStaffCount(tenant_id) {
     .from("staff")
     .select("*", { count: "exact", head: true })
     .eq("tenant_id", tenant_id);
+
+  if (error) throw error;
+
+  return count || 0;
+}
+
+// A diferencia de getStaffCount (cuenta TODAS las filas, usada como gate de
+// creación para que no se pueda "esquivar" el límite creando y desactivando),
+// esta cuenta solo staff activo — es lo que corresponde comparar contra el
+// límite de un plan destino en un downgrade, igual que ya hace la UI de
+// staff/page.tsx y billing/page.tsx (activeStaff = staff.filter(is_active)).
+async function getActiveStaffCount(tenant_id) {
+  const { count, error } = await supabase
+    .from("staff")
+    .select("*", { count: "exact", head: true })
+    .eq("tenant_id", tenant_id)
+    .eq("is_active", true);
 
   if (error) throw error;
 
@@ -9996,6 +10103,23 @@ app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
       });
     }
 
+    // Cierra el hueco de que alguien llame la API directamente saltándose
+    // la validación de excedente de staff/sucursales que hoy solo existe en
+    // el frontend (staff/page.tsx, branches/page.tsx) — sin esto, se podía
+    // agendar un downgrade aunque el tenant tuviera más staff o sucursales
+    // activas de las que el plan destino permite.
+    const downgradeLimitCheck = await checkDowngradeResourceLimits(
+      tenant_id,
+      targetPlan
+    );
+
+    if (downgradeLimitCheck) {
+      return res.status(409).json({
+        error: `No puedes bajar al plan ${targetPlan}: ${downgradeLimitCheck.message}. Desactiva el excedente antes de continuar.`,
+        excess: downgradeLimitCheck.excesses,
+      });
+    }
+
     const { data, error } = await supabase
       .from("tenants")
       .update({
@@ -10898,9 +11022,33 @@ app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) =
     if (fetchError) throw fetchError;
 
     let applied = 0;
+    let blockedByLimits = 0;
 
     for (const tenant of tenantsToApply || []) {
       const newPlan = normalizePlanSlug(tenant.scheduled_plan_slug);
+
+      // El estado del tenant pudo cambiar entre agendar el downgrade y este
+      // momento (ej. agregó staff durante el período de gracia) — se
+      // revalida acá igual que en POST /billing/change-plan. Si sigue
+      // habiendo exceso: no se aplica el downgrade, no se desactiva ni
+      // borra nada para forzar que entre, el tenant queda en su plan
+      // actual (scheduled_plan_slug/scheduled_change_at intactos, para que
+      // el próximo run del cron lo vuelva a intentar) y solo se deja un
+      // warning para revisión manual — mismo patrón de manejo de fallos
+      // que usa chargeRecurringAddons para casos que no se pueden
+      // completar automáticamente.
+      const downgradeLimitCheck = await checkDowngradeResourceLimits(
+        tenant.id,
+        newPlan
+      );
+
+      if (downgradeLimitCheck) {
+        console.warn(
+          `POST /billing/apply-scheduled-changes: downgrade de tenant ${tenant.id} a ${newPlan} bloqueado — ${downgradeLimitCheck.message}. Requiere revisión manual.`
+        );
+        blockedByLimits++;
+        continue;
+      }
 
       // El nuevo ciclo conserva la duración del ciclo anterior del tenant
       // (mensual renueva igual que antes con addOneMonth-equivalente).
@@ -10996,6 +11144,7 @@ app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) =
     return res.json({
       ok: true,
       applied,
+      blocked_by_limits: blockedByLimits,
     });
   } catch (err) {
     console.error("POST /billing/apply-scheduled-changes error:", err.message);
