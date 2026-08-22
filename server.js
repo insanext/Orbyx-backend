@@ -712,6 +712,14 @@ const MONTHLY_RESOURCE_CAP_KEY = {
   emails_campana: "max_campaign_emails_per_send",
 };
 
+// Cupo del plan (resetea solo, ver más abajo) vs. saldo de add-ons (persiste
+// entre ciclos, ver "Cupo mensual vs. saldo de add-ons" más arriba de
+// resetMonthlyAddons). `used` acá es SOLO lo consumido contra el cupo del
+// plan en el período actual — no incluye lo consumido contra el saldo de
+// add-ons (ese consumo baja `balance` directamente y no se re-suma cada mes,
+// por diseño: es plata ya pagada que no debe perderse). `remaining` sí es la
+// suma de ambos — es el número real que determina si todavía se puede
+// enviar/usar el recurso.
 async function checkMonthlyUsage(tenant_id, resource) {
   const plan = await getPlan(tenant_id);
   const caps = getPlanCapabilities(plan);
@@ -720,29 +728,27 @@ async function checkMonthlyUsage(tenant_id, resource) {
 
   const baseCap = caps[capKey] || 0;
 
-  // Capacidad de add-ons activos para este recurso
-  let addonCap = 0;
+  // Saldo de add-ons activo para este recurso (persiste entre ciclos)
+  let addonBalance = 0;
   let addonRow = null;
   const addonDef = ADDON_CATALOG[resource];
   if (addonDef) {
     try {
       const { data } = await supabase
         .from("tenant_addons")
-        .select("id, quantity, low_balance_recharge_enabled, low_balance_recharge_in_progress")
+        .select("id, quantity, balance, low_balance_recharge_enabled, low_balance_recharge_in_progress")
         .eq("tenant_id", tenant_id)
         .eq("addon_key", resource)
         .eq("status", "active")
         .maybeSingle();
       addonRow = data;
-      const qty = Number(addonRow?.quantity) || 0;
-      addonCap = qty * (addonDef.grants[resource] || 0);
+      addonBalance = Math.max(0, Number(addonRow?.balance) || 0);
     } catch (_) {}
   }
 
-  const total = baseCap + addonCap;
   const period = new Date().toISOString().slice(0, 7);
 
-  let used = 0;
+  let planUsed = 0;
   try {
     const { data: usageRow } = await supabase
       .from("tenant_monthly_usage")
@@ -751,10 +757,12 @@ async function checkMonthlyUsage(tenant_id, resource) {
       .eq("resource", resource)
       .eq("period", period)
       .maybeSingle();
-    used = Number(usageRow?.used) || 0;
+    planUsed = Number(usageRow?.used) || 0;
   } catch (_) {}
 
-  const remaining = Math.max(0, total - used);
+  const planRemaining = Math.max(0, baseCap - planUsed);
+  const total = baseCap + addonBalance;
+  const remaining = planRemaining + addonBalance;
 
   // Recarga automática por saldo bajo: fire-and-forget, nunca bloquea ni
   // afecta el resultado de checkMonthlyUsage — mismo patrón que
@@ -772,7 +780,7 @@ async function checkMonthlyUsage(tenant_id, resource) {
     );
   }
 
-  return { allowed: total > 0 && used < total, limit: total, base: baseCap, addon: addonCap, used, remaining };
+  return { allowed: remaining > 0, limit: total, base: baseCap, addon: addonBalance, used: planUsed, remaining };
 }
 
 async function incrementMonthlyUsage(tenant_id, resource, amount = 1) {
@@ -799,6 +807,72 @@ async function incrementMonthlyUsage(tenant_id, resource, amount = 1) {
   } catch (err) {
     console.warn("incrementMonthlyUsage error:", err.message);
   }
+}
+
+// Resta `amount` del saldo de add-ons activo del tenant para ese recurso
+// (tenant_addons.balance). Nunca baja de 0. Tolerante a que no exista
+// add-on activo (no hace nada) — mismo criterio best-effort que el resto
+// de las funciones de uso mensual en este archivo.
+async function decrementAddonBalance(tenant_id, resource, amount) {
+  if (amount <= 0) return;
+  try {
+    const { data: row } = await supabase
+      .from("tenant_addons")
+      .select("id, balance")
+      .eq("tenant_id", tenant_id)
+      .eq("addon_key", resource)
+      .eq("status", "active")
+      .maybeSingle();
+    if (!row) return;
+
+    const newBalance = Math.max(0, Number(row.balance || 0) - amount);
+    await supabase
+      .from("tenant_addons")
+      .update({ balance: newBalance, updated_at: new Date().toISOString() })
+      .eq("id", row.id);
+  } catch (err) {
+    console.warn(`decrementAddonBalance(${resource}) tenant ${tenant_id}:`, err.message);
+  }
+}
+
+// Función central de consumo: descuenta primero del cupo del plan del ciclo
+// en curso (tenant_monthly_usage, resetea solo al cambiar el period
+// "YYYY-MM") y recién cuando ese cupo llega a 0 empieza a bajar el saldo de
+// add-ons ya pagado (tenant_addons.balance, persiste entre ciclos). Es el
+// único punto que debe llamarse al consumir de verdad un mensaje/correo de
+// estos 3 recursos. Call sites reales hoy: wa_confirmacion (POST
+// /whatsapp/status-callback, al confirmar delivered) y emails_campana
+// (POST /campaigns/send-email, ya envía de verdad — sí está construido,
+// a diferencia de lo asumido al iniciar este cambio). campanas_wa no tiene
+// ningún hook todavía: /campaigns/save-whatsapp solo guarda el historial,
+// no envía nada por Twilio — confirmado sin call site real.
+async function consumeResourceUsage(tenant_id, resource, amount = 1) {
+  const plan = await getPlan(tenant_id);
+  const caps = getPlanCapabilities(plan);
+  const capKey = MONTHLY_RESOURCE_CAP_KEY[resource];
+  const baseCap = capKey ? caps[capKey] || 0 : 0;
+  const period = new Date().toISOString().slice(0, 7);
+
+  let planUsed = 0;
+  try {
+    const { data: usageRow } = await supabase
+      .from("tenant_monthly_usage")
+      .select("used")
+      .eq("tenant_id", tenant_id)
+      .eq("resource", resource)
+      .eq("period", period)
+      .maybeSingle();
+    planUsed = Number(usageRow?.used) || 0;
+  } catch (_) {}
+
+  const planRemaining = Math.max(0, baseCap - planUsed);
+  const fromPlan = Math.min(planRemaining, amount);
+  const fromAddon = amount - fromPlan;
+
+  if (fromPlan > 0) await incrementMonthlyUsage(tenant_id, resource, fromPlan);
+  if (fromAddon > 0) await decrementAddonBalance(tenant_id, resource, fromAddon);
+
+  return { fromPlan, fromAddon };
 }
 
 // Registra un envío de WhatsApp en whatsapp_message_log para que el cupo
@@ -8165,7 +8239,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
       // en la rama sin audiencia curada (abajo), dejando este camino sin
       // contar contra el cupo mensual del tenant.
       if (sent > 0) {
-        await incrementMonthlyUsage(tenant.id, "emails_campana", sent);
+        await consumeResourceUsage(tenant.id, "emails_campana", sent);
       }
 
       return res.json({
@@ -8338,7 +8412,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
 
     // Registrar uso mensual de emails_campana
     if (sent > 0) {
-      await incrementMonthlyUsage(tenant.id, "emails_campana", sent);
+      await consumeResourceUsage(tenant.id, "emails_campana", sent);
     }
 
     return res.json({
@@ -10204,18 +10278,23 @@ app.get("/billing/addons", tenantAuth, async (req, res) => {
         const caps = getPlanCapabilities(normalizedPlan);
         const period = new Date().toISOString().slice(0, 7);
 
-        // Cantidades de add-ons activos (una sola query)
+        // Cantidades y saldo de add-ons activos (una sola query)
         const { data: addonRows } = await supabase
           .from("tenant_addons")
-          .select("addon_key, quantity")
+          .select("addon_key, quantity, balance")
           .eq("tenant_id", tenant_id)
           .eq("status", "active");
         const addonQty = {};
+        const addonBalance = {};
         for (const row of addonRows || []) {
           addonQty[row.addon_key] = Number(row.quantity) || 0;
+          addonBalance[row.addon_key] = Math.max(0, Number(row.balance) || 0);
         }
 
-        // Uso mensual actual (una sola query)
+        // Uso mensual actual (una sola query) — solo cuenta contra el cupo
+        // del plan (tenant_monthly_usage), ver checkMonthlyUsage/
+        // consumeResourceUsage. El consumo del saldo de add-ons ya está
+        // descontado directamente de addonBalance arriba.
         const { data: usageRows } = await supabase
           .from("tenant_monthly_usage")
           .select("resource, used")
@@ -10228,11 +10307,15 @@ app.get("/billing/addons", tenantAuth, async (req, res) => {
 
         const addonTotal = (key) =>
           (addonQty[key] || 0) * (ADDON_CATALOG[key]?.grants?.[key] || 0);
+        // wa_confirmacion/campanas_wa/emails_campana: el "addon" ya no es
+        // quantity×pack_size (eso se resetearía solo cada mes) sino el
+        // saldo acumulado real (tenant_addons.balance).
         const usageEntry = (base, addonKey) => {
-          const addon = addonTotal(addonKey);
+          const addon = addonBalance[addonKey] || 0;
+          const planUsed = usageMap[addonKey] || 0;
+          const planRemaining = Math.max(0, base - planUsed);
           const total = base + addon;
-          const used = usageMap[addonKey] || 0;
-          return { base, addon, total, used, remaining: Math.max(0, total - used) };
+          return { base, addon, total, used: planUsed, remaining: planRemaining + addon };
         };
 
         limits = {
@@ -10357,12 +10440,12 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
 
     const { data: addonRows } = await supabase
       .from("tenant_addons")
-      .select("addon_key, quantity")
+      .select("addon_key, quantity, balance")
       .eq("tenant_id", tenant_id)
       .eq("status", "active");
-    const addonQty = {};
+    const addonBalance = {};
     for (const row of addonRows || []) {
-      addonQty[row.addon_key] = Number(row.quantity) || 0;
+      addonBalance[row.addon_key] = Math.max(0, Number(row.balance) || 0);
     }
 
     const { data: usageRows } = await supabase
@@ -10375,11 +10458,14 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       usageMap[row.resource] = Number(row.used) || 0;
     }
 
+    // Saldo de add-ons real (tenant_addons.balance, acumula) en vez de
+    // quantity×pack_size (eso volvería a "resetea solo cada mes") — mismo
+    // criterio que GET /billing/addons.
     const usageEntry = (base, addonKey) => {
-      const addonTotal = (addonQty[addonKey] || 0) * (ADDON_CATALOG[addonKey]?.grants?.[addonKey] || 0);
-      const total = base + addonTotal;
-      const used = usageMap[addonKey] || 0;
-      return { used, total, remaining: Math.max(0, total - used) };
+      const addon = addonBalance[addonKey] || 0;
+      const planUsed = usageMap[addonKey] || 0;
+      const total = base + addon;
+      return { used: planUsed, total, remaining: Math.max(0, base - planUsed) + addon };
     };
 
     return res.json({
@@ -10452,7 +10538,7 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
 
     const { data: existing, error: existingError } = await supabase
       .from("tenant_addons")
-      .select("id, quantity")
+      .select("id, quantity, balance")
       .eq("tenant_id", tenant_id)
       .eq("addon_key", addon_key)
       .eq("status", "active")
@@ -10463,6 +10549,12 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
     // Cobra el tier real de CADA unidad nueva (ver tieredAddonChargeAmount),
     // no un solo tier aplicado a todo el lote.
     const currentQty = existing ? Number(existing.quantity) : 0;
+    // Saldo comprado (tenant_addons.balance) — solo aplica a los add-ons de
+    // mensajería con cupo mensual (resets_monthly:true); para staff/sucursal/
+    // group_capacity la capacidad sigue siendo quantity directamente (ver
+    // getEffectiveLimit/getEffectiveGroupCapacity), balance queda en 0 sin uso.
+    const isBalanceTracked = Boolean(ADDON_CATALOG[addon_key]?.resets_monthly);
+    const balanceGrant = isBalanceTracked ? qty * (ADDON_CATALOG[addon_key].pack_size || 0) : 0;
     const chargeAmount = tieredAddonChargeAmount(addon_key, currentQty, qty);
     // unit_price guardado = tier de la última unidad de este lote (precio
     // marginal vigente) — usado luego por chargeRecurringAddons para
@@ -10506,6 +10598,7 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
         .from("tenant_addons")
         .update({
           quantity: existing.quantity + qty,
+          balance: Number(existing.balance || 0) + balanceGrant,
           billing_cycle: cycle,
           unit_price: unitPrice,
           last_charged_at: chargedNowIso,
@@ -10524,6 +10617,7 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
           tenant_id,
           addon_key,
           quantity: qty,
+          balance: balanceGrant,
           billing_cycle: cycle,
           unit_price: unitPrice,
           status: "active",
@@ -10592,7 +10686,7 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
 
     const { data: existing, error: existingError } = await supabase
       .from("tenant_addons")
-      .select("id, quantity, unit_price")
+      .select("id, quantity, unit_price, balance")
       .eq("tenant_id", tenant_id)
       .eq("addon_key", addon_key)
       .eq("status", "active")
@@ -10609,6 +10703,12 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
     const now = new Date().toISOString();
     let justCharged = false;
     let updatedUnitPrice = existing.unit_price;
+    // Solo se suma saldo cuando SUBE la quantity (compra real, ver abajo).
+    // Si baja sin llegar a 0, es solo un ajuste de la renovación futura
+    // (menos packs el próximo ciclo) — el saldo ya pagado y acumulado no se
+    // le quita retroactivamente al tenant, no hay lógica de reembolso en
+    // esta app para ningún otro flujo tampoco.
+    let balanceIncrement = 0;
 
     if (qty > existing.quantity) {
       // Cobra el tier real de CADA unidad nueva (ver tieredAddonChargeAmount),
@@ -10617,6 +10717,9 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
       // fino al ciclo de facturación restante, eso sigue igual que antes.
       const increment = qty - existing.quantity;
       const currentQty = Number(existing.quantity) || 0;
+      if (ADDON_CATALOG[addon_key]?.resets_monthly) {
+        balanceIncrement = increment * (ADDON_CATALOG[addon_key].pack_size || 0);
+      }
       const chargeAmount = tieredAddonChargeAmount(addon_key, currentQty, increment);
       // Precio marginal vigente tras esta compra (tier de la última unidad
       // agregada) — se guarda para que chargeRecurringAddons renueve la
@@ -10683,6 +10786,9 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
       .update({
         quantity: qty,
         updated_at: now,
+        ...(balanceIncrement > 0
+          ? { balance: Number(existing.balance || 0) + balanceIncrement }
+          : {}),
         ...(justCharged ? { last_charged_at: now, unit_price: updatedUnitPrice } : {}),
       })
       .eq("id", existing.id)
@@ -12451,7 +12557,7 @@ async function chargeRecurringAddons() {
       // campo nunca se llenó.
       const { data: dueRows, error: dueErr } = await supabase
         .from("tenant_addons")
-        .select("id, tenant_id, addon_key, quantity, unit_price, last_charged_at, failed_attempts")
+        .select("id, tenant_id, addon_key, quantity, unit_price, balance, last_charged_at, failed_attempts")
         .eq("status", "active")
         .eq("renewal_mode", "automatico")
         .or(`last_charged_at.is.null,last_charged_at.lte.${cutoff}`);
@@ -12492,12 +12598,24 @@ async function chargeRecurringAddons() {
             commerceOrder: `addon_recurring_${row.tenant_id}_${row.addon_key}_${Date.now()}`,
           });
 
+          // Renovación mensual pagada = suma otro cupo de pack_size al saldo
+          // acumulado (tenant_addons.balance) — NO resetea el saldo a un
+          // valor fijo, el tenant sigue siendo dueño de lo que no gastó el
+          // ciclo anterior. Solo aplica a add-ons de mensajería
+          // (resets_monthly:true); staff/sucursal/group_capacity no usan
+          // balance, su capacidad es la quantity misma y no cambia acá.
+          const addonDef = ADDON_CATALOG[row.addon_key];
+          const balancePatch = addonDef?.resets_monthly
+            ? { balance: Number(row.balance || 0) + Number(row.quantity || 0) * (addonDef.pack_size || 0) }
+            : {};
+
           const { error: updateErr } = await supabase
             .from("tenant_addons")
             .update({
               last_charged_at: new Date().toISOString(),
               failed_attempts: 0,
               updated_at: new Date().toISOString(),
+              ...balancePatch,
             })
             .eq("id", row.id);
 
@@ -12569,7 +12687,7 @@ async function triggerLowBalanceRecharge(tenant_id, addonId) {
     })
     .eq("id", addonId)
     .eq("low_balance_recharge_in_progress", false)
-    .select("id, quantity, low_balance_recharge_failed_attempts")
+    .select("id, quantity, balance, low_balance_recharge_failed_attempts")
     .maybeSingle();
 
   if (claimErr) {
@@ -12616,6 +12734,10 @@ async function triggerLowBalanceRecharge(tenant_id, addonId) {
       .from("tenant_addons")
       .update({
         quantity: currentQty + 1,
+        // La recarga automática compra 1 pack completo (pack_size msgs),
+        // igual que activate/quantity — se suma al saldo acumulado, no lo
+        // reemplaza.
+        balance: Number(claimed.balance || 0) + (addon.pack_size || 0),
         unit_price: unitPrice,
         last_charged_at: new Date().toISOString(),
         low_balance_recharge_in_progress: false,
@@ -14723,7 +14845,7 @@ app.post(
       const updates = { status: messageStatus, updated_at: new Date().toISOString() };
 
       if (messageStatus === "delivered" && !logRow.counted) {
-        await incrementMonthlyUsage(logRow.tenant_id, logRow.resource);
+        await consumeResourceUsage(logRow.tenant_id, logRow.resource, 1);
         updates.counted = true;
       }
 
