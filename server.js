@@ -2543,12 +2543,22 @@ const PERIODICIDAD_TO_FLOW_INTERVAL = {
 // getOrCreateFlowPlan: idempotente. planId de Flow es elegido por el
 // comercio (no lo genera Flow), así que se deriva determinísticamente de
 // (plan_id, periodicidad) y se cachea en flow_plans para no recrearlo.
+// Cacheado/keyed también por `monto`, no solo por (plan_id, periodicidad):
+// plan_id es un string reusable entre eras de precios -- ej. "premium" fue
+// un plan_id LEGACY a $29.990 antes de la migración 2026-08-21 a 3 planes, y
+// hoy "premium" es el plan nuevo a $54.990 (mismo string, precio distinto).
+// Si el lookup solo mirara plan_id+periodicidad, un flow_plans row viejo
+// creado bajo el precio legacy se reutilizaría en silencio para el plan
+// nuevo, prorrateando/cobrando contra el monto viejo. Versionar el
+// flowPlanId por monto también evita colisionar en Flow mismo con un plan
+// ya creado ahí bajo un precio distinto para el mismo plan_id+periodicidad.
 async function getOrCreateFlowPlan(plan_id, periodicidad, monto) {
   const { data: existing, error: existingErr } = await supabase
     .from("flow_plans")
     .select("flow_plan_id")
     .eq("plan_id", plan_id)
     .eq("periodicidad", periodicidad)
+    .eq("monto", monto)
     .maybeSingle();
 
   if (existingErr) throw existingErr;
@@ -2559,7 +2569,7 @@ async function getOrCreateFlowPlan(plan_id, periodicidad, monto) {
     throw new Error(`periodicidad no soportada para Flow: ${periodicidad}`);
   }
 
-  const flowPlanId = `orbyx_${plan_id}_${periodicidad}`;
+  const flowPlanId = `orbyx_${plan_id}_${periodicidad}_${monto}`;
 
   let flowPlan;
   try {
@@ -2583,7 +2593,7 @@ async function getOrCreateFlowPlan(plan_id, periodicidad, monto) {
     .from("flow_plans")
     .upsert(
       { plan_id, periodicidad, monto, flow_plan_id: flowPlan.planId },
-      { onConflict: "plan_id,periodicidad" }
+      { onConflict: "plan_id,periodicidad,monto" }
     );
   if (upsertErr) throw upsertErr;
 
@@ -13223,11 +13233,37 @@ app.post("/branches", tenantAuthWrite, async (req, res) => {
       });
     }
 
+    // Genera el slug al crear (mismo criterio que el slug de tenant en
+    // PATCH /tenants/:id: minúsculas, sin tildes/espacios, con manejo de
+    // colisión — acá scoped a tenant_id, ya que el slug de sucursal solo
+    // necesita ser único dentro del mismo tenant).
+    const baseBranchSlug =
+      String(name)
+        .trim()
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[̀-ͯ]/g, "")
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 30) || "sucursal";
+
+    const { data: existingBranchSlug } = await supabase
+      .from("branches")
+      .select("id")
+      .eq("tenant_id", tenant_id)
+      .eq("slug", baseBranchSlug)
+      .maybeSingle();
+
+    const branchSlug = existingBranchSlug
+      ? `${baseBranchSlug}-${Math.random().toString(16).slice(2, 6)}`
+      : baseBranchSlug;
+
     const { data, error } = await supabase
       .from("branches")
       .insert({
         tenant_id,
         name: String(name).trim(),
+        slug: branchSlug,
         address: normalizeNullableText(address),
         phone: normalizeNullableText(phone),
         whatsapp: normalizeNullableText(whatsapp),
