@@ -11613,6 +11613,40 @@ app.post(
           );
         }
 
+        // Extiende el ciclo de facturación al período recién pagado — sin
+        // esto, tenants.billing_cycle_end queda congelado en el valor del
+        // primer cobro para siempre. No bloquea nada hoy porque blocked
+        // requiere !hasActiveSubscription primero, pero el día que un cobro
+        // falle (status pasa a "error" más abajo), billing_cycle_end ya
+        // vencido dispara el bloqueo sin ningún período de gracia. Reusa
+        // el mismo cálculo (inferBillingCycle + addMonths + BILLING_CYCLES)
+        // que POST /billing/apply-scheduled-changes usa para lo mismo.
+        // Extiende desde el billing_cycle_end anterior (no desde "ahora")
+        // para no arrastrar el drift de cuándo Flow/el webhook procesa el
+        // cobro respecto al aniversario real de facturación.
+        const { data: tenantForCycle, error: tenantCycleErr } = await supabase
+          .from("tenants")
+          .select("billing_cycle_start, billing_cycle_end")
+          .eq("id", subscription.tenant_id)
+          .maybeSingle();
+
+        if (tenantCycleErr) {
+          console.error(
+            "POST /billing/flow/webhook: fallo al leer billing_cycle_start/end antes de extender el ciclo",
+            tenantCycleErr.message
+          );
+        }
+
+        const previousEnd = tenantForCycle?.billing_cycle_end
+          ? new Date(tenantForCycle.billing_cycle_end)
+          : new Date();
+        const tenantCycle = inferBillingCycle(
+          tenantForCycle?.billing_cycle_start || previousEnd,
+          tenantForCycle?.billing_cycle_end || previousEnd
+        );
+        const cycleMonths = BILLING_CYCLES[tenantCycle]?.months || 1;
+        const newCycleEnd = addMonths(previousEnd, cycleMonths);
+
         const { error: tenantUpdateErr } = await supabase
           .from("tenants")
           // is_trial=false: un pago real confirmado por Flow saca al
@@ -11622,6 +11656,8 @@ app.post(
           .update({
             plan_slug: normalizePlanSlug(subscription.plan_id),
             is_trial: false,
+            billing_cycle_start: previousEnd.toISOString(),
+            billing_cycle_end: newCycleEnd.toISOString(),
           })
           .eq("id", subscription.tenant_id);
 
@@ -11633,7 +11669,7 @@ app.post(
         }
 
         console.log(
-          `Flow webhook: pago confirmado para tenant ${subscription.tenant_id}, plan ${subscription.plan_id}`
+          `Flow webhook: pago confirmado para tenant ${subscription.tenant_id}, plan ${subscription.plan_id}, ciclo extendido hasta ${newCycleEnd.toISOString()}`
         );
       } else {
         const { error: subErrorUpdateErr } = await supabase
