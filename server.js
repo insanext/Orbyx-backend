@@ -2118,6 +2118,54 @@ async function getEffectiveBusinessAvailability({ tenant_id, branch_id, date }) 
   };
 }
 
+async function getPublicWeeklyBusinessHours({ tenant_id, branch_id }) {
+  const branch = branch_id ? await getBranchById(branch_id) : null;
+  const useGlobalHours = branch ? branch.use_global_hours !== false : true;
+
+  const { data: globalRows, error: globalError } = await supabase
+    .from("business_hours")
+    .select("day_of_week, enabled, start_time, end_time")
+    .eq("tenant_id", tenant_id)
+    .is("branch_id", null);
+
+  if (globalError) throw globalError;
+
+  const { data: branchRows, error: branchHoursError } = branch
+    ? await supabase
+        .from("business_hours")
+        .select("day_of_week, enabled, start_time, end_time")
+        .eq("tenant_id", tenant_id)
+        .eq("branch_id", branch.id)
+    : { data: [], error: null };
+
+  if (branchHoursError) throw branchHoursError;
+
+  let sourceRows = [];
+  if (branch) {
+    if (useGlobalHours) {
+      sourceRows = (globalRows || []).length > 0 ? globalRows : branchRows || [];
+    } else {
+      sourceRows = (branchRows || []).length > 0 ? branchRows : globalRows || [];
+    }
+  } else {
+    sourceRows = globalRows || [];
+  }
+
+  const byDay = new Map((sourceRows || []).map((row) => [row.day_of_week, row]));
+
+  return Array.from({ length: 7 }, (_, day) => {
+    const row = byDay.get(day);
+    const isOpen = Boolean(row?.enabled && row?.start_time && row?.end_time);
+
+    return {
+      day_of_week: day,
+      enabled: isOpen,
+      start_time: isOpen ? String(row.start_time).slice(0, 5) : null,
+      end_time: isOpen ? String(row.end_time).slice(0, 5) : null,
+    };
+  });
+}
+
 async function getStaffHoursRows({ tenant_id, branch_id, staff_id, date }) {
   const weekday = parseDateToWeekday(date);
 
@@ -14091,7 +14139,7 @@ app.get("/public/services/:slug", publicLimiter, async (req, res) => {
 
     const { data: branch, error: branchError } = await supabase
       .from("branches")
-      .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, is_active")
+      .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, use_global_hours, is_active")
       .eq("id", resolvedBranchId)
       .eq("tenant_id", tenant.id)
       .single();
@@ -14099,6 +14147,22 @@ app.get("/public/services/:slug", publicLimiter, async (req, res) => {
     if (branchError || !branch || !branch.is_active) {
       return res.status(404).json({ error: "Sucursal no encontrada" });
     }
+
+    const { data: serviceGroups, error: serviceGroupsError } = await supabase
+      .from("service_groups")
+      .select("id, name, sort_order")
+      .eq("tenant_id", tenant.id)
+      .eq("branch_id", resolvedBranchId)
+      .order("sort_order", { ascending: true });
+
+    if (serviceGroupsError) {
+      return res.status(500).json({ error: serviceGroupsError.message });
+    }
+
+    const businessHours = await getPublicWeeklyBusinessHours({
+      tenant_id: tenant.id,
+      branch_id: resolvedBranchId,
+    });
 
     const { data: calendar, error: calendarError } = await supabase
       .from("calendars")
@@ -14152,9 +14216,77 @@ const filteredServices = (services || []).filter((s) =>
       branch,
       calendar_id: calendar.id,
       services: filteredServices,
+      service_groups: serviceGroups || [],
+      business_hours: businessHours,
     });
   } catch (error) {
     console.error("Error en /public/services/:slug", error);
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
+/* ======================================================
+   🌐 PUBLIC: thumbnail estático del mapa (Google Static Maps)
+   La API key vive solo en el backend — nunca se expone al cliente.
+====================================================== */
+
+app.get("/public/map-thumbnail/:slug", publicLimiter, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { branch_id } = req.query;
+
+    if (!process.env.GOOGLE_MAPS_API_KEY) {
+      return res.status(404).json({ error: "Mapa no disponible" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, address")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const resolvedBranchId = await resolveBranchId({
+      tenant_id: tenant.id,
+      branch_id: branch_id || null,
+    });
+
+    const branch = resolvedBranchId ? await getBranchById(resolvedBranchId) : null;
+    const address = branch?.address || tenant.address;
+
+    if (!address) {
+      return res.status(404).json({ error: "Sin dirección disponible" });
+    }
+
+    const params = new URLSearchParams({
+      center: address,
+      zoom: "16",
+      size: "600x300",
+      scale: "2",
+      maptype: "roadmap",
+      markers: `color:red|${address}`,
+      key: process.env.GOOGLE_MAPS_API_KEY,
+    });
+
+    const mapRes = await fetch(
+      `https://maps.googleapis.com/maps/api/staticmap?${params.toString()}`
+    );
+
+    if (!mapRes.ok) {
+      return res.status(502).json({ error: "No se pudo generar el mapa" });
+    }
+
+    const buffer = Buffer.from(await mapRes.arrayBuffer());
+
+    res.set("Content-Type", mapRes.headers.get("content-type") || "image/png");
+    res.set("Cache-Control", "public, max-age=86400");
+    return res.send(buffer);
+  } catch (error) {
+    console.error("Error en /public/map-thumbnail/:slug", error);
     return res.status(500).json({ error: "Error interno del servidor" });
   }
 });
