@@ -14236,6 +14236,9 @@ app.get("/public/map-thumbnail/:slug", publicLimiter, async (req, res) => {
     const { branch_id } = req.query;
 
     if (!process.env.GOOGLE_MAPS_API_KEY) {
+      console.error(
+        "[map-thumbnail] GOOGLE_MAPS_API_KEY no está configurada en este entorno"
+      );
       return res.status(404).json({ error: "Mapa no disponible" });
     }
 
@@ -14277,6 +14280,11 @@ app.get("/public/map-thumbnail/:slug", publicLimiter, async (req, res) => {
     );
 
     if (!mapRes.ok) {
+      const errorBody = await mapRes.text().catch(() => "");
+      console.error(
+        `[map-thumbnail] Google Static Maps respondió ${mapRes.status}:`,
+        errorBody.slice(0, 500)
+      );
       return res.status(502).json({ error: "No se pudo generar el mapa" });
     }
 
