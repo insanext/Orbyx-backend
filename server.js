@@ -705,6 +705,70 @@ async function resetMonthlyAddons(tenant_id) {
   }
 }
 
+// Plantillas de WhatsApp Marketing aprobadas en Twilio Content Template
+// Builder — Content SIDs y copy exactos, definidos por Camilo, no se
+// inventan variantes. Cada slot {{n}} es "auto" (resuelto acá desde datos
+// del tenant/destinatario) o editable (el negocio lo llena al armar la
+// campaña, ver template_vars en POST /campaigns/send-whatsapp). Duplicado
+// (misma data) en orbyx-web/app/dashboard/[slug]/campaigns/page.tsx — el
+// frontend es un submodule aparte, no puede importar este archivo en build
+// time, mismo patrón que LEGAL_TERMS_BLOCKS en email.js/app/terminos.
+const WHATSAPP_MARKETING_TEMPLATES = {
+  descuento: {
+    contentSid: "HX3b85b00bcaa97f2723fb19a34de3fcd",
+    slots: {
+      1: { auto: "customer_name" },
+      2: { auto: "business_name" },
+      3: { editable: true, label: "Porcentaje de descuento" },
+      4: { editable: true, label: "Servicio en promoción" },
+      5: { editable: true, label: "Fecha límite" },
+      6: { auto: "link" },
+      7: { auto: "phone" },
+    },
+  },
+  reactivacion: {
+    contentSid: "HXc36e8acc4d5028de51cbf31bbd474519",
+    slots: {
+      1: { auto: "customer_name" },
+      2: { auto: "business_name" },
+      3: { auto: "phone" },
+    },
+  },
+  recordatorio: {
+    contentSid: "HXcc5cf3755b6eb6fdd3e045e266743334",
+    slots: {
+      1: { auto: "customer_name" },
+      2: { auto: "business_name" },
+      3: { editable: true, label: "Servicios a destacar" },
+      4: { auto: "link" },
+    },
+  },
+};
+
+function buildWhatsAppMarketingVariables(templateKey, templateVars, autoValues) {
+  const template = WHATSAPP_MARKETING_TEMPLATES[templateKey];
+  if (!template) return null;
+
+  const variables = {};
+  for (const [index, slot] of Object.entries(template.slots)) {
+    if (slot.auto) {
+      variables[index] = autoValues[slot.auto] || "";
+    } else {
+      variables[index] = String(templateVars?.[index] || "").trim();
+    }
+  }
+  return variables;
+}
+
+function getMissingWhatsAppTemplateVars(templateKey, templateVars) {
+  const template = WHATSAPP_MARKETING_TEMPLATES[templateKey];
+  if (!template) return null;
+
+  return Object.entries(template.slots)
+    .filter(([index, slot]) => slot.editable && !String(templateVars?.[index] || "").trim())
+    .map(([, slot]) => slot.label);
+}
+
 // Mapa resource → clave en getPlanCapabilities
 const MONTHLY_RESOURCE_CAP_KEY = {
   wa_confirmacion: "max_wa_confirmacion",
@@ -840,12 +904,10 @@ async function decrementAddonBalance(tenant_id, resource, amount) {
 // "YYYY-MM") y recién cuando ese cupo llega a 0 empieza a bajar el saldo de
 // add-ons ya pagado (tenant_addons.balance, persiste entre ciclos). Es el
 // único punto que debe llamarse al consumir de verdad un mensaje/correo de
-// estos 3 recursos. Call sites reales hoy: wa_confirmacion (POST
-// /whatsapp/status-callback, al confirmar delivered) y emails_campana
-// (POST /campaigns/send-email, ya envía de verdad — sí está construido,
-// a diferencia de lo asumido al iniciar este cambio). campanas_wa no tiene
-// ningún hook todavía: /campaigns/save-whatsapp solo guarda el historial,
-// no envía nada por Twilio — confirmado sin call site real.
+// estos 3 recursos. Call sites reales hoy: wa_confirmacion y campanas_wa
+// (ambos vía POST /whatsapp/status-callback, al confirmar delivered — ver
+// POST /campaigns/send-whatsapp, que las manda por Twilio real) y
+// emails_campana (POST /campaigns/send-email, se descuenta en el momento).
 async function consumeResourceUsage(tenant_id, resource, amount = 1) {
   const plan = await getPlan(tenant_id);
   const caps = getPlanCapabilities(plan);
@@ -888,6 +950,24 @@ async function trackWhatsAppMessage({ messageSid, tenantId, resource }) {
   } catch (err) {
     console.warn("trackWhatsAppMessage error:", err.message);
   }
+}
+
+// Extraído de POST /appointments/slot (estaba anidada ahí) para poder
+// reusarla tal cual desde el envío de campañas WhatsApp Marketing (filtro de
+// audiencia por teléfono válido) sin duplicar la validación.
+function normalizeChileanPhone(rawPhone) {
+  if (!rawPhone) return null;
+
+  let digits = String(rawPhone).replace(/\D/g, "");
+
+  if (digits.startsWith("56")) {
+    digits = digits.slice(2);
+  }
+
+  if (digits.length !== 9) return null;
+  if (!digits.startsWith("9")) return null;
+
+  return `+56${digits}`;
 }
 
 // Envía la confirmación de reserva (email + WhatsApp) — extraído de
@@ -5055,21 +5135,6 @@ const {
 
 } = req.body;
 
-    function normalizeChileanPhone(rawPhone) {
-      if (!rawPhone) return null;
-
-      let digits = String(rawPhone).replace(/\D/g, "");
-
-      if (digits.startsWith("56")) {
-        digits = digits.slice(2);
-      }
-
-      if (digits.length !== 9) return null;
-      if (!digits.startsWith("9")) return null;
-
-      return `+56${digits}`;
-    }
-
     function isValidEmail(email) {
       if (!email) return false;
 
@@ -6942,6 +7007,7 @@ async function insertCampaignDeliveryLog({
   customerPhone = null,
   status,
   errorMessage = null,
+  messageSid = null,
 }) {
   const payload = {
     tenant_id: tenantId,
@@ -6952,7 +7018,8 @@ async function insertCampaignDeliveryLog({
     customer_phone: customerPhone,
     status,
     error_message: errorMessage,
-    sent_at: status === "sent" ? new Date().toISOString() : null,
+    message_sid: messageSid,
+    sent_at: ["sent", "queued"].includes(status) ? new Date().toISOString() : null,
   };
 
   const { error } = await supabase
@@ -8490,19 +8557,24 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
 });
 
 /* ======================================================
-   ✅ POST /campaigns/save-whatsapp
-   Guarda campaña WhatsApp mock en historial
+   ✅ POST /campaigns/send-whatsapp
 ====================================================== */
-app.post("/campaigns/save-whatsapp", tenantAuthSlugWrite, async (req, res) => {
+// Envío real de campañas WhatsApp Marketing — reemplaza el antiguo
+// /campaigns/save-whatsapp (que solo guardaba historial simulado, nunca
+// llamaba a Twilio, ver comentario en consumeResourceUsage). Mismo patrón
+// sincrónico que /campaigns/send-email (loop por destinatario en el propio
+// request, sin cola/cron). El cupo (campanas_wa) se descuenta recién cuando
+// Twilio confirma "delivered" vía POST /whatsapp/status-callback — acá solo
+// se lleva un contador LOCAL (seedeado desde checkMonthlyUsage) para
+// detener el loop cuando ya no queda cupo disponible para intentar, sin
+// tocar tenant_monthly_usage antes de tiempo.
+app.post("/campaigns/send-whatsapp", tenantAuthSlugWrite, async (req, res) => {
   try {
     const {
       slug,
-      channel = "whatsapp",
       campaign_name,
       segment,
       inactive_days = 60,
-      subject = null,
-      message,
       sort = "oldest",
       plan,
       plan_limit,
@@ -8510,8 +8582,8 @@ app.post("/campaigns/save-whatsapp", tenantAuthSlugWrite, async (req, res) => {
       applied_limit,
       audience_total,
       recipients_with_contact,
-      sent_count = 0,
-      failed_count = 0,
+      template_id,
+      template_vars = {},
       final_recipients = [],
     } = req.body;
 
@@ -8523,20 +8595,9 @@ app.post("/campaigns/save-whatsapp", tenantAuthSlugWrite, async (req, res) => {
       return res.status(400).json({ error: "segment es obligatorio" });
     }
 
-    if (!message || !String(message).trim()) {
-      return res.status(400).json({ error: "message es obligatorio" });
-    }
-
-    const normalizedChannel = String(channel || "whatsapp").trim().toLowerCase();
     const normalizedSegment = String(segment).trim().toLowerCase();
     const normalizedSort = String(sort || "oldest").trim().toLowerCase();
     const normalizedPlan = normalizePlanSlug(plan || "starter");
-
-    if (normalizedChannel !== "whatsapp") {
-      return res.status(400).json({
-        error: "Este endpoint solo permite guardar campañas de WhatsApp",
-      });
-    }
 
     if (!["new", "recurrent", "frequent", "inactive"].includes(normalizedSegment)) {
       return res.status(400).json({
@@ -8552,9 +8613,24 @@ app.post("/campaigns/save-whatsapp", tenantAuthSlugWrite, async (req, res) => {
       });
     }
 
+    const templateKey = String(template_id || "").trim();
+    const template = WHATSAPP_MARKETING_TEMPLATES[templateKey];
+    if (!template) {
+      return res.status(400).json({
+        error: "template_id inválido. Usa: " + Object.keys(WHATSAPP_MARKETING_TEMPLATES).join(", "),
+      });
+    }
+
+    const missingVars = getMissingWhatsAppTemplateVars(templateKey, template_vars);
+    if (missingVars && missingVars.length > 0) {
+      return res.status(400).json({
+        error: `Faltan variables de la plantilla: ${missingVars.join(", ")}`,
+      });
+    }
+
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, name, slug, is_active, plan_slug, plan")
+      .select("id, name, slug, phone, whatsapp, is_active, plan_slug, plan")
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -8565,16 +8641,37 @@ app.post("/campaigns/save-whatsapp", tenantAuthSlugWrite, async (req, res) => {
 
     const currentPlan = normalizePlanSlug(tenant.plan_slug || tenant.plan || normalizedPlan);
 
+    const usage = await checkMonthlyUsage(tenant.id, "campanas_wa");
+    if (!usage.allowed) {
+      return res.status(400).json({
+        error: "No tienes saldo disponible de WhatsApp Marketing (campanas_wa) para enviar.",
+      });
+    }
+
+    const autoValues = {
+      business_name: tenant.name || "Tu negocio",
+      link: `https://www.orbyx.cl/${tenant.slug}`,
+      phone: tenant.phone || tenant.whatsapp || "",
+    };
+
+    const exampleMessage = Object.values(
+      buildWhatsAppMarketingVariables(templateKey, template_vars, {
+        ...autoValues,
+        customer_name: "Cliente",
+      }) || {}
+    ).join(" | ");
+
     const { data: historyRow, error: historyError } = await supabase
       .from("campaign_history")
       .insert({
         tenant_id: tenant.id,
         campaign_name: campaign_name ? String(campaign_name).trim() : null,
         channel: "whatsapp",
+        template_id: templateKey,
         segment: normalizedSegment,
         inactive_days: Math.max(1, Number(inactive_days || 60)),
         subject: null,
-        message: String(message).trim(),
+        message: exampleMessage,
         sort: normalizedSort,
         plan_slug: currentPlan,
         plan_limit: Number(plan_limit || 0),
@@ -8582,8 +8679,9 @@ app.post("/campaigns/save-whatsapp", tenantAuthSlugWrite, async (req, res) => {
         applied_limit: Number(applied_limit || 0),
         audience_total: Number(audience_total || 0),
         recipients_with_contact: Number(recipients_with_contact || 0),
-        sent_count: Number(sent_count || 0),
-        failed_count: Number(failed_count || 0),
+        sent_count: 0,
+        failed_count: 0,
+        skipped_count: 0,
       })
       .select("id")
       .single();
@@ -8591,40 +8689,98 @@ app.post("/campaigns/save-whatsapp", tenantAuthSlugWrite, async (req, res) => {
     if (historyError || !historyRow) {
       console.error("❌ Error creando campaign_history whatsapp:", historyError?.message);
       return res.status(500).json({
-        error: "No se pudo guardar el historial de campaña WhatsApp",
+        error: "No se pudo crear el historial de campaña WhatsApp",
       });
     }
 
     const campaignHistoryId = historyRow.id;
 
-    if (Array.isArray(final_recipients) && final_recipients.length > 0) {
-      for (const recipient of final_recipients) {
-const phone = String(
-  recipient?.phone || recipient?.telefono || ""
-).trim();
+    let sent = 0;
+    let failed = 0;
+    let skipped = 0;
+    let remainingBudget = usage.remaining;
 
-const email = String(
-  recipient?.email || ""
-).trim().toLowerCase();
+    const recipients = Array.isArray(final_recipients) ? final_recipients : [];
 
-const name = String(
-  recipient?.name || recipient?.nombre || "Sin nombre"
-).trim();
+    for (const recipient of recipients) {
+      const rawPhone = String(recipient?.phone || recipient?.telefono || "").trim();
+      const name = String(recipient?.name || recipient?.nombre || "Sin nombre").trim();
+      const normalizedPhone = normalizeChileanPhone(rawPhone);
 
-        const hasPhone = !!phone;
-
+      if (!normalizedPhone) {
+        failed++;
         await insertCampaignDeliveryLog({
           tenantId: tenant.id,
           campaignHistoryId,
           channel: "whatsapp",
           customerName: name,
-          customerEmail: email || null,
-          customerPhone: phone || null,
-          status: hasPhone ? "sent" : "failed",
-          errorMessage: hasPhone ? null : "Destinatario sin teléfono",
+          customerPhone: rawPhone || null,
+          status: "failed",
+          errorMessage: "Teléfono inválido",
+        });
+        continue;
+      }
+
+      if (remainingBudget <= 0) {
+        skipped++;
+        await insertCampaignDeliveryLog({
+          tenantId: tenant.id,
+          campaignHistoryId,
+          channel: "whatsapp",
+          customerName: name,
+          customerPhone: normalizedPhone,
+          status: "skipped_no_balance",
+          errorMessage: "Sin saldo de campanas_wa disponible",
+        });
+        continue;
+      }
+
+      const variables = buildWhatsAppMarketingVariables(templateKey, template_vars, {
+        ...autoValues,
+        customer_name: name,
+      });
+
+      const waResult = await sendWhatsAppTemplate({
+        to: normalizedPhone,
+        contentSid: template.contentSid,
+        variables,
+      });
+
+      if (waResult.ok) {
+        remainingBudget--;
+        sent++;
+        await insertCampaignDeliveryLog({
+          tenantId: tenant.id,
+          campaignHistoryId,
+          channel: "whatsapp",
+          customerName: name,
+          customerPhone: normalizedPhone,
+          status: "queued",
+          messageSid: waResult.sid,
+        });
+        await trackWhatsAppMessage({
+          messageSid: waResult.sid,
+          tenantId: tenant.id,
+          resource: "campanas_wa",
+        });
+      } else {
+        failed++;
+        await insertCampaignDeliveryLog({
+          tenantId: tenant.id,
+          campaignHistoryId,
+          channel: "whatsapp",
+          customerName: name,
+          customerPhone: normalizedPhone,
+          status: "failed",
+          errorMessage: waResult.reason || "Error desconocido",
         });
       }
     }
+
+    await supabase
+      .from("campaign_history")
+      .update({ sent_count: sent, failed_count: failed, skipped_count: skipped })
+      .eq("id", campaignHistoryId);
 
     return res.json({
       ok: true,
@@ -8641,11 +8797,12 @@ const name = String(
       inactive_days: Math.max(1, Number(inactive_days || 60)),
       audience_total: Number(audience_total || 0),
       recipients_with_contact: Number(recipients_with_contact || 0),
-      sent: Number(sent_count || 0),
-      failed: Number(failed_count || 0),
+      sent,
+      failed,
+      skipped_for_balance: skipped,
     });
   } catch (err) {
-    console.error("POST /campaigns/save-whatsapp error:", err.message);
+    console.error("POST /campaigns/send-whatsapp error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -15026,6 +15183,24 @@ app.post(
       }
 
       await supabase.from("whatsapp_message_log").update(updates).eq("id", logRow.id);
+
+      // Traza por destinatario para campañas WhatsApp Marketing (no-op para
+      // confirmación/recordatorio, que no insertan fila en
+      // campaign_delivery_logs — el update simplemente no matchea nada).
+      const deliveryLogUpdates = { status: messageStatus };
+      if (["failed", "undelivered"].includes(messageStatus)) {
+        const errorCode = req.body?.ErrorCode;
+        const errorMessage = req.body?.ErrorMessage;
+        if (errorCode || errorMessage) {
+          deliveryLogUpdates.error_message = [errorCode, errorMessage]
+            .filter(Boolean)
+            .join(" - ");
+        }
+      }
+      await supabase
+        .from("campaign_delivery_logs")
+        .update(deliveryLogUpdates)
+        .eq("message_sid", messageSid);
 
       return res.status(200).send();
     } catch (err) {
