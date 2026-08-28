@@ -9981,11 +9981,12 @@ async function provisionTenantCore({ email, plan = "starter", billing_cycle }) {
   return { tenant, calendar, branch };
 }
 
-async function linkTenantOwner({ tenant_id, user_id }) {
+async function linkTenantOwner({ tenant_id, user_id, phone = null }) {
   const { error: userError } = await supabase.from("tenant_users").insert({
     user_id,
     tenant_id,
     role: "owner",
+    phone: phone || null,
   });
 
   if (userError) throw userError;
@@ -10127,11 +10128,19 @@ async function recordLegalAcceptancesAndSendConfirmation({
 ====================================================== */
 app.post("/tenants/provision", async (req, res) => {
   try {
-    const { user_id, email, plan = "starter", billing_cycle } = req.body;
+    const { user_id, email, plan = "starter", billing_cycle, phone } = req.body;
 
     if (!user_id || !email) {
       return res.status(400).json({ error: "Faltan campos: user_id, email" });
     }
+
+    // phone NO es hard-required acá (a diferencia de POST /signup/start-paid):
+    // el formulario de /signup ya lo exige, pero este endpoint corre en el
+    // PRIMER LOGIN después de verificar el email — que puede ser días
+    // después del signup. Bloquear acá rompería a alguien que se registró
+    // justo antes de este deploy y recién ahora verifica su email (su
+    // metadata no tiene phone, sin culpa suya). Mejor: guardar si viene,
+    // no bloquear si no viene.
 
     const maxRetries = 5;
     let authUser = null;
@@ -10145,7 +10154,7 @@ app.post("/tenants/provision", async (req, res) => {
     }
 
     const { tenant, calendar, branch } = await provisionTenantCore({ email, plan, billing_cycle });
-    await linkTenantOwner({ tenant_id: tenant.id, user_id });
+    await linkTenantOwner({ tenant_id: tenant.id, user_id, phone });
 
     await recordLegalAcceptancesAndSendConfirmation({
       tenant_id: tenant.id,
@@ -12228,12 +12237,16 @@ const PAID_SIGNUP_PLANS = new Set(["business", "premium"]);
 ====================================================== */
 app.post("/signup/start-paid", publicLimiter, async (req, res) => {
   try {
-    const { email, business_name, plan_id, periodicidad, monto } = req.body || {};
+    const { email, business_name, phone, plan_id, periodicidad, monto } = req.body || {};
 
     if (!email || !plan_id || !periodicidad || !monto) {
       return res.status(400).json({
         error: "email, plan_id, periodicidad y monto son obligatorios",
       });
+    }
+
+    if (!phone || !String(phone).trim()) {
+      return res.status(400).json({ error: "phone es obligatorio" });
     }
 
     const normalizedPlan = String(plan_id).toLowerCase();
@@ -12252,6 +12265,7 @@ app.post("/signup/start-paid", publicLimiter, async (req, res) => {
       .insert({
         email,
         business_name: business_name || null,
+        phone: String(phone).trim(),
         plan_id: normalizedPlan,
         periodicidad,
         monto,
@@ -12340,7 +12354,7 @@ app.post("/signup/register-card", publicLimiter, async (req, res) => {
 });
 
 const SIGNUP_INTENT_SELECT_FIELDS =
-  "id, email, business_name, plan_id, periodicidad, monto, status, flow_customer_id, flow_subscription_id, recovery_token, tenant_id";
+  "id, email, business_name, phone, plan_id, periodicidad, monto, status, flow_customer_id, flow_subscription_id, recovery_token, tenant_id";
 
 // Reclamo atómico: solo el request que gana la carrera pasa de fromStatus a
 // patch.status. Los demás reciben null y deben releer el estado actual en vez
@@ -12750,7 +12764,7 @@ app.post("/signup/claim-account", publicLimiter, async (req, res) => {
       }
     }
 
-    await linkTenantOwner({ tenant_id: intent.tenant_id, user_id: authUser.id });
+    await linkTenantOwner({ tenant_id: intent.tenant_id, user_id: authUser.id, phone: intent.phone });
 
     await recordLegalAcceptancesAndSendConfirmation({
       tenant_id: intent.tenant_id,
@@ -16197,8 +16211,9 @@ app.patch("/admin/addons/:key", requireAdminAuth, async (req, res) => {
 // frontend) — se duplica acá porque el backend no puede importar un
 // archivo del submodule frontend. Solo se usa como último fallback cuando
 // un tenant no tiene ninguna fila en `subscriptions` (subscriptions.monto
-// es siempre preferido por ser el monto real contratado).
-const ADMIN_STATS_PLAN_PRICES = {
+// es siempre preferido por ser el monto real contratado). Compartido entre
+// GET /admin/estadisticas y GET /admin/tenants*.
+const ADMIN_PLAN_PRICES_ALL = {
   starter: 14990,
   business: 29990,
   premium: 54990,
@@ -16285,7 +16300,7 @@ app.get("/admin/estadisticas", requireAdminAuth, async (req, res) => {
         const amount =
           subscription?.monto != null
             ? Number(subscription.monto)
-            : ADMIN_STATS_PLAN_PRICES[planSlug] || ADMIN_STATS_PLAN_PRICES.starter;
+            : ADMIN_PLAN_PRICES_ALL[planSlug] || ADMIN_PLAN_PRICES_ALL.starter;
 
         revenueByPlan[planSlug] = (revenueByPlan[planSlug] || 0) + amount;
         revenueTotal += amount;
@@ -16324,6 +16339,267 @@ app.get("/admin/estadisticas", requireAdminAuth, async (req, res) => {
   } catch (err) {
     console.error("GET /admin/estadisticas error:", err.message);
     res.status(500).json({ error: err.message || "Error obteniendo estadísticas" });
+  }
+});
+
+// Labels de los valores reales de tenants.business_category vistos en uso
+// hoy (confirmado por grep contra server.js/onboarding — NO existe una
+// taxonomía más rica tipo "veterinaria/barbería/taller genérico" en el
+// código: el onboarding actual solo produce generic|vet|clinica|
+// odontologia|group_booking; "veterinaria" queda como alias legacy que
+// algunos gates del backend todavía reconocen pero que el onboarding ya no
+// escribe). Fallback: capitaliza el string tal cual, mismo criterio que
+// getPlanLabel() en orbyx-web/lib/plans.ts.
+const BUSINESS_CATEGORY_LABELS = {
+  generic: "Genérico",
+  vet: "Veterinaria",
+  veterinaria: "Veterinaria",
+  clinica: "Clínica",
+  odontologia: "Odontología",
+  group_booking: "Reservas grupales",
+};
+
+function getBusinessCategoryLabel(category) {
+  if (!category) return BUSINESS_CATEGORY_LABELS.generic;
+  const normalized = String(category).toLowerCase();
+  if (BUSINESS_CATEGORY_LABELS[normalized]) return BUSINESS_CATEGORY_LABELS[normalized];
+  return category.charAt(0).toUpperCase() + category.slice(1);
+}
+
+/* ======================================================
+   📊 GET /admin/tenants
+   Directorio de tenants (listado) — panel admin interno.
+====================================================== */
+app.get("/admin/tenants", requireAdminAuth, async (req, res) => {
+  try {
+    const { data: tenants, error: tenantsError } = await supabase
+      .from("tenants")
+      .select("id, name, slug, plan_slug, business_category, trial_ends_at, billing_cycle_end, created_at, is_active")
+      .eq("is_active", true)
+      .order("created_at", { ascending: false });
+    if (tenantsError) throw tenantsError;
+
+    const { data: subscriptions, error: subsError } = await supabase
+      .from("subscriptions")
+      .select("tenant_id, status, monto, created_at")
+      .order("created_at", { ascending: false });
+    if (subsError) throw subsError;
+
+    const latestSubscriptionByTenant = {};
+    for (const row of subscriptions || []) {
+      if (!latestSubscriptionByTenant[row.tenant_id]) {
+        latestSubscriptionByTenant[row.tenant_id] = row;
+      }
+    }
+
+    const { data: activeAddons, error: addonsError } = await supabase
+      .from("tenant_addons")
+      .select("tenant_id, addon_key")
+      .eq("status", "active");
+    if (addonsError) throw addonsError;
+
+    const addonsByTenant = {};
+    for (const row of activeAddons || []) {
+      if (!addonsByTenant[row.tenant_id]) addonsByTenant[row.tenant_id] = [];
+      addonsByTenant[row.tenant_id].push(ADDON_CATALOG[row.addon_key]?.name || row.addon_key);
+    }
+
+    const now = new Date();
+    const result = (tenants || []).map((tenant) => {
+      const subscription = latestSubscriptionByTenant[tenant.id] || null;
+      const planSlug = normalizePlanSlug(tenant.plan_slug);
+      const bucket = deriveTenantBucket({
+        subscriptionStatus: subscription?.status || "none",
+        trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
+        billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
+        now,
+      });
+      const amount =
+        subscription?.monto != null
+          ? Number(subscription.monto)
+          : ADMIN_PLAN_PRICES_ALL[planSlug] || ADMIN_PLAN_PRICES_ALL.starter;
+
+      return {
+        id: tenant.id,
+        name: tenant.name,
+        slug: tenant.slug,
+        plan_slug: planSlug,
+        amount,
+        addons_summary: (addonsByTenant[tenant.id] || []).join(", "),
+        business_category: tenant.business_category || "generic",
+        business_category_label: getBusinessCategoryLabel(tenant.business_category),
+        status: bucket,
+        created_at: tenant.created_at,
+      };
+    });
+
+    return res.json({ ok: true, tenants: result });
+  } catch (err) {
+    console.error("GET /admin/tenants error:", err.message);
+    res.status(500).json({ error: err.message || "Error obteniendo tenants" });
+  }
+});
+
+/* ======================================================
+   📊 GET /admin/tenants/:id
+   Detalle de un tenant — panel admin interno.
+====================================================== */
+app.get("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select(
+        "id, name, slug, business_category, business_subtype, phone, email, whatsapp, address, plan_slug, trial_ends_at, billing_cycle_start, billing_cycle_end, scheduled_plan_slug, scheduled_change_at, pending_change_type, is_active, created_at"
+      )
+      .eq("id", id)
+      .single();
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    const { data: subscriptions, error: subsError } = await supabase
+      .from("subscriptions")
+      .select("status, monto, periodicidad, created_at, updated_at")
+      .eq("tenant_id", id)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (subsError) throw subsError;
+    const subscription = (subscriptions || [])[0] || null;
+
+    const now = new Date();
+    const planSlug = normalizePlanSlug(tenant.plan_slug);
+    const bucket = deriveTenantBucket({
+      subscriptionStatus: subscription?.status || "none",
+      trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
+      billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
+      now,
+    });
+    const amount =
+      subscription?.monto != null
+        ? Number(subscription.monto)
+        : ADMIN_PLAN_PRICES_ALL[planSlug] || ADMIN_PLAN_PRICES_ALL.starter;
+
+    const { data: addons, error: addonsError } = await supabase
+      .from("tenant_addons")
+      .select("addon_key, quantity, status, balance, renewal_mode, last_charged_at")
+      .eq("tenant_id", id)
+      .eq("status", "active");
+    if (addonsError) throw addonsError;
+
+    const addonsDetailed = (addons || []).map((row) => {
+      // No hay columna de próxima renovación por add-on (confirmado: no
+      // existe en ninguna migración de tenant_addons) — para renewal_mode
+      // "automatico" se aproxima como last_charged_at + 30 días, que es
+      // exactamente el criterio que usa chargeRecurringAddons() para decidir
+      // si un addon "está vencido" (server.js, cron de cobro recurrente).
+      // Para "manual" no hay fecha de renovación automática que mostrar.
+      let approxNextRenewal = null;
+      if (row.renewal_mode === "automatico" && row.last_charged_at) {
+        const next = new Date(row.last_charged_at);
+        next.setDate(next.getDate() + 30);
+        approxNextRenewal = next.toISOString();
+      }
+      return {
+        addon_key: row.addon_key,
+        name: ADDON_CATALOG[row.addon_key]?.name || row.addon_key,
+        quantity: row.quantity,
+        balance: row.balance,
+        renewal_mode: row.renewal_mode,
+        last_charged_at: row.last_charged_at,
+        approx_next_renewal_at: approxNextRenewal,
+      };
+    });
+
+    const { data: branches, error: branchesError } = await supabase
+      .from("branches")
+      .select("id, name, slug, address, city, commune, phone, is_active")
+      .eq("tenant_id", id)
+      .order("created_at", { ascending: true });
+    if (branchesError) throw branchesError;
+
+    // Contacto del administrador: tenant_users no tiene columnas propias de
+    // nombre/teléfono (confirmado, no existen en ningún select/insert de
+    // este archivo) — el único dato real disponible es el email, vía
+    // auth.users (mismo patrón que GET /members y el fallback de email de
+    // facturación). Se reporta explícitamente qué falta en vez de dejarlo
+    // en blanco sin explicación.
+    const { data: ownerMemberships } = await supabase
+      .from("tenant_users")
+      .select("user_id, role, phone")
+      .eq("tenant_id", id)
+      .eq("is_active", true)
+      .eq("role", "owner");
+
+    const owners = [];
+    for (const membership of ownerMemberships || []) {
+      try {
+        const { data: authUser } = await supabase.auth.admin.getUserById(membership.user_id);
+        owners.push({
+          user_id: membership.user_id,
+          email: authUser?.user?.email || null,
+          name: null,
+          // Solo tenants registrados DESPUÉS de 2026-08-27-owner-phone.sql
+          // tienen este dato (se pide obligatorio en el registro desde esa
+          // fecha) — null acá para uno anterior es esperado, no un bug.
+          phone: membership.phone || null,
+        });
+      } catch (_) {
+        owners.push({ user_id: membership.user_id, email: null, name: null, phone: membership.phone || null });
+      }
+    }
+
+    return res.json({
+      ok: true,
+      tenant: {
+        id: tenant.id,
+        name: tenant.name,
+        slug: tenant.slug,
+        business_category: tenant.business_category || "generic",
+        business_category_label: getBusinessCategoryLabel(tenant.business_category),
+        business_subtype: tenant.business_subtype || null,
+        phone: tenant.phone,
+        email: tenant.email,
+        whatsapp: tenant.whatsapp,
+        address: tenant.address,
+        created_at: tenant.created_at,
+      },
+      plan: {
+        plan_slug: planSlug,
+        status: bucket,
+        amount,
+        subscription_status: subscription?.status || "none",
+        periodicidad: subscription?.periodicidad || null,
+        trial_ends_at: tenant.trial_ends_at,
+        billing_cycle_start: tenant.billing_cycle_start,
+        billing_cycle_end: tenant.billing_cycle_end,
+        scheduled_plan_slug: tenant.scheduled_plan_slug,
+        scheduled_change_at: tenant.scheduled_change_at,
+        pending_change_type: tenant.pending_change_type,
+      },
+      addons: addonsDetailed,
+      branches: branches || [],
+      owners,
+      // No existe ningún log de cambios de plan (upgrade/downgrade) en el
+      // proyecto hoy — confirmado (no hay tabla plan_change_log, audit_log,
+      // ni similar). No se puede reconstruir retroactivamente. Se propone
+      // (no implementado en esta fase) una tabla `plan_change_log(tenant_id,
+      // plan_anterior, plan_nuevo, changed_at)` insertada desde los mismos
+      // 3 puntos donde hoy se confirma un cambio real: POST
+      // /billing/change-plan (upgrade inmediato, ver supabase.update en
+      // server.js ~línea 10350; downgrade programado, ~línea 10422) y POST
+      // /billing/apply-scheduled-changes (downgrade que se hace efectivo,
+      // ~línea 11391) — en los 3 puntos el plan viejo y el nuevo ya están
+      // disponibles en el mismo scope.
+      plan_change_history: {
+        entries: [],
+        note: "Sin historial previo — este registro no existía antes de hoy. Ver propuesta de plan_change_log en el código.",
+      },
+    });
+  } catch (err) {
+    console.error("GET /admin/tenants/:id error:", err.message);
+    res.status(500).json({ error: err.message || "Error obteniendo tenant" });
   }
 });
 
