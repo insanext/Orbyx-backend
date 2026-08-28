@@ -952,6 +952,19 @@ async function trackWhatsAppMessage({ messageSid, tenantId, resource }) {
   }
 }
 
+// Contador simple de visitas a la página pública, para GET /admin/estadisticas
+// (panel admin interno). Fire-and-forget, nunca bloquea ni rompe la carga real
+// de la página — mismo criterio best-effort que el resto de estas funciones
+// de tracking. Ver 2026-08-27-admin-stats.sql para la tabla (un solo total
+// acumulado, no un contador por día).
+async function incrementSiteVisitCounter() {
+  try {
+    await supabase.rpc("increment_site_visit_counter");
+  } catch (err) {
+    console.warn("incrementSiteVisitCounter error:", err.message);
+  }
+}
+
 // Extraído de POST /appointments/slot (estaba anidada ahí) para poder
 // reusarla tal cual desde el envío de campañas WhatsApp Marketing (filtro de
 // audiencia por teléfono válido) sin duplicar la validación.
@@ -14289,6 +14302,11 @@ app.get("/public/services/:slug", publicLimiter, async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
+    // Fire-and-forget: única señal real de "carga de página pública" en el
+    // proyecto (ver comentario en incrementSiteVisitCounter). No se espera
+    // (await) para no agregar latencia a la carga real de la página.
+    incrementSiteVisitCounter();
+
     const resolvedBranchId = await resolveBranchId({
       tenant_id: tenant.id,
       branch_id: branch_id || null,
@@ -16167,6 +16185,145 @@ app.patch("/admin/addons/:key", requireAdminAuth, async (req, res) => {
   } catch (err) {
     console.error("PATCH /admin/addons/:key error:", err.message);
     res.status(500).json({ error: err.message || "Error actualizando add-on" });
+  }
+});
+
+// Precios netos (sin IVA) de los 6 plan_slug que puede tener un tenant hoy
+// (3 vigentes + 3 legacy preservados, ver LEGACY_PLAN_SLUGS más arriba).
+// PLAN_PRICES (arriba en este archivo) NO sirve acá: solo tiene los 3
+// vigentes y cae a starter (14990) para cualquier legacy, lo que
+// subestimaría el ingreso real de esos tenants. Valores copiados de
+// orbyx-web/lib/plans.ts (PLAN_PRICES_ALL, fuente única ya usada por el
+// frontend) — se duplica acá porque el backend no puede importar un
+// archivo del submodule frontend. Solo se usa como último fallback cuando
+// un tenant no tiene ninguna fila en `subscriptions` (subscriptions.monto
+// es siempre preferido por ser el monto real contratado).
+const ADMIN_STATS_PLAN_PRICES = {
+  starter: 14990,
+  business: 29990,
+  premium: 54990,
+  pro: 12990,
+  vip: 54990,
+  platinum: 149990,
+};
+
+// Deriva el mismo bucket de estado que ya calcula GET /billing/account-status
+// (server.js:10630-10641) pero para uso agregado (todos los tenants a la
+// vez), no un tenant individual — por eso es una función pura nueva acá en
+// vez de tocar ese endpoint (billing, alto riesgo, cambios mínimos).
+// IMPORTANTE: si la lógica de /billing/account-status cambia, replicar el
+// cambio acá también — no hay una sola fuente de verdad compartida todavía.
+function deriveTenantBucket({ subscriptionStatus, trialEndsAt, billingCycleEnd, now }) {
+  const hasActiveSubscription = subscriptionStatus === "active";
+  const isTrialingInFlow = subscriptionStatus === "trialing";
+
+  const trialActive = Boolean(trialEndsAt && now < trialEndsAt && !hasActiveSubscription);
+  const awaitingPayment = !hasActiveSubscription && !trialActive && !isTrialingInFlow;
+  const trialExpired = Boolean(awaitingPayment && trialEndsAt && now >= trialEndsAt);
+  const blocked = Boolean(awaitingPayment && billingCycleEnd && now >= billingCycleEnd);
+
+  if (hasActiveSubscription) return "active";
+  if (trialActive || isTrialingInFlow) return "trial";
+  if (blocked || trialExpired || ["canceled", "error"].includes(subscriptionStatus)) {
+    return "expired_or_canceled";
+  }
+  // Awaiting payment pero todavía dentro del ciclo vigente (ni bloqueado ni
+  // con trial vencido) — se cuenta junto a "en prueba" por ser un estado
+  // transitorio, no uno vencido.
+  return "trial";
+}
+
+/* ======================================================
+   📊 GET /admin/estadisticas
+   Sección "Estadísticas del negocio" del panel admin interno — conteo de
+   tenants por estado, ingresos recurrentes actuales (MRR) y visitas a la
+   página pública. Ver 2026-08-27-admin-stats.sql para site_visit_counter.
+====================================================== */
+app.get("/admin/estadisticas", requireAdminAuth, async (req, res) => {
+  try {
+    const { data: tenants, error: tenantsError } = await supabase
+      .from("tenants")
+      .select("id, plan_slug, trial_ends_at, billing_cycle_end, is_active")
+      .eq("is_active", true);
+    if (tenantsError) throw tenantsError;
+
+    const { data: subscriptions, error: subsError } = await supabase
+      .from("subscriptions")
+      .select("tenant_id, status, monto, created_at")
+      .order("created_at", { ascending: false });
+    if (subsError) throw subsError;
+
+    // Solo la más reciente por tenant (subscriptions es un historial de
+    // intentos/estados, no una tabla 1 fila = 1 tenant) — mismo criterio que
+    // GET /billing/account-status (order by created_at desc, limit 1), acá
+    // hecho en JS para las N filas de una sola vez en vez de 1 query por
+    // tenant.
+    const latestSubscriptionByTenant = {};
+    for (const row of subscriptions || []) {
+      if (!latestSubscriptionByTenant[row.tenant_id]) {
+        latestSubscriptionByTenant[row.tenant_id] = row;
+      }
+    }
+
+    const now = new Date();
+    const counts = { active: 0, trial: 0, expired_or_canceled: 0 };
+    const revenueByPlan = {};
+    let revenueTotal = 0;
+
+    for (const tenant of tenants || []) {
+      const subscription = latestSubscriptionByTenant[tenant.id] || null;
+      const bucket = deriveTenantBucket({
+        subscriptionStatus: subscription?.status || "none",
+        trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
+        billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
+        now,
+      });
+      counts[bucket] = (counts[bucket] || 0) + 1;
+
+      if (bucket === "active") {
+        const planSlug = normalizePlanSlug(tenant.plan_slug);
+        const amount =
+          subscription?.monto != null
+            ? Number(subscription.monto)
+            : ADMIN_STATS_PLAN_PRICES[planSlug] || ADMIN_STATS_PLAN_PRICES.starter;
+
+        revenueByPlan[planSlug] = (revenueByPlan[planSlug] || 0) + amount;
+        revenueTotal += amount;
+      }
+    }
+
+    const { data: visitRow } = await supabase
+      .from("site_visit_counter")
+      .select("total")
+      .eq("id", 1)
+      .maybeSingle();
+
+    return res.json({
+      ok: true,
+      tenants: {
+        active: counts.active,
+        trial: counts.trial,
+        expired_or_canceled: counts.expired_or_canceled,
+        total: (tenants || []).length,
+      },
+      revenue: {
+        // MRR actual (monto base del plan contratado, sin add-ons — el
+        // saldo/consumo de add-ons no se factura por separado en una tabla
+        // hoy, ver plan del admin panel). Neto, sin IVA (mismo criterio que
+        // subscriptions.monto/PLAN_PRICES en todo el resto del backend).
+        total_mrr: revenueTotal,
+        by_plan: revenueByPlan,
+        currency: "CLP",
+        note: "No incluye add-ons. No hay tabla de historial de pagos todavía — este es un snapshot del MRR actual, no un desglose real por período histórico.",
+      },
+      visits: {
+        total: Number(visitRow?.total) || 0,
+      },
+      flow_mode: (process.env.FLOW_API_URL || "").includes("sandbox") ? "sandbox" : "live",
+    });
+  } catch (err) {
+    console.error("GET /admin/estadisticas error:", err.message);
+    res.status(500).json({ error: err.message || "Error obteniendo estadísticas" });
   }
 });
 
