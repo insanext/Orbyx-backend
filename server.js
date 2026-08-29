@@ -6698,7 +6698,7 @@ function classifyCustomerActivity(totalVisits, lastVisitAt, inactiveCutoff) {
 app.get("/stats/:slug", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
-    const { from, to, branch_id } = req.query;
+    const { from, to, branch_id, inactive_days } = req.query;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
@@ -6814,7 +6814,11 @@ app.get("/stats/:slug", tenantAuthSlug, async (req, res) => {
       .limit(500);
     if (customerRowsError) throw customerRowsError;
 
-    const inactiveDays = 60; // mismo default que getCustomerSegment (GET /customers/:slug)
+    // Corte de inactividad configurable desde el panel (30/60/90/personalizado)
+    // — antes fijo en 60, mismo default que getCustomerSegment (GET
+    // /customers/:slug) cuando no viene el parámetro. Clamp 1-365 para
+    // evitar valores absurdos desde el query string.
+    const inactiveDays = Math.max(1, Math.min(365, Number(inactive_days) || 60));
     const inactiveCutoff = new Date(now.getTime() - inactiveDays * 24 * 60 * 60 * 1000);
 
     const classifiedCustomers = (customerRows || []).map((c) => ({
