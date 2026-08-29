@@ -983,6 +983,31 @@ function normalizeChileanPhone(rawPhone) {
   return `+56${digits}`;
 }
 
+// Usado solo en POST /appointments/slot, donde el formulario público ahora
+// deja elegir cualquier país (PhoneCountryInput/toE164 en el frontend, que ya
+// envía el número en formato E.164 con "+"). Intenta primero el formato
+// chileno estricto (igual criterio que normalizeChileanPhone, incluye
+// aceptar el prefijo "56" sin "+"); si no calza, acepta cualquier otro país
+// en formato E.164 (+<código><dígitos>, 7 a 15 dígitos en total). No se
+// modifica normalizeChileanPhone en sí para no afectar sus otros call sites
+// (ej. filtro de audiencia de campañas WhatsApp), que siguen siendo
+// intencionalmente solo-Chile.
+function normalizeBookingPhone(rawPhone) {
+  const chilean = normalizeChileanPhone(rawPhone);
+  if (chilean) return chilean;
+
+  if (!rawPhone) return null;
+
+  const raw = String(rawPhone).trim();
+  const digits = raw.replace(/\D/g, "");
+
+  if (raw.startsWith("+") && digits.length >= 7 && digits.length <= 15) {
+    return `+${digits}`;
+  }
+
+  return null;
+}
+
 // Envía la confirmación de reserva (email + WhatsApp) — extraído de
 // POST /appointments/slot para poder reutilizarlo EXACTO (mismos templates,
 // misma lógica de cupo) desde POST /appointments/:id/deposit/confirm, sin
@@ -5166,7 +5191,7 @@ const {
     }
 
     const normalizedEmail = String(customer_email || "").trim().toLowerCase();
-    const normalizedPhone = normalizeChileanPhone(customer_phone);
+    const normalizedPhone = normalizeBookingPhone(customer_phone);
 
     if (
       !calendar_id ||
@@ -5190,8 +5215,7 @@ const {
 
     if (!normalizedPhone) {
       return res.status(400).json({
-        error:
-          "El teléfono debe ser un número móvil chileno válido de 9 dígitos. Ejemplo: 912345678",
+        error: "El teléfono ingresado no es válido.",
       });
     }
 
