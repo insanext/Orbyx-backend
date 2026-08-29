@@ -6650,6 +6650,549 @@ app.get("/dashboard/metrics/:slug", tenantAuthSlug, async (req, res) => {
   }
 });
 
+// Nivel de plan para gating de GET /stats/:slug — mismo criterio que
+// PLAN_LEVEL en orbyx-web/lib/plans.ts (incluye los 3 legacy pro/vip/
+// platinum, mapeados a su nivel real: pro≈starter, vip/platinum≈premium).
+// No se reusa getPlanLevel()/PLAN_ORDER existentes en server.js porque esos
+// solo cubren starter/business/premium y colapsarían vip/platinum a nivel
+// starter, quitándoles funciones premium que sí deben conservar.
+const STATS_PLAN_LEVEL = {
+  starter: 1,
+  business: 2,
+  premium: 3,
+  pro: 1,
+  vip: 3,
+  platinum: 3,
+};
+function getStatsPlanLevel(planSlug) {
+  const normalized = String(planSlug || "starter").toLowerCase();
+  return STATS_PLAN_LEVEL[normalized] || STATS_PLAN_LEVEL.starter;
+}
+
+// Mismo criterio de segmentación que getCustomerSegment (GET /customers/:slug
+// y GET /admin/tenants/:id, ambos con su propia copia inline) — factorizado
+// acá para no duplicarlo una tercera vez, sin tocar esos dos endpoints
+// existentes. inactive: sin visitas o última visita antes del corte;
+// frequent: >=5 visitas; recurrent: >=2; si no, new.
+function classifyCustomerActivity(totalVisits, lastVisitAt, inactiveCutoff) {
+  const lastVisit = lastVisitAt ? new Date(lastVisitAt) : null;
+  const isInactive =
+    !lastVisit || Number.isNaN(lastVisit.getTime())
+      ? true
+      : lastVisit.getTime() <= inactiveCutoff.getTime();
+  if (isInactive) return "inactive";
+  if (totalVisits >= 5) return "frequent";
+  if (totalVisits >= 2) return "recurrent";
+  return "new";
+}
+
+/* ======================================================
+   📊 GET /stats/:slug
+   Estadísticas del negocio para el dashboard del tenant (distinto del panel
+   admin interno de Orbyx, que ve todos los tenants — esto es un tenant
+   viendo solo su propio negocio). Gating por plan: básicas siempre,
+   Business agrega cupos/historial de campañas, Premium agrega ocupación,
+   ingresos estimados, desempeño por profesional/sucursal y entrega real de
+   WhatsApp Marketing.
+====================================================== */
+app.get("/stats/:slug", tenantAuthSlug, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { from, to, branch_id } = req.query;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, plan_slug, business_category")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const planLevel = getStatsPlanLevel(tenant.plan_slug);
+
+    // A diferencia de resolveBranchId en el flujo de reservas (que hace
+    // fallback a la sucursal principal cuando branch_id falta), acá sin
+    // branch_id explícito las estadísticas muestran TODAS las sucursales
+    // combinadas — ese fallback escondería sucursales del total.
+    let resolvedBranchId = null;
+    if (branch_id) {
+      try {
+        resolvedBranchId = await resolveBranchId({
+          tenant_id: tenant.id,
+          branch_id,
+        });
+      } catch (branchError) {
+        return res.status(400).json({
+          error: branchError.message || "branch_id inválido",
+        });
+      }
+    }
+
+    const now = new Date();
+
+    function toDateOnly(value) {
+      return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "")) ? String(value) : null;
+    }
+
+    const defaultTo = now.toISOString().slice(0, 10);
+    const defaultFrom = new Date(now.getFullYear(), now.getMonth(), 1)
+      .toISOString()
+      .slice(0, 10);
+
+    const fromKey = toDateOnly(from) || defaultFrom;
+    const toKey = toDateOnly(to) || defaultTo;
+    const fromIso = `${fromKey}T00:00:00`;
+    const toIso = `${toKey}T23:59:59`;
+
+    const { data: branchRows, error: branchesError } = await supabase
+      .from("branches")
+      .select("id, name")
+      .eq("tenant_id", tenant.id)
+      .eq("is_active", true)
+      .order("name", { ascending: true });
+    if (branchesError) throw branchesError;
+
+    let appointmentsQuery = supabase
+      .from("appointments")
+      .select(
+        "id, status, start_at, created_at, service_id, staff_id, branch_id, customer_id, service_name_snapshot"
+      )
+      .eq("tenant_id", tenant.id)
+      .gte("start_at", fromIso)
+      .lte("start_at", toIso);
+
+    if (resolvedBranchId) {
+      appointmentsQuery = appointmentsQuery.eq("branch_id", resolvedBranchId);
+    }
+
+    const { data: appointmentRows, error: appointmentsError } = await appointmentsQuery;
+    if (appointmentsError) throw appointmentsError;
+
+    const appointments = appointmentRows || [];
+
+    const byStatus = { booked: 0, completed: 0, canceled: 0, no_show: 0, rescheduled: 0 };
+    for (const appt of appointments) {
+      const status = String(appt.status || "").toLowerCase();
+      if (byStatus[status] !== undefined) byStatus[status]++;
+    }
+
+    // Tasas sobre citas ya "resueltas" (completadas/no-show/canceladas) — se
+    // excluyen booked/rescheduled porque todavía no ocurrieron; incluirlas
+    // subestimaría artificialmente la tasa. Mismo criterio se reusa abajo
+    // para la tasa por profesional (staff_performance).
+    const resolvedTotal = byStatus.completed + byStatus.no_show + byStatus.canceled;
+    const noShowRate = resolvedTotal > 0 ? byStatus.no_show / resolvedTotal : 0;
+    const cancellationRate = resolvedTotal > 0 ? byStatus.canceled / resolvedTotal : 0;
+
+    // ---- Clientes ----
+    const { count: customersTotal, error: customersTotalError } = await supabase
+      .from("customers")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenant.id);
+    if (customersTotalError) throw customersTotalError;
+
+    const { count: customersNew, error: customersNewError } = await supabase
+      .from("customers")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenant.id)
+      .gte("created_at", fromIso)
+      .lte("created_at", toIso);
+    if (customersNewError) throw customersNewError;
+
+    const { data: customerRows, error: customerRowsError } = await supabase
+      .from("customers")
+      .select("id, name, email, phone, total_visits, last_visit_at")
+      .eq("tenant_id", tenant.id)
+      .order("total_visits", { ascending: false })
+      .limit(500);
+    if (customerRowsError) throw customerRowsError;
+
+    const inactiveDays = 60; // mismo default que getCustomerSegment (GET /customers/:slug)
+    const inactiveCutoff = new Date(now.getTime() - inactiveDays * 24 * 60 * 60 * 1000);
+
+    const classifiedCustomers = (customerRows || []).map((c) => ({
+      ...c,
+      segment: classifyCustomerActivity(Number(c.total_visits || 0), c.last_visit_at, inactiveCutoff),
+    }));
+
+    const activeCustomers = classifiedCustomers
+      .filter((c) => c.segment !== "inactive")
+      .sort((a, b) => Number(b.total_visits || 0) - Number(a.total_visits || 0))
+      .slice(0, 15);
+
+    const inactiveCustomers = classifiedCustomers
+      .filter((c) => c.segment === "inactive")
+      .sort((a, b) => {
+        const at = a.last_visit_at ? new Date(a.last_visit_at).getTime() : 0;
+        const bt = b.last_visit_at ? new Date(b.last_visit_at).getTime() : 0;
+        return bt - at;
+      })
+      .slice(0, 15);
+
+    // ---- Servicios más reservados ----
+    const serviceCounts = new Map();
+    for (const appt of appointments) {
+      if (!appt.service_id) continue;
+      const current = serviceCounts.get(appt.service_id) || {
+        service_id: appt.service_id,
+        name: appt.service_name_snapshot || "Servicio",
+        total: 0,
+      };
+      current.total++;
+      serviceCounts.set(appt.service_id, current);
+    }
+    const topServices = Array.from(serviceCounts.values())
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 10);
+
+    // ---- Add-ons activos ----
+    const { data: addonRows, error: addonRowsError } = await supabase
+      .from("tenant_addons")
+      .select("addon_key, quantity, balance, billing_cycle")
+      .eq("tenant_id", tenant.id)
+      .eq("status", "active");
+    if (addonRowsError) throw addonRowsError;
+
+    const addons = (addonRows || []).map((row) => ({
+      addon_key: row.addon_key,
+      name: ADDON_CATALOG[row.addon_key]?.name || row.addon_key,
+      quantity: row.quantity,
+      balance: row.balance,
+      billing_cycle: row.billing_cycle,
+    }));
+
+    // ---- Cupo WhatsApp confirmación+recordatorio ----
+    const waConfirmacionUsage = await checkMonthlyUsage(tenant.id, "wa_confirmacion");
+
+    // ---- Modo veterinario ----
+    const vetCategories = ["veterinaria", "vet", "clinica", "odontologia"];
+    const isVetMode = vetCategories.includes(String(tenant.business_category || "").toLowerCase());
+    let vetStats = null;
+    if (isVetMode) {
+      const { count: petsCount, error: petsError } = await supabase
+        .from("pets")
+        .select("id", { count: "exact", head: true })
+        .eq("tenant_id", tenant.id);
+      if (petsError) throw petsError;
+
+      const { count: pendingFollowups, error: followupsError } = await supabase
+        .from("pet_followups")
+        .select("id", { count: "exact", head: true })
+        .eq("tenant_id", tenant.id)
+        .gte("next_control_at", now.toISOString());
+      if (followupsError) throw followupsError;
+
+      vetStats = { pets_count: petsCount || 0, pending_followups: pendingFollowups || 0 };
+    }
+
+    const basic = {
+      appointments: {
+        total: appointments.length,
+        by_status: byStatus,
+        no_show_rate: Number((noShowRate * 100).toFixed(1)),
+        cancellation_rate: Number((cancellationRate * 100).toFixed(1)),
+      },
+      customers: { total: customersTotal || 0, new_in_period: customersNew || 0 },
+      customer_ranking: {
+        active: activeCustomers,
+        inactive: inactiveCustomers,
+        inactive_days_threshold: inactiveDays,
+      },
+      top_services: topServices,
+      addons,
+      wa_confirmacion_usage: waConfirmacionUsage,
+      vet: vetStats,
+    };
+
+    // ---- Business: cupos de campañas + historial simple ----
+    let businessTier = null;
+    if (planLevel >= 2) {
+      const campanasWaUsage = await checkMonthlyUsage(tenant.id, "campanas_wa");
+      const emailsCampanaUsage = await checkMonthlyUsage(tenant.id, "emails_campana");
+
+      const { data: campaignRows, error: campaignRowsError } = await supabase
+        .from("campaign_history")
+        .select("id, campaign_name, channel, sent_count, failed_count, skipped_count, created_at")
+        .eq("tenant_id", tenant.id)
+        .gte("created_at", fromIso)
+        .lte("created_at", toIso)
+        .order("created_at", { ascending: false })
+        .limit(30);
+      if (campaignRowsError) throw campaignRowsError;
+
+      const campaignTotals = (campaignRows || []).reduce(
+        (acc, row) => {
+          acc.sent += Number(row.sent_count || 0);
+          acc.failed += Number(row.failed_count || 0);
+          acc.skipped += Number(row.skipped_count || 0);
+          return acc;
+        },
+        { sent: 0, failed: 0, skipped: 0 }
+      );
+
+      businessTier = {
+        campanas_wa_usage: campanasWaUsage,
+        emails_campana_usage: emailsCampanaUsage,
+        campaign_history: { rows: campaignRows || [], totals: campaignTotals },
+      };
+    }
+
+    // ---- Premium: ocupación, ingresos estimados, desempeño, entrega real ----
+    let premiumTier = null;
+    if (planLevel >= 3) {
+      const { data: servicesRows, error: servicesRowsError } = await supabase
+        .from("services")
+        .select("id, name, price, is_group, capacity")
+        .eq("tenant_id", tenant.id)
+        .is("deleted_at", null);
+      if (servicesRowsError) throw servicesRowsError;
+
+      const { data: staffRows, error: staffRowsError } = await supabase
+        .from("staff")
+        .select("id, name")
+        .eq("tenant_id", tenant.id);
+      if (staffRowsError) throw staffRowsError;
+
+      const serviceById = new Map((servicesRows || []).map((s) => [s.id, s]));
+      const staffById = new Map((staffRows || []).map((s) => [s.id, s]));
+      const branchById = new Map((branchRows || []).map((b) => [b.id, b]));
+
+      const heatmapMap = new Map();
+      let leadTimeSumHours = 0;
+      let leadTimeCount = 0;
+      const revenueByService = new Map();
+      const revenueByStaff = new Map();
+      const revenueByBranch = new Map();
+      const staffPerf = new Map();
+      const branchActivity = new Map();
+
+      // "Estimado": no existe price_snapshot en appointments, así que usa el
+      // precio ACTUAL del servicio — si el tenant cambió precios, el
+      // histórico no calza exacto (ver CLAUDE.md/auditoría). completed+booked
+      // = confirmado u ocurrido; excluye canceled/no_show.
+      const REVENUE_STATUSES = new Set(["completed", "booked"]);
+
+      for (const appt of appointments) {
+        const startDate = new Date(appt.start_at);
+
+        const parts = new Intl.DateTimeFormat("en-US", {
+          timeZone: "America/Santiago",
+          weekday: "short",
+          hour: "2-digit",
+          hour12: false,
+        }).formatToParts(startDate);
+        const weekday = parts.find((p) => p.type === "weekday")?.value || "";
+        let hour = Number(parts.find((p) => p.type === "hour")?.value);
+        if (hour === 24) hour = 0;
+
+        const heatKey = `${weekday}-${hour}`;
+        heatmapMap.set(heatKey, (heatmapMap.get(heatKey) || 0) + 1);
+
+        if (appt.created_at) {
+          const diffHours =
+            (startDate.getTime() - new Date(appt.created_at).getTime()) / (1000 * 60 * 60);
+          if (Number.isFinite(diffHours) && diffHours >= 0) {
+            leadTimeSumHours += diffHours;
+            leadTimeCount++;
+          }
+        }
+
+        const status = String(appt.status || "").toLowerCase();
+        const service = appt.service_id ? serviceById.get(appt.service_id) : null;
+        const price = REVENUE_STATUSES.has(status) && service?.price ? Number(service.price) : 0;
+
+        if (price > 0 && appt.service_id) {
+          const current = revenueByService.get(appt.service_id) || {
+            service_id: appt.service_id,
+            name: service?.name || appt.service_name_snapshot || "Servicio",
+            total: 0,
+          };
+          current.total += price;
+          revenueByService.set(appt.service_id, current);
+        }
+        if (price > 0 && appt.staff_id) {
+          const current = revenueByStaff.get(appt.staff_id) || {
+            staff_id: appt.staff_id,
+            name: staffById.get(appt.staff_id)?.name || "Profesional",
+            total: 0,
+          };
+          current.total += price;
+          revenueByStaff.set(appt.staff_id, current);
+        }
+        if (price > 0 && appt.branch_id) {
+          const current = revenueByBranch.get(appt.branch_id) || {
+            branch_id: appt.branch_id,
+            name: branchById.get(appt.branch_id)?.name || "Sucursal",
+            total: 0,
+          };
+          current.total += price;
+          revenueByBranch.set(appt.branch_id, current);
+        }
+
+        if (appt.staff_id) {
+          const current = staffPerf.get(appt.staff_id) || {
+            staff_id: appt.staff_id,
+            name: staffById.get(appt.staff_id)?.name || "Profesional",
+            total: 0,
+            completed: 0,
+            no_show: 0,
+            canceled: 0,
+          };
+          current.total++;
+          if (status === "completed") current.completed++;
+          if (status === "no_show") current.no_show++;
+          if (status === "canceled") current.canceled++;
+          staffPerf.set(appt.staff_id, current);
+        }
+
+        if (appt.branch_id) {
+          const current = branchActivity.get(appt.branch_id) || {
+            branch_id: appt.branch_id,
+            name: branchById.get(appt.branch_id)?.name || "Sucursal",
+            total: 0,
+            customers: new Set(),
+          };
+          current.total++;
+          if (appt.customer_id) current.customers.add(appt.customer_id);
+          branchActivity.set(appt.branch_id, current);
+        }
+      }
+
+      const occupancyHeatmap = Array.from(heatmapMap.entries()).map(([key, count]) => {
+        const [weekday, hour] = key.split("-");
+        return { weekday, hour: Number(hour), count };
+      });
+
+      const staffPerformance = Array.from(staffPerf.values())
+        .map((row) => {
+          const resolved = row.completed + row.no_show + row.canceled;
+          return {
+            ...row,
+            no_show_rate: resolved > 0 ? Number(((row.no_show / resolved) * 100).toFixed(1)) : 0,
+            cancellation_rate: resolved > 0 ? Number(((row.canceled / resolved) * 100).toFixed(1)) : 0,
+          };
+        })
+        .sort((a, b) => b.total - a.total);
+
+      const branchActivityRows = Array.from(branchActivity.values())
+        .map((row) => ({
+          branch_id: row.branch_id,
+          name: row.name,
+          total_appointments: row.total,
+          active_customers: row.customers.size,
+        }))
+        .sort((a, b) => b.total_appointments - a.total_appointments);
+
+      // ---- Cupos ocupados en reservas grupales ----
+      const groupServiceIds = new Set((servicesRows || []).filter((s) => s.is_group).map((s) => s.id));
+      const groupSessions = new Map();
+      for (const appt of appointments) {
+        if (!appt.service_id || !groupServiceIds.has(appt.service_id)) continue;
+        if (String(appt.status || "").toLowerCase() === "canceled") continue;
+        const sessionsForService = groupSessions.get(appt.service_id) || new Map();
+        sessionsForService.set(appt.start_at, (sessionsForService.get(appt.start_at) || 0) + 1);
+        groupSessions.set(appt.service_id, sessionsForService);
+      }
+      const groupCapacityStats = Array.from(groupSessions.entries()).map(([serviceId, sessions]) => {
+        const service = serviceById.get(serviceId);
+        const capacity = Number(service?.capacity || 1);
+        const sessionCount = sessions.size;
+        const totalBooked = Array.from(sessions.values()).reduce((a, b) => a + b, 0);
+        const totalCapacity = capacity * sessionCount;
+        return {
+          service_id: serviceId,
+          name: service?.name || "Servicio grupal",
+          sessions: sessionCount,
+          capacity_per_session: capacity,
+          total_booked: totalBooked,
+          occupancy_rate: totalCapacity > 0 ? Number(((totalBooked / totalCapacity) * 100).toFixed(1)) : 0,
+        };
+      });
+
+      // ---- Tasa de entrega real de WhatsApp Marketing (dato real, no
+      // estimado) — mismo webhook de Twilio que ya usa confirmación/
+      // recordatorio actualiza campaign_delivery_logs.status.
+      const { data: waCampaigns, error: waCampaignsError } = await supabase
+        .from("campaign_history")
+        .select("id")
+        .eq("tenant_id", tenant.id)
+        .eq("channel", "whatsapp")
+        .gte("created_at", fromIso)
+        .lte("created_at", toIso);
+      if (waCampaignsError) throw waCampaignsError;
+
+      const waCampaignIds = (waCampaigns || []).map((c) => c.id);
+      const waDelivery = {
+        total: 0,
+        delivered: 0,
+        read: 0,
+        failed: 0,
+        undelivered: 0,
+        other: 0,
+        delivery_rate: 0,
+      };
+
+      if (waCampaignIds.length > 0) {
+        const { data: deliveryLogs, error: deliveryLogsError } = await supabase
+          .from("campaign_delivery_logs")
+          .select("status")
+          .in("campaign_history_id", waCampaignIds);
+        if (deliveryLogsError) throw deliveryLogsError;
+
+        for (const log of deliveryLogs || []) {
+          const status = String(log.status || "").toLowerCase();
+          waDelivery.total++;
+          if (status === "delivered") waDelivery.delivered++;
+          else if (status === "read") waDelivery.read++;
+          else if (status === "failed") waDelivery.failed++;
+          else if (status === "undelivered") waDelivery.undelivered++;
+          else waDelivery.other++;
+        }
+        const deliveredOrRead = waDelivery.delivered + waDelivery.read;
+        waDelivery.delivery_rate =
+          waDelivery.total > 0 ? Number(((deliveredOrRead / waDelivery.total) * 100).toFixed(1)) : 0;
+      }
+
+      premiumTier = {
+        occupancy_heatmap: occupancyHeatmap,
+        avg_lead_time_hours: leadTimeCount > 0 ? Number((leadTimeSumHours / leadTimeCount).toFixed(1)) : null,
+        revenue_estimated: {
+          note:
+            "Estimado con el precio actual del servicio (no existe registro del precio al momento de cada reserva) — si el tenant cambió precios, el histórico puede no calzar exacto.",
+          by_service: Array.from(revenueByService.values()).sort((a, b) => b.total - a.total).slice(0, 10),
+          by_staff: Array.from(revenueByStaff.values()).sort((a, b) => b.total - a.total).slice(0, 10),
+          by_branch: Array.from(revenueByBranch.values()).sort((a, b) => b.total - a.total),
+        },
+        staff_performance: staffPerformance,
+        branch_activity: branchActivityRows,
+        group_capacity: groupCapacityStats,
+        whatsapp_marketing_delivery: waDelivery,
+      };
+    }
+
+    return res.json({
+      ok: true,
+      plan_slug: tenant.plan_slug,
+      plan_level: planLevel,
+      is_vet_mode: isVetMode,
+      branches: branchRows || [],
+      filters: { from: fromKey, to: toKey, branch_id: resolvedBranchId },
+      basic,
+      business: businessTier,
+      premium: premiumTier,
+    });
+  } catch (err) {
+    console.error("GET /stats/:slug error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 /* ======================================================
    ✅ GET /appointments/customer-history/:slug
