@@ -6917,9 +6917,17 @@ app.get("/stats/:slug", tenantAuthSlug, async (req, res) => {
       const campanasWaUsage = await checkMonthlyUsage(tenant.id, "campanas_wa");
       const emailsCampanaUsage = await checkMonthlyUsage(tenant.id, "emails_campana");
 
-      const { data: campaignRows, error: campaignRowsError } = await supabase
+      // campaign_history NO tiene columna skipped_count en producción hoy
+      // (confirmado vía el spec OpenAPI de PostgREST — la migración
+      // 2026-08-27-whatsapp-marketing-campaigns.sql que la agrega nunca se
+      // corrió contra prod; ver también template_id, mismo caso, y
+      // campaign_delivery_logs.message_sid). "Omitidos" se deriva acá de
+      // columnas que sí existen: contactos con dato de contacto menos los
+      // que sí se enviaron u fallaron — no es un valor guardado, es
+      // calculado, pero solo con datos reales de la fila.
+      const { data: rawCampaignRows, error: campaignRowsError } = await supabase
         .from("campaign_history")
-        .select("id, campaign_name, channel, sent_count, failed_count, skipped_count, created_at")
+        .select("id, campaign_name, channel, recipients_with_contact, sent_count, failed_count, created_at")
         .eq("tenant_id", tenant.id)
         .gte("created_at", fromIso)
         .lte("created_at", toIso)
@@ -6927,11 +6935,26 @@ app.get("/stats/:slug", tenantAuthSlug, async (req, res) => {
         .limit(30);
       if (campaignRowsError) throw campaignRowsError;
 
-      const campaignTotals = (campaignRows || []).reduce(
+      const campaignRows = (rawCampaignRows || []).map((row) => {
+        const sent = Number(row.sent_count || 0);
+        const failed = Number(row.failed_count || 0);
+        const recipients = Number(row.recipients_with_contact || 0);
+        return {
+          id: row.id,
+          campaign_name: row.campaign_name,
+          channel: row.channel,
+          sent_count: sent,
+          failed_count: failed,
+          skipped_count: Math.max(0, recipients - sent - failed),
+          created_at: row.created_at,
+        };
+      });
+
+      const campaignTotals = campaignRows.reduce(
         (acc, row) => {
-          acc.sent += Number(row.sent_count || 0);
-          acc.failed += Number(row.failed_count || 0);
-          acc.skipped += Number(row.skipped_count || 0);
+          acc.sent += row.sent_count;
+          acc.failed += row.failed_count;
+          acc.skipped += row.skipped_count;
           return acc;
         },
         { sent: 0, failed: 0, skipped: 0 }
@@ -6940,7 +6963,7 @@ app.get("/stats/:slug", tenantAuthSlug, async (req, res) => {
       businessTier = {
         campanas_wa_usage: campanasWaUsage,
         emails_campana_usage: emailsCampanaUsage,
-        campaign_history: { rows: campaignRows || [], totals: campaignTotals },
+        campaign_history: { rows: campaignRows, totals: campaignTotals },
       };
     }
 
