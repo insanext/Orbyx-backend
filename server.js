@@ -983,14 +983,27 @@ function normalizeChileanPhone(rawPhone) {
   return `+56${digits}`;
 }
 
-// Usado solo en POST /appointments/slot, donde el formulario público ahora
-// deja elegir cualquier país (PhoneCountryInput/toE164 en el frontend, que ya
-// envía el número en formato E.164 con "+"). Intenta primero el formato
-// chileno estricto (igual criterio que normalizeChileanPhone, incluye
-// aceptar el prefijo "56" sin "+"); si no calza, acepta cualquier otro país
-// en formato E.164 (+<código><dígitos>, 7 a 15 dígitos en total). No se
-// modifica normalizeChileanPhone en sí para no afectar sus otros call sites
-// (ej. filtro de audiencia de campañas WhatsApp), que siguen siendo
+// Países habilitados hoy para POST /appointments/slot (el formulario público
+// ahora usa PhoneCountryInput con allowedCountries=["CL"], pero el
+// componente y normalizeBookingPhone sí soportan cualquier país — esto es
+// solo un freno temporal). Para reactivar otro país el día de mañana:
+// (1) agregar su ISO2 acá, (2) agregar su dial code a
+// BOOKING_COUNTRY_DIAL_CODES, (3) sacar allowedCountries={["CL"]} del lado
+// del formulario público en orbyx-web. No hace falta tocar la lógica de
+// normalizeBookingPhone.
+const ALLOWED_BOOKING_COUNTRIES = ["CL"];
+const BOOKING_COUNTRY_DIAL_CODES = {
+  CL: "56",
+};
+
+// Usado solo en POST /appointments/slot. Intenta primero el formato chileno
+// estricto (igual criterio que normalizeChileanPhone, incluye aceptar el
+// prefijo "56" sin "+"); si no calza, acepta formato E.164 genérico
+// (+<código><dígitos>, 7 a 15 dígitos en total) SOLO si el código de país
+// corresponde a uno de ALLOWED_BOOKING_COUNTRIES (hoy, ninguno además de
+// Chile, así que en la práctica cualquier número no-chileno se rechaza). No
+// se modifica normalizeChileanPhone en sí para no afectar sus otros call
+// sites (ej. filtro de audiencia de campañas WhatsApp), que siguen siendo
 // intencionalmente solo-Chile.
 function normalizeBookingPhone(rawPhone) {
   const chilean = normalizeChileanPhone(rawPhone);
@@ -1001,11 +1014,21 @@ function normalizeBookingPhone(rawPhone) {
   const raw = String(rawPhone).trim();
   const digits = raw.replace(/\D/g, "");
 
-  if (raw.startsWith("+") && digits.length >= 7 && digits.length <= 15) {
-    return `+${digits}`;
+  if (!raw.startsWith("+") || digits.length < 7 || digits.length > 15) {
+    return null;
   }
 
-  return null;
+  const allowedOtherDialCodes = ALLOWED_BOOKING_COUNTRIES.filter(
+    (iso2) => iso2 !== "CL"
+  )
+    .map((iso2) => BOOKING_COUNTRY_DIAL_CODES[iso2])
+    .filter(Boolean);
+
+  const matchesAllowedCountry = allowedOtherDialCodes.some((dialCode) =>
+    digits.startsWith(dialCode)
+  );
+
+  return matchesAllowedCountry ? `+${digits}` : null;
 }
 
 // Envía la confirmación de reserva (email + WhatsApp) — extraído de
@@ -5215,7 +5238,7 @@ const {
 
     if (!normalizedPhone) {
       return res.status(400).json({
-        error: "El teléfono ingresado no es válido.",
+        error: "Por el momento solo aceptamos números de teléfono de Chile.",
       });
     }
 
