@@ -4110,12 +4110,24 @@ app.put("/business-special-dates/:id", tenantAuthWrite, async (req, res) => {
       return res.status(400).json({ error: "id es obligatorio" });
     }
 
+    const { data: existingDate } = await supabase
+      .from("business_special_dates")
+      .select("id")
+      .eq("id", id)
+      .eq("tenant_id", req.authenticatedUser.tenant_id)
+      .single();
+
+    if (!existingDate) {
+      return res.status(404).json({ error: "Fecha especial no encontrada" });
+    }
+
     const payload = {
       updated_at: new Date().toISOString(),
     };
     const isGlobalScope = scope === "global" || branch_id === null || branch_id === "null";
 
-    if (tenant_id !== undefined) payload.tenant_id = tenant_id;
+    // tenant_id nunca se reasigna vía body — el recurso ya quedó
+    // identificado/validado arriba por el tenant_id autenticado.
     if (branch_id !== undefined || scope !== undefined) {
       payload.branch_id = isGlobalScope ? null : branch_id;
     }
@@ -4129,6 +4141,7 @@ app.put("/business-special-dates/:id", tenantAuthWrite, async (req, res) => {
       .from("business_special_dates")
       .update(payload)
       .eq("id", id)
+      .eq("tenant_id", req.authenticatedUser.tenant_id)
       .select("*")
       .single();
 
@@ -4153,11 +4166,24 @@ app.put("/business-special-dates/:id", tenantAuthWrite, async (req, res) => {
 app.delete("/business-special-dates/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
+    const tenantId = req.authenticatedUser.tenant_id;
+
+    const { data: existingDate } = await supabase
+      .from("business_special_dates")
+      .select("id")
+      .eq("id", id)
+      .eq("tenant_id", tenantId)
+      .single();
+
+    if (!existingDate) {
+      return res.status(404).json({ error: "Fecha especial no encontrada" });
+    }
 
     const { error } = await supabase
       .from("business_special_dates")
       .delete()
-      .eq("id", id);
+      .eq("id", id)
+      .eq("tenant_id", tenantId);
 
     if (error) throw error;
 
@@ -4489,13 +4515,14 @@ app.put("/staff/:id", tenantAuthWrite, async (req, res) => {
       .from("staff")
       .select("id, tenant_id, branch_id")
       .eq("id", id)
+      .eq("tenant_id", req.authenticatedUser.tenant_id)
       .single();
 
     if (existingError || !existingStaff) {
       return res.status(404).json({ error: "Staff no encontrado" });
     }
 
-    const effectiveTenantId = tenant_id || existingStaff.tenant_id;
+    const effectiveTenantId = existingStaff.tenant_id;
 
     const updateData = {};
 
@@ -4533,6 +4560,7 @@ if (req.body.photo_url !== undefined) {
       .from("staff")
       .update(updateData)
       .eq("id", id)
+      .eq("tenant_id", effectiveTenantId)
       .select("*")
       .single();
 
@@ -4554,11 +4582,24 @@ if (req.body.photo_url !== undefined) {
 app.delete("/staff/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
+    const tenantId = req.authenticatedUser.tenant_id;
+
+    const { data: existingStaff } = await supabase
+      .from("staff")
+      .select("id")
+      .eq("id", id)
+      .eq("tenant_id", tenantId)
+      .single();
+
+    if (!existingStaff) {
+      return res.status(404).json({ error: "Staff no encontrado" });
+    }
 
     const { error } = await supabase
       .from("staff")
       .delete()
-      .eq("id", id);
+      .eq("id", id)
+      .eq("tenant_id", tenantId);
 
     if (error) throw error;
 
@@ -4976,13 +5017,14 @@ app.put("/staff-special-dates/:id", tenantAuthWrite, async (req, res) => {
       .from("staff_special_dates")
       .select("id, tenant_id, branch_id, staff_id")
       .eq("id", id)
+      .eq("tenant_id", req.authenticatedUser.tenant_id)
       .single();
 
     if (existingRowError || !existingRow) {
       return res.status(404).json({ error: "Excepción no encontrada" });
     }
 
-    const effectiveTenantId = tenant_id || existingRow.tenant_id;
+    const effectiveTenantId = existingRow.tenant_id;
     const effectiveBranchId = branch_id || existingRow.branch_id;
     const effectiveStaffId = staff_id || existingRow.staff_id;
 
@@ -5004,7 +5046,8 @@ app.put("/staff-special-dates/:id", tenantAuthWrite, async (req, res) => {
       updated_at: new Date().toISOString(),
     };
 
-    if (tenant_id !== undefined) payload.tenant_id = tenant_id;
+    // tenant_id nunca se reasigna vía body — el recurso ya quedó
+    // identificado/validado arriba por el tenant_id autenticado.
     if (branch_id !== undefined) payload.branch_id = branch_id;
     if (staff_id !== undefined) payload.staff_id = staff_id;
     if (date !== undefined) payload.date = date;
@@ -5018,6 +5061,7 @@ app.put("/staff-special-dates/:id", tenantAuthWrite, async (req, res) => {
       .from("staff_special_dates")
       .update(payload)
       .eq("id", id)
+      .eq("tenant_id", effectiveTenantId)
       .select("*")
       .single();
 
@@ -5039,11 +5083,24 @@ app.put("/staff-special-dates/:id", tenantAuthWrite, async (req, res) => {
 app.delete("/staff-special-dates/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
+    const tenantId = req.authenticatedUser.tenant_id;
+
+    const { data: existingRow } = await supabase
+      .from("staff_special_dates")
+      .select("id")
+      .eq("id", id)
+      .eq("tenant_id", tenantId)
+      .single();
+
+    if (!existingRow) {
+      return res.status(404).json({ error: "Excepción no encontrada" });
+    }
 
     const { error } = await supabase
       .from("staff_special_dates")
       .delete()
-      .eq("id", id);
+      .eq("id", id)
+      .eq("tenant_id", tenantId);
 
     if (error) throw error;
 
@@ -7313,6 +7370,9 @@ app.get("/pets/:id/clinical-pdf", [dashboardLimiter, requireTenantAuth], async (
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
+    const isMember = await requireTenantMembership(req, res, tenant.id);
+    if (!isMember) return;
+
     const category = String(tenant.business_category || "").toLowerCase();
 
     if (!["veterinaria", "vet"].includes(category)) {
@@ -7609,10 +7669,24 @@ app.get("/appointments", [dashboardLimiter, requireTenantAuth], async (req, res)
       return res.status(400).json({ error: "calendar_id es obligatorio" });
     }
 
+    const { data: cal, error: calErr } = await supabase
+      .from("calendars")
+      .select("id, tenant_id")
+      .eq("id", calendar_id)
+      .single();
+
+    if (calErr || !cal) {
+      return res.status(404).json({ error: "Calendario no encontrado" });
+    }
+
+    const isMember = await requireTenantMembership(req, res, cal.tenant_id);
+    if (!isMember) return;
+
     let query = supabase
       .from("appointments")
       .select("*")
       .eq("calendar_id", calendar_id)
+      .eq("tenant_id", cal.tenant_id)
       .order("start_at", { ascending: true });
 
     if (status) query = query.eq("status", status);
@@ -9484,6 +9558,19 @@ app.get("/campaigns/logs/:campaignId", [dashboardLimiter, requireTenantAuth], as
     if (!campaignId) {
       return res.status(400).json({ error: "campaignId requerido" });
     }
+
+    const { data: campaign, error: campaignError } = await supabase
+      .from("campaign_history")
+      .select("id, tenant_id")
+      .eq("id", campaignId)
+      .single();
+
+    if (campaignError || !campaign) {
+      return res.status(404).json({ error: "Campaña no encontrada" });
+    }
+
+    const isMember = await requireTenantMembership(req, res, campaign.tenant_id);
+    if (!isMember) return;
 
     const { data, error } = await supabase
       .from("campaign_delivery_logs")
@@ -14346,13 +14433,14 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
       .from("branches")
       .select("id, tenant_id, name, slug, is_active")
       .eq("id", id)
+      .eq("tenant_id", req.authenticatedUser.tenant_id)
       .single();
 
     if (existingError || !existingBranch) {
       return res.status(404).json({ error: "Sucursal no encontrada" });
     }
 
-    const effectiveTenantId = tenant_id || existingBranch.tenant_id;
+    const effectiveTenantId = existingBranch.tenant_id;
 
     const updateData = {};
 
@@ -14453,6 +14541,7 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
       .from("branches")
       .update(updateData)
       .eq("id", id)
+      .eq("tenant_id", effectiveTenantId)
       .select("*")
       .single();
 
@@ -14786,13 +14875,14 @@ const {
       .from("services")
       .select("id, tenant_id, branch_id, is_group, capacity")
       .eq("id", id)
+      .eq("tenant_id", req.authenticatedUser.tenant_id)
       .single();
 
     if (existingError || !existingService) {
       return res.status(404).json({ error: "Servicio no encontrado" });
     }
 
-    const effectiveTenantId = tenant_id || existingService.tenant_id;
+    const effectiveTenantId = existingService.tenant_id;
 
     // Capacidad grupal: solo se valida cuando la edición toca is_group o
     // capacity. Servicios legados sobre el límite no bloquean otras ediciones
@@ -14858,6 +14948,7 @@ if (requires_deposit !== undefined)
       .from("services")
       .update(updateData)
       .eq("id", id)
+      .eq("tenant_id", effectiveTenantId)
       .select()
       .single();
 
@@ -14893,6 +14984,7 @@ app.delete("/services/:id", tenantAuthWrite, async (req, res) => {
         active: false,
       })
       .eq("id", id)
+      .eq("tenant_id", req.authenticatedUser.tenant_id)
       .is("deleted_at", null)
       .select()
       .single();
@@ -16406,6 +16498,8 @@ app.get("/support/tickets/:id/messages", [dashboardLimiter, requireTenantAuth], 
     const { id } = req.params;
     const { tenant_id } = req.query;
     if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
+    const isMember = await requireTenantMembership(req, res, tenant_id);
+    if (!isMember) return;
     const { data: ticket } = await supabase
       .from("support_tickets")
       .select("id")
@@ -16480,6 +16574,8 @@ app.patch("/support/tickets/:id/mark-read", [dashboardLimiter, requireTenantAuth
     const { id } = req.params;
     const { tenant_id } = req.body;
     if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
+    const isMember = await requireTenantMembership(req, res, tenant_id);
+    if (!isMember) return;
     const { error } = await supabase
       .from("support_tickets")
       .update({ has_unread_for_customer: false })
@@ -16515,6 +16611,8 @@ app.patch("/support/tickets/:id/resolve", [dashboardLimiter, requireTenantAuth],
     const { id } = req.params;
     const { tenant_id } = req.body;
     if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
+    const isMember = await requireTenantMembership(req, res, tenant_id);
+    if (!isMember) return;
     const { error } = await supabase
       .from("support_tickets")
       .update({
@@ -16538,6 +16636,8 @@ app.patch("/support/tickets/:id/confirm-resolution", [dashboardLimiter, requireT
     const { tenant_id, confirmed } = req.body;
     if (!tenant_id || typeof confirmed !== "boolean")
       return res.status(400).json({ error: "tenant_id y confirmed (boolean) requeridos" });
+    const isMember = await requireTenantMembership(req, res, tenant_id);
+    if (!isMember) return;
     const newStatus = confirmed ? "closed" : "reopened";
     const { error } = await supabase
       .from("support_tickets")
