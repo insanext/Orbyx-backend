@@ -14973,11 +14973,18 @@ const {
   capacity = 1,
   customer_instructions,
   requires_deposit = false,
+  deposit_amount,
 } = req.body;
 
     if (!tenant_id || !name || !duration_minutes) {
       return res.status(400).json({
         error: "Faltan campos obligatorios: tenant_id, name, duration_minutes",
+      });
+    }
+
+    if (Boolean(requires_deposit) && !(Number(deposit_amount) > 0)) {
+      return res.status(400).json({
+        error: "Debes indicar el monto del depósito (mayor a 0) para exigirlo en este servicio.",
       });
     }
 
@@ -15027,6 +15034,10 @@ const {
     ? String(customer_instructions).trim()
     : null,
   requires_deposit: Boolean(requires_deposit),
+  deposit_amount:
+    deposit_amount === undefined || deposit_amount === null || deposit_amount === ""
+      ? null
+      : Number(deposit_amount),
       })
       .select()
       .single();
@@ -15067,6 +15078,7 @@ const {
   capacity,
   customer_instructions,
   requires_deposit,
+  deposit_amount,
 } = req.body;
 
     if (!id) {
@@ -15075,7 +15087,7 @@ const {
 
     const { data: existingService, error: existingError } = await supabase
       .from("services")
-      .select("id, tenant_id, branch_id, is_group, capacity")
+      .select("id, tenant_id, branch_id, is_group, capacity, requires_deposit, deposit_amount")
       .eq("id", id)
       .eq("tenant_id", req.authenticatedUser.tenant_id)
       .single();
@@ -15112,6 +15124,28 @@ const {
       }
     }
 
+    // Monto de depósito: solo se valida cuando la edición toca
+    // requires_deposit o deposit_amount, igual que el bloque de capacidad
+    // grupal de arriba — un servicio ya guardado con requires_deposit=true
+    // y monto vacío (dato legado, ver 2026-08-30-services-deposit-amount.sql)
+    // no se rompe por editar otro campo que no sea este.
+    if (requires_deposit !== undefined || deposit_amount !== undefined) {
+      const effectiveRequiresDeposit =
+        requires_deposit !== undefined
+          ? Boolean(requires_deposit)
+          : Boolean(existingService.requires_deposit);
+      const effectiveDepositAmount =
+        deposit_amount !== undefined
+          ? deposit_amount
+          : existingService.deposit_amount;
+
+      if (effectiveRequiresDeposit && !(Number(effectiveDepositAmount) > 0)) {
+        return res.status(400).json({
+          error: "Debes indicar el monto del depósito (mayor a 0) para exigirlo en este servicio.",
+        });
+      }
+    }
+
     const updateData = {};
 
     if (branch_id !== undefined) {
@@ -15144,6 +15178,12 @@ if (customer_instructions !== undefined)
       : String(customer_instructions).trim();
 if (requires_deposit !== undefined)
   updateData.requires_deposit = Boolean(requires_deposit);
+// deposit_amount no se limpia cuando requires_deposit pasa a false — mismo
+// criterio ya usado para tenants.deposit_bank_name etc. (ver CLAUDE.md):
+// reactivar el toggle no debería obligar a volver a cargar el monto.
+if (deposit_amount !== undefined)
+  updateData.deposit_amount =
+    deposit_amount === null || deposit_amount === "" ? null : Number(deposit_amount);
 
 
     const { data, error } = await supabase
