@@ -16631,7 +16631,12 @@ app.post("/upload/ticket-attachment", [dashboardLimiter, requireTenantAuth], upl
       return res.status(400).json({ error: "Solo se permiten imágenes JPG, PNG o WebP" });
     if (req.file.size > 1 * 1024 * 1024)
       return res.status(400).json({ error: "La imagen no debe superar 1MB" });
-    const fileName = `${tenant_id}/${Date.now()}-${req.file.originalname}`;
+    // Mismo patrón que deposit-receipts: nombre no adivinable (antes era
+    // tenant_id/timestamp-nombreOriginal, predecible dentro de una ventana
+    // acotada). El bucket es privado — la URL pública ya no se usa para
+    // mostrar el adjunto, ver GET /support/tickets/:id/attachment-url.
+    const fileExt = req.file.mimetype.split("/")[1] || "jpg";
+    const fileName = `${tenant_id}/${crypto.randomUUID()}.${fileExt}`;
     const { error } = await supabase.storage
       .from("ticket-attachments")
       .upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
@@ -16729,6 +16734,71 @@ app.get("/support/tickets/:id/messages", [dashboardLimiter, requireTenantAuth], 
   } catch (err) {
     console.error("GET /support/tickets/:id/messages error:", err);
     res.status(500).json({ error: "Error obteniendo mensajes" });
+  }
+});
+
+// El valor guardado en support_tickets.attachments / support_ticket_messages
+// .attachments es lo que devolvió POST /upload/ticket-attachment en su
+// momento: una URL pública de Supabase Storage (histórico, de cuando el
+// bucket era público). Para generar un signed URL hace falta el path
+// dentro del bucket, no la URL completa — esto lo extrae de cualquiera
+// de las dos formas (URL pública vieja, o un path crudo si en el futuro
+// se guarda directo así) sin tener que migrar los datos ya guardados.
+function extractTicketAttachmentPath(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const marker = "/ticket-attachments/";
+  const idx = raw.indexOf(marker);
+  const pathPart = idx === -1 ? raw.replace(/^\/+/, "") : raw.slice(idx + marker.length);
+  try {
+    return decodeURIComponent(pathPart);
+  } catch {
+    return pathPart;
+  }
+}
+
+/* ======================================================
+   ✅ GET /support/tickets/:id/attachment-url
+   Genera un signed URL de corta duración para un adjunto de ticket —
+   el bucket ticket-attachments es privado (captura de pantalla puede
+   incluir datos internos del negocio), así que no hay URL pública fija.
+====================================================== */
+app.get("/support/tickets/:id/attachment-url", [dashboardLimiter, requireTenantAuth], async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tenant_id, attachment } = req.query;
+    if (!tenant_id) return res.status(400).json({ error: "tenant_id requerido" });
+    if (!attachment) return res.status(400).json({ error: "attachment requerido" });
+
+    const isMember = await requireTenantMembership(req, res, tenant_id);
+    if (!isMember) return;
+
+    const { data: ticket } = await supabase
+      .from("support_tickets")
+      .select("id")
+      .eq("id", id)
+      .eq("tenant_id", tenant_id)
+      .single();
+    if (!ticket) return res.status(404).json({ error: "Ticket no encontrado" });
+
+    const path = extractTicketAttachmentPath(attachment);
+    // El path siempre empieza con el tenant_id del que subió el archivo
+    // (ver POST /upload/ticket-attachment) — confirma que el adjunto
+    // pedido realmente es de ESTE tenant, no solo que el ticket lo es,
+    // por si `attachment` viniera manipulado con el path de otro tenant.
+    if (!path || !path.startsWith(`${tenant_id}/`)) {
+      return res.status(403).json({ error: "Adjunto no pertenece a este negocio" });
+    }
+
+    const { data, error } = await supabase.storage
+      .from("ticket-attachments")
+      .createSignedUrl(path, 300);
+    if (error) return res.status(404).json({ error: "Adjunto no encontrado" });
+
+    res.json({ url: data.signedUrl });
+  } catch (err) {
+    console.error("GET /support/tickets/:id/attachment-url error:", err);
+    res.status(500).json({ error: "Error generando URL del adjunto" });
   }
 });
 
