@@ -4224,6 +4224,51 @@ function normalizeNullableText(value) {
   return trimmed ? trimmed : null;
 }
 
+// Misma lógica que la validación local de isValidEmail() usada en
+// POST /appointments/slot (reserva pública) — expuesta acá para poder
+// reutilizarla en otros endpoints sin duplicar el regex a mano.
+function isValidEmail(email) {
+  if (!email) return false;
+
+  const normalized = String(email).trim().toLowerCase();
+  const emailRegex = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
+
+  if (!emailRegex.test(normalized)) return false;
+
+  const domain = normalized.split("@")[1];
+  if (!domain) return false;
+  if (domain.startsWith(".")) return false;
+  if (domain.endsWith(".")) return false;
+  if (domain.includes("..")) return false;
+
+  return true;
+}
+
+// Validación compartida de largo máximo para campos de texto libre —
+// mismo criterio que ya usaba PATCH /appointments/:id/session-notes con
+// su cap de 300 caracteres, generalizado para poder darle a cada campo su
+// propio límite (una nota de sesión corta no es lo mismo que una ficha
+// clínica completa). No transforma el valor, solo lo valida: devuelve
+// { error } si falla, o { value } (string recortado, o null si vino
+// vacío/ausente) si pasa. El caller decide qué hacer con `value`.
+function validateText(value, { maxLen = 1000, required = false, fieldName = "campo" } = {}) {
+  if (value === undefined || value === null || value === "") {
+    if (required) return { error: `${fieldName} es obligatorio` };
+    return { value: null };
+  }
+  if (typeof value !== "string") {
+    return { error: `${fieldName} debe ser texto` };
+  }
+  const trimmed = value.trim();
+  if (required && !trimmed) {
+    return { error: `${fieldName} es obligatorio` };
+  }
+  if (trimmed.length > maxLen) {
+    return { error: `${fieldName} no puede superar los ${maxLen} caracteres` };
+  }
+  return { value: trimmed || null };
+}
+
 function normalizeColor(value) {
   const color = String(value || "").trim();
   if (!color) return "#0f172a";
@@ -5309,6 +5354,15 @@ const {
       return res.status(400).json({
         error: "Por el momento solo aceptamos números de teléfono de Chile.",
       });
+    }
+
+    const reasonCheck = validateText(reason, { maxLen: 1000, fieldName: "reason" });
+    if (reasonCheck.error) {
+      return res.status(400).json({ error: reasonCheck.error });
+    }
+    const notesCheck = validateText(notes, { maxLen: 1000, fieldName: "notes" });
+    if (notesCheck.error) {
+      return res.status(400).json({ error: notesCheck.error });
     }
 
     const { data: cal, error: calErr } = await supabase
@@ -8066,6 +8120,33 @@ app.patch("/customers/:id", tenantAuthSlugWrite, async (req, res) => {
       return res.status(400).json({ error: "name no puede estar vacío" });
     }
 
+    if (email !== undefined && email && !isValidEmail(email)) {
+      return res.status(400).json({ error: "El email ingresado no es válido." });
+    }
+
+    for (const [field, maxLen] of [
+      ["name", 200],
+      ["phone", 50],
+      ["email", 200],
+      ["notes", 1000],
+      ["rut", 20],
+      ["sex", 50],
+      ["intake_notes", 1000],
+      ["occupation", 200],
+      ["health_insurance", 200],
+      ["emergency_contact_name", 200],
+      ["emergency_contact_phone", 50],
+      ["known_allergies", 1000],
+      ["chronic_conditions", 1000],
+      ["family_history", 1000],
+      ["habits", 1000],
+    ]) {
+      const check = validateText(req.body?.[field], { maxLen, fieldName: field });
+      if (check.error) {
+        return res.status(400).json({ error: check.error });
+      }
+    }
+
     // Validar tenant por slug
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
@@ -8377,6 +8458,24 @@ app.post("/clinical-notes/:slug", tenantAuthSlugWrite, async (req, res) => {
       return res.status(404).json({ error: "Cliente no encontrado para este negocio" });
     }
 
+    for (const [field, maxLen] of [
+      ["control_type", 200],
+      ["next_control_label", 200],
+      ["reason", 2000],
+      ["symptoms", 2000],
+      ["diagnosis", 2000],
+      ["treatment", 2000],
+      ["medications", 2000],
+      ["referrals", 2000],
+      ["observations", 2000],
+      ["follow_up_notes", 2000],
+    ]) {
+      const check = validateText(req.body?.[field], { maxLen, fieldName: field });
+      if (check.error) {
+        return res.status(400).json({ error: check.error });
+      }
+    }
+
     const n = (v) => String(v || "").trim() || null;
 
     const payload = {
@@ -8531,8 +8630,9 @@ app.post("/pets", tenantAuthSlugWrite, async (req, res) => {
       return res.status(400).json({ error: "customer_id es obligatorio" });
     }
 
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ error: "name es obligatorio" });
+    const nameCheck = validateText(name, { maxLen: 200, required: true, fieldName: "name" });
+    if (nameCheck.error) {
+      return res.status(400).json({ error: nameCheck.error });
     }
 
     const normalizedSpeciesBase = String(species_base || "").trim().toLowerCase();
@@ -8550,6 +8650,18 @@ app.post("/pets", tenantAuthSlugWrite, async (req, res) => {
       return res.status(400).json({
         error: "species_custom es obligatorio cuando species_base es 'otro'",
       });
+    }
+
+    for (const [field, maxLen] of [
+      ["species_custom", 100],
+      ["breed", 200],
+      ["sex", 50],
+      ["notes", 1000],
+    ]) {
+      const check = validateText(req.body?.[field], { maxLen, fieldName: field });
+      if (check.error) {
+        return res.status(400).json({ error: check.error });
+      }
     }
 
     const { data: tenant, error: tenantError } = await supabase
@@ -8646,8 +8758,9 @@ app.patch("/pets/:id", tenantAuthSlugWrite, async (req, res) => {
       return res.status(400).json({ error: "id es obligatorio" });
     }
 
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ error: "name es obligatorio" });
+    const nameCheck = validateText(name, { maxLen: 200, required: true, fieldName: "name" });
+    if (nameCheck.error) {
+      return res.status(400).json({ error: nameCheck.error });
     }
 
     const normalizedSpeciesBase = String(species_base || "").trim().toLowerCase();
@@ -8665,6 +8778,18 @@ app.patch("/pets/:id", tenantAuthSlugWrite, async (req, res) => {
       return res.status(400).json({
         error: "species_custom es obligatorio cuando species_base es 'otro'",
       });
+    }
+
+    for (const [field, maxLen] of [
+      ["species_custom", 100],
+      ["breed", 200],
+      ["sex", 50],
+      ["notes", 1000],
+    ]) {
+      const check = validateText(req.body?.[field], { maxLen, fieldName: field });
+      if (check.error) {
+        return res.status(400).json({ error: check.error });
+      }
     }
 
     // Validar tenant por slug
@@ -13935,8 +14060,25 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
       return res.status(400).json({ error: "id es obligatorio" });
     }
 
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ error: "name es obligatorio" });
+    const nameCheck = validateText(name, { maxLen: 200, required: true, fieldName: "name" });
+    if (nameCheck.error) {
+      return res.status(400).json({ error: nameCheck.error });
+    }
+
+    for (const [field, maxLen] of [
+      ["business_name", 200],
+      ["phone", 50],
+      ["address", 500],
+      ["email", 200],
+      ["whatsapp", 50],
+      ["description", 1000],
+      ["instagram_url", 300],
+      ["facebook_url", 300],
+    ]) {
+      const check = validateText(req.body?.[field], { maxLen, fieldName: field });
+      if (check.error) {
+        return res.status(400).json({ error: check.error });
+      }
     }
 
     // Generar slug desde business_name si se recibe
@@ -14331,6 +14473,27 @@ app.post("/branches", tenantAuthWrite, async (req, res) => {
       });
     }
 
+    for (const [field, maxLen] of [
+      ["name", 200],
+      ["address", 500],
+      ["phone", 50],
+      ["whatsapp", 50],
+      ["email", 200],
+      ["description", 1000],
+      ["city", 100],
+      ["commune", 100],
+      ["map_url", 300],
+      ["instagram_url", 300],
+      ["facebook_url", 300],
+      ["tiktok_url", 300],
+      ["website_url", 300],
+    ]) {
+      const check = validateText(req.body?.[field], { maxLen, fieldName: field });
+      if (check.error) {
+        return res.status(400).json({ error: check.error });
+      }
+    }
+
     // 🔥 VALIDACIÓN PLAN (AQUÍ ESTÁ LO NUEVO)
     const plan = await getPlan(tenant_id);
     const branchesCount = await getBranchesCount(tenant_id);
@@ -14458,11 +14621,34 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
 
     const effectiveTenantId = existingBranch.tenant_id;
 
+    for (const [field, maxLen] of [
+      ["address", 500],
+      ["phone", 50],
+      ["whatsapp", 50],
+      ["email", 200],
+      ["description", 1000],
+      ["city", 100],
+      ["commune", 100],
+      ["map_url", 300],
+      ["instagram_url", 300],
+      ["facebook_url", 300],
+      ["tiktok_url", 300],
+      ["website_url", 300],
+    ]) {
+      const check = validateText(req.body?.[field], { maxLen, fieldName: field });
+      if (check.error) {
+        return res.status(400).json({ error: check.error });
+      }
+    }
+
     const updateData = {};
 
     if (name !== undefined) {
       if (!String(name).trim()) {
         return res.status(400).json({ error: "name no puede estar vacío" });
+      }
+      if (String(name).trim().length > 200) {
+        return res.status(400).json({ error: "name no puede superar los 200 caracteres" });
       }
 
       updateData.name = String(name).trim();
