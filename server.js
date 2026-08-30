@@ -5387,7 +5387,9 @@ const {
 
     const { data: tenantConfig, error: tenantConfigError } = await supabase
       .from("tenants")
-      .select("min_booking_notice_minutes, max_booking_days_ahead, deposit_required")
+      .select(
+        "min_booking_notice_minutes, max_booking_days_ahead, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name"
+      )
       .eq("id", cal.tenant_id)
       .single();
 
@@ -5395,7 +5397,21 @@ const {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    const tenantRequiresDeposit = Boolean(tenantConfig.deposit_required);
+    // La ficha bancaria debe estar completa para que el flujo de depósito
+    // aplique — si el tenant activó el toggle pero dejó algún campo vacío,
+    // se trata como si el servicio no pidiera depósito (mismo criterio ya
+    // usado en el frontend desde la ronda de fixes original; ahora también
+    // es la fuente de verdad acá, no solo una máscara del lado del cliente).
+    const tenantDepositBankFieldsComplete = Boolean(
+      String(tenantConfig.deposit_bank_name || "").trim() &&
+        String(tenantConfig.deposit_account_type || "").trim() &&
+        String(tenantConfig.deposit_account_number || "").trim() &&
+        String(tenantConfig.deposit_holder_rut || "").trim() &&
+        String(tenantConfig.deposit_holder_name || "").trim()
+    );
+
+    const tenantRequiresDeposit =
+      Boolean(tenantConfig.deposit_required) && tenantDepositBankFieldsComplete;
 
     const minBookingNoticeMinutes = Number(
       tenantConfig.min_booking_notice_minutes || 0
@@ -5468,11 +5484,11 @@ if (service_id) {
   serviceRequiresDeposit = Boolean(service.requires_deposit);
 }
 
-// El interruptor maestro del tenant (tenantRequiresDeposit) habilita el
-// sistema completo (config de datos bancarios, etc.), pero el flujo de
-// depósito en una reserva puntual solo se activa si además el servicio
-// reservado tiene requires_deposit=true. Sin service_id no hay forma de
-// saber esto, así que no se exige depósito.
+// El interruptor maestro del tenant (tenantRequiresDeposit, que ya exige
+// ficha bancaria completa — ver arriba) habilita el sistema completo, pero
+// el flujo de depósito en una reserva puntual solo se activa si además el
+// servicio reservado tiene requires_deposit=true. Sin service_id no hay
+// forma de saber esto, así que no se exige depósito.
 const appointmentRequiresDeposit = tenantRequiresDeposit && serviceRequiresDeposit;
 
     let bookingQuery = supabase
@@ -10386,9 +10402,15 @@ app.post(
 );
 
 // Libera (cancela) cualquier cita cuyo hold de depósito ya venció sin que
-// el tenant la haya confirmado o rechazado. Extraído como función nombrada
-// para poder llamarla tanto desde el endpoint HTTP (cron externo, sigue
+// el cliente haya subido comprobante. Extraído como función nombrada para
+// poder llamarla tanto desde el endpoint HTTP (cron externo, sigue
 // funcionando igual) como desde el cron interno de node-cron.
+//
+// Excluye a propósito las citas que ya tienen deposit_receipt_path (el
+// cliente sí subió el comprobante a tiempo): esas están esperando la
+// revisión del tenant (Confirmar/Rechazar), no al cliente, así que no deben
+// vencer solo porque el tenant tardó en revisar más de lo que quedaba del
+// hold de 10 min.
 async function releaseExpiredDeposits() {
   const nowIso = new Date().toISOString();
 
@@ -10396,6 +10418,7 @@ async function releaseExpiredDeposits() {
     .from("appointments")
     .select("*")
     .eq("deposit_status", "pending")
+    .is("deposit_receipt_path", null)
     .lt("deposit_hold_expires_at", nowIso);
 
   if (error) throw new Error(error.message);
