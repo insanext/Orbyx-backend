@@ -15697,8 +15697,18 @@ return res.json({
 
 /* ======================================================
    🔔 RECORDATORIOS 24H
+   Mismo header x-maintenance-secret que /signup/maintenance/sweep,
+   /billing/addons/maintenance/charge-recurring y
+   /whatsapp/maintenance/send-reminders. Confirmado 2026-08-30: no hay
+   ningún cron interno (node-cron) ni externo llamando este endpoint hoy
+   — no está entre las 3 tareas programadas internas más abajo, y no hay
+   ninguna otra referencia en el código. En la práctica es funcionalidad
+   sin uso en producción actualmente (el único email automático real que
+   dispara Orbyx es la confirmación inmediata al agendar, no un
+   recordatorio 24h periódico) — se deja protegida por si se retoma más
+   adelante, no porque haya tráfico real que asegurar hoy.
 ====================================================== */
-app.get("/jobs/send-reminders", async (req, res) => {
+app.get("/jobs/send-reminders", [publicLimiter, requireSignupMaintenanceSecret], async (req, res) => {
   try {
     const now = new Date();
     const in24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
