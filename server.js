@@ -1368,6 +1368,18 @@ const dashboardLimiter = rateLimit({
   message: { error: "Demasiadas solicitudes. Intenta de nuevo en un momento." },
 });
 
+// Más estricto que dashboardLimiter: protege endpoints que reverifican la
+// contraseña actual del usuario (verifyCurrentPassword actúa como oráculo
+// de login) — un límite compartido de 300/min con el resto del dashboard
+// permitía demasiados intentos de contraseña por minuto.
+const passwordVerifyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiados intentos. Intenta de nuevo en un momento." },
+});
+
 // =======================
 // AUTH MIDDLEWARE — TENANT DASHBOARD
 // =======================
@@ -10830,12 +10842,16 @@ async function recordLegalAcceptancesAndSendConfirmation({
 /* ======================================================
    ✅ SAAS: Provision tenant + owner user + main calendar
 ====================================================== */
-app.post("/tenants/provision", async (req, res) => {
+app.post("/tenants/provision", [publicLimiter, requireTenantAuth], async (req, res) => {
   try {
-    const { user_id, email, plan = "starter", billing_cycle, phone } = req.body;
+    const { email, plan = "starter", billing_cycle, phone } = req.body;
+    // user_id viene del token verificado (requireTenantAuth), nunca del
+    // body — antes se confiaba en el user_id que mandaba el cliente, sin
+    // confirmar que quien llama esté autenticado como ese usuario.
+    const user_id = req.authenticatedUser.user_id;
 
-    if (!user_id || !email) {
-      return res.status(400).json({ error: "Faltan campos: user_id, email" });
+    if (!email) {
+      return res.status(400).json({ error: "Falta campo: email" });
     }
 
     // phone NO es hard-required acá (a diferencia de POST /signup/start-paid):
@@ -15996,7 +16012,7 @@ app.post("/webhooks/meta-whatsapp", publicLimiter, (req, res) => {
 /* ======================================================
    ✅ ONBOARDING SETUP
 ====================================================== */
-app.post("/onboarding/setup", async (req, res) => {
+app.post("/onboarding/setup", publicLimiter, async (req, res) => {
   try {
     const {
       business,
@@ -18166,7 +18182,7 @@ async function maybeApplyEmailChange(requestId, record) {
   }
 }
 
-app.post("/account/email-change/request", [dashboardLimiter, requireTenantAuth], async (req, res) => {
+app.post("/account/email-change/request", [passwordVerifyLimiter, requireTenantAuth], async (req, res) => {
   try {
     const { user_id, current_email, new_email, password, tenant_id } = req.body;
     if (!user_id || !current_email || !new_email || !password) {
@@ -18289,6 +18305,9 @@ app.get("/account/email-change/status", [dashboardLimiter, requireTenantAuth], a
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: "user_id es obligatorio" });
+    if (user_id !== req.authenticatedUser.user_id) {
+      return res.status(403).json({ error: "No tienes acceso a esta cuenta" });
+    }
 
     const { data, error } = await supabase
       .from("email_change_requests")
