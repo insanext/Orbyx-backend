@@ -21,6 +21,7 @@ const {
   sendSignupRecoveryEmail,
   sendSignupStuckAlertEmail,
   sendLegalAcceptanceConfirmationEmail,
+  sendDepositReceiptUploadedEmail,
 } = require("./email");
 const {
   sendWhatsAppTemplate,
@@ -10052,6 +10053,73 @@ return res.json({
    (por qué no hay un status "pending_deposit" nuevo).
 ====================================================== */
 
+// Resuelve el email de contacto real del tenant para notificaciones internas
+// (ej. "llegó un depósito para revisar") — mismo fallback ya usado en
+// POST /billing/flow/create-customer para el email de facturación:
+// tenants.email es el contacto PÚBLICO del negocio (opcional, se muestra en
+// la página de reservas); si está vacío, se usa el email real de la cuenta
+// (auth.users) del owner (o el primer miembro activo) vía tenant_users. No
+// se extrajo ese call site existente a este helper para no tocar código de
+// billing fuera del alcance de esta tarea — sí se reutiliza el criterio.
+async function resolveTenantContactEmail(tenant_id) {
+  const { data: tenant } = await supabase
+    .from("tenants")
+    .select("email")
+    .eq("id", tenant_id)
+    .single();
+
+  if (tenant?.email) return tenant.email;
+
+  const { data: activeMembers } = await supabase
+    .from("tenant_users")
+    .select("user_id, role")
+    .eq("tenant_id", tenant_id)
+    .eq("is_active", true);
+
+  const ownerMembership =
+    (activeMembers || []).find((m) => m.role === "owner") || (activeMembers || [])[0];
+
+  if (!ownerMembership) return null;
+
+  const { data: authUser } = await supabase.auth.admin.getUserById(ownerMembership.user_id);
+  return authUser?.user?.email || null;
+}
+
+// Dispara la notificación por email al tenant cuando el cliente sube el
+// comprobante de depósito — best-effort, nunca lanza ni bloquea la respuesta
+// al cliente que subió el archivo (mismo patrón que sendWhatsAppTemplate,
+// ver CLAUDE.md "WhatsApp (Twilio) Integration": internal try/catch, nunca
+// throws). Se dispara acá (upload confirmado) y no al crear la reserva ni al
+// arrancar el cronómetro, porque antes de esto no hay nada que el tenant
+// pueda revisar todavía.
+async function notifyTenantDepositReceiptUploaded(appt) {
+  try {
+    const { data: tenant } = await supabase
+      .from("tenants")
+      .select("name, slug")
+      .eq("id", appt.tenant_id)
+      .single();
+
+    if (!tenant?.slug) return;
+
+    const contactEmail = await resolveTenantContactEmail(appt.tenant_id);
+    if (!contactEmail) return;
+
+    const dashboardUrl = `https://www.orbyx.cl/dashboard/${tenant.slug}/agenda?openDeposits=1`;
+
+    await sendDepositReceiptUploadedEmail({
+      to: contactEmail,
+      tenantName: tenant.name || "tu negocio",
+      customerName: appt.customer_name || "Cliente",
+      serviceName: appt.service_name_snapshot || "Servicio",
+      startAt: appt.start_at,
+      dashboardUrl,
+    });
+  } catch (err) {
+    console.warn("[DEPOSIT] notifyTenantDepositReceiptUploaded falló:", err.message);
+  }
+}
+
 // POST /appointments/:id/deposit-receipt
 // Público (llamado desde la página de reservas, sin login) — protegido con
 // el mismo cancel_token que ya existe para la cancelación pública, no un
@@ -10091,10 +10159,14 @@ app.post("/appointments/:id/deposit-receipt", publicLimiter, async (req, res) =>
       .from("appointments")
       .update({ deposit_receipt_path: String(receipt_path).trim() })
       .eq("id", id)
-      .select("id, deposit_receipt_path")
+      .select("id, deposit_receipt_path, tenant_id, customer_name, service_name_snapshot, start_at")
       .single();
 
     if (error) return res.status(500).json({ error: error.message });
+
+    // No bloquea la respuesta al cliente si el email falla — ver comentario
+    // en notifyTenantDepositReceiptUploaded.
+    await notifyTenantDepositReceiptUploaded(data);
 
     return res.json({ ok: true, appointment: data });
   } catch (err) {
@@ -15478,7 +15550,8 @@ app.get("/public/business/:slug", publicLimiter, async (req, res) => {
   proration_charge,
   business_category,
   business_subtype,
-  business_subtype_config
+  business_subtype_config,
+  deposit_required
 `)
       .eq("slug", slug)
       .eq("is_active", true)
