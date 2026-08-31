@@ -17741,6 +17741,152 @@ app.get("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
   }
 });
 
+/* ======================================================
+   🗑️ DELETE /admin/tenants/:id
+   Borrado completo e irreversible de un tenant — panel Super Admin.
+   Borra filas en ~35 tablas (vía la función Postgres
+   delete_tenant_cascade, una sola transacción atómica — ver migración
+   2026-08-30-admin-tenant-deletion.sql para el detalle y el porqué de
+   cada decisión), archivos en los 5 buckets de Storage conocidos
+   (business-logos, deposit-receipts, campaign-images,
+   ticket-attachments, staff-photos), y el usuario de Supabase Auth del
+   owner cuando no pertenece a ningún otro tenant. Requiere
+   reconfirmación escrita del slug exacto en el body (confirm_slug) —
+   no basta con estar autenticado como admin.
+====================================================== */
+async function listStorageFolderRecursive(bucket, prefix) {
+  const allPaths = [];
+  async function walk(currentPrefix) {
+    const { data, error } = await supabase.storage.from(bucket).list(currentPrefix, { limit: 1000 });
+    if (error || !data) return;
+    for (const entry of data) {
+      const entryPath = currentPrefix ? `${currentPrefix}/${entry.name}` : entry.name;
+      // Una carpeta "virtual" de Supabase Storage no trae id -> hay que
+      // recursar en ella; un archivo real sí trae id.
+      if (entry.id === null || entry.id === undefined) {
+        await walk(entryPath);
+      } else {
+        allPaths.push(entryPath);
+      }
+    }
+  }
+  await walk(prefix);
+  return allPaths;
+}
+
+async function removeStorageFolder(bucket, prefix) {
+  const paths = await listStorageFolderRecursive(bucket, prefix);
+  if (paths.length === 0) return 0;
+  const { error } = await supabase.storage.from(bucket).remove(paths);
+  if (error) {
+    console.warn(`[admin/delete-tenant] error borrando ${bucket}/${prefix}:`, error.message);
+    return 0;
+  }
+  return paths.length;
+}
+
+app.delete("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
+  const { id } = req.params;
+  const { confirm_slug } = req.body || {};
+
+  try {
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id, name, slug")
+      .eq("id", id)
+      .single();
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    if (!confirm_slug || confirm_slug !== tenant.slug) {
+      return res.status(400).json({ error: "La confirmación no coincide con el slug del tenant" });
+    }
+
+    // Datos que se necesitan ANTES de borrar filas: para limpiar Storage
+    // (staff-photos no lleva tenant_id en su path, solo staff_id) y para
+    // evaluar después si corresponde borrar el usuario de Auth.
+    const { data: staffRows } = await supabase.from("staff").select("id").eq("tenant_id", id);
+    const staffIds = (staffRows || []).map((s) => s.id);
+
+    const { data: membershipRows } = await supabase
+      .from("tenant_users")
+      .select("user_id")
+      .eq("tenant_id", id);
+    const memberUserIds = [...new Set((membershipRows || []).map((m) => m.user_id))];
+
+    // 1) Storage — 5 buckets conocidos (confirmados en vivo contra el
+    // proyecto de Supabase real, no solo por grep del repo).
+    const storageSummary = {};
+    storageSummary.business_logos = await removeStorageFolder("business-logos", `tenants/${id}`);
+    storageSummary.deposit_receipts = await removeStorageFolder("deposit-receipts", `tenants/${id}`);
+    storageSummary.campaign_images = await removeStorageFolder("campaign-images", id);
+    storageSummary.ticket_attachments = await removeStorageFolder("ticket-attachments", id);
+
+    let staffPhotosRemoved = 0;
+    for (const staffId of staffIds) {
+      const candidates = ["jpg", "png", "webp"].map((ext) => `staff/${staffId}.${ext}`);
+      const { data: removed } = await supabase.storage.from("staff-photos").remove(candidates);
+      staffPhotosRemoved += (removed || []).length;
+    }
+    storageSummary.staff_photos = staffPhotosRemoved;
+
+    // 2) Base de datos — borrado atómico vía función Postgres.
+    const { data: dbCounts, error: rpcError } = await supabase.rpc("delete_tenant_cascade", {
+      p_tenant_id: id,
+    });
+    if (rpcError) throw rpcError;
+
+    // 3) Usuario de Supabase Auth — solo se borra si no pertenece a
+    // ningún otro tenant (tenant_users de ESTE tenant ya se borró en el
+    // paso anterior dentro de delete_tenant_cascade, así que cualquier
+    // fila restante para ese user_id es de OTRO tenant).
+    const authUsersDeleted = [];
+    for (const userId of memberUserIds) {
+      const { data: otherMemberships } = await supabase
+        .from("tenant_users")
+        .select("tenant_id")
+        .eq("user_id", userId)
+        .limit(1);
+      if (!otherMemberships || otherMemberships.length === 0) {
+        const { error: deleteUserError } = await supabase.auth.admin.deleteUser(userId);
+        if (!deleteUserError) {
+          authUsersDeleted.push(userId);
+        } else {
+          console.warn(`[admin/delete-tenant] no se pudo borrar auth user ${userId}:`, deleteUserError.message);
+        }
+      }
+    }
+
+    // 4) Registro de auditoría simple (no existía ninguna tabla de
+    // auditoría de acciones admin hasta ahora).
+    await supabase.from("admin_tenant_deletions").insert({
+      tenant_id: id,
+      tenant_name: tenant.name,
+      tenant_slug: tenant.slug,
+      deleted_by_admin_user_id: req.adminUser.user_id,
+      deleted_by_admin_email: req.adminUser.email,
+      details: {
+        db_counts: dbCounts,
+        storage: storageSummary,
+        auth_users_deleted: authUsersDeleted,
+      },
+    });
+
+    return res.json({
+      ok: true,
+      tenant_name: tenant.name,
+      tenant_slug: tenant.slug,
+      db_counts: dbCounts,
+      storage: storageSummary,
+      auth_users_deleted: authUsersDeleted,
+    });
+  } catch (err) {
+    console.error("DELETE /admin/tenants/:id error:", err.message);
+    res.status(500).json({ error: err.message || "Error borrando tenant" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Servidor listo en http://localhost:${PORT}`);
 });
