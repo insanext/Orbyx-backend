@@ -10173,7 +10173,10 @@ app.post("/appointments/:id/deposit-receipt", publicLimiter, async (req, res) =>
 
     const { data, error } = await supabase
       .from("appointments")
-      .update({ deposit_receipt_path: String(receipt_path).trim() })
+      .update({
+        deposit_receipt_path: String(receipt_path).trim(),
+        deposit_receipt_uploaded_at: new Date().toISOString(),
+      })
       .eq("id", id)
       .select("id, deposit_receipt_path, tenant_id, customer_name, service_name_snapshot, start_at")
       .single();
@@ -10201,7 +10204,7 @@ app.get("/appointments/pending-deposits", tenantAuth, async (req, res) => {
     const { data, error } = await supabase
       .from("appointments")
       .select(
-        "id, customer_name, service_name_snapshot, start_at, deposit_receipt_path, deposit_hold_expires_at, branch_id, staff_id"
+        "id, customer_name, service_name_snapshot, start_at, deposit_receipt_path, deposit_receipt_uploaded_at, deposit_hold_expires_at, branch_id, staff_id"
       )
       .eq("tenant_id", tenant_id)
       .eq("deposit_status", "pending")
