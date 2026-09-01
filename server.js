@@ -17819,6 +17819,83 @@ app.post("/admin/tenants/:id/notes", requireAdminAuth, async (req, res) => {
 });
 
 /* ======================================================
+   👁️ POST /admin/tenants/:id/view-session
+   Genera una sesion real del dueño del tenant para que el Super Admin
+   pueda ver su dashboard (Agenda, Indicadores, etc.) sin conocer ni pedir
+   su contraseña. Usa el mecanismo estandar de Supabase Admin
+   (generateLink tipo magiclink + verifyOtp) para canjear el link del lado
+   del servidor -- el dueño nunca recibe ningun email ni es notificado.
+   La sesion resultante es equivalente a la del dueño real (no hay un rol
+   "solo lectura" en esta app para construir algo más acotado sin un
+   refactor mucho mayor de middleware.ts/dashboard) y expira segun la
+   configuracion estandar de expiracion de sesion de Supabase. Queda
+   auditado en admin_tenant_actions en cada uso. Gateado por
+   requireAdminAuth (incluye MFA obligatorio).
+====================================================== */
+app.post("/admin/tenants/:id/view-session", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: tenant } = await supabase.from("tenants").select("id, slug, name").eq("id", id).single();
+    if (!tenant) return res.status(404).json({ error: "Tenant no encontrado" });
+
+    const { data: ownerMemberships } = await supabase
+      .from("tenant_users")
+      .select("user_id")
+      .eq("tenant_id", id)
+      .eq("is_active", true)
+      .eq("role", "owner")
+      .limit(1);
+
+    const ownerUserId = (ownerMemberships || [])[0]?.user_id;
+    if (!ownerUserId) {
+      return res.status(400).json({ error: "No se encontró un usuario owner activo para este tenant" });
+    }
+
+    const { data: authUser, error: authUserError } = await supabase.auth.admin.getUserById(ownerUserId);
+    if (authUserError || !authUser?.user?.email) {
+      return res.status(400).json({ error: "No se pudo obtener el email del owner" });
+    }
+    const ownerEmail = authUser.user.email;
+
+    const { data: linkData, error: linkError } = await supabase.auth.admin.generateLink({
+      type: "magiclink",
+      email: ownerEmail,
+    });
+    if (linkError) throw linkError;
+
+    const hashedToken = linkData?.properties?.hashed_token;
+    if (!hashedToken) {
+      throw new Error("Supabase no devolvió hashed_token para el magic link");
+    }
+
+    const { data: otpData, error: otpError } = await supabase.auth.verifyOtp({
+      email: ownerEmail,
+      token: hashedToken,
+      type: "magiclink",
+    });
+    if (otpError || !otpData?.session) throw otpError || new Error("No se pudo canjear la sesión");
+
+    await logAdminTenantAction({
+      tenantId: id,
+      adminUserId: req.adminUser.user_id,
+      adminEmail: req.adminUser.email,
+      actionType: "view_as_tenant",
+      details: { owner_email: ownerEmail },
+    });
+
+    return res.json({
+      ok: true,
+      slug: tenant.slug,
+      access_token: otpData.session.access_token,
+      refresh_token: otpData.session.refresh_token,
+    });
+  } catch (err) {
+    console.error("POST /admin/tenants/:id/view-session error:", err.message);
+    res.status(500).json({ error: err.message || "Error generando sesión de vista" });
+  }
+});
+
+/* ======================================================
    🗑️ DELETE /admin/tenants/:id
    Borrado completo e irreversible de un tenant — panel Super Admin.
    Borra filas en ~35 tablas (vía la función Postgres
