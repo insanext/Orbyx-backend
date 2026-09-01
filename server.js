@@ -13252,21 +13252,20 @@ app.post("/signup/start-paid", publicLimiter, async (req, res) => {
     }
 
     const normalizedPlan = String(plan_id).toLowerCase();
-    if (!PAID_SIGNUP_PLANS.has(normalizedPlan)) {
+    // Starter (gratis, trial de 30 días) solo pasa por este flujo de pago
+    // cuando trae add-ons -- esos SÍ se cobran aunque el plan base no
+    // (fix 2026-09-02: antes un starter con add-ons no tenía ninguna
+    // pantalla de pago, los add-ons simplemente se perdían). Un starter
+    // sin add-ons sigue yendo directo a /signup, sin tocar Flow para nada.
+    const isFreeBasePlan = normalizedPlan === "starter";
+    if (!PAID_SIGNUP_PLANS.has(normalizedPlan) && !isFreeBasePlan) {
       return res.status(400).json({
-        error: "plan_id debe ser business o premium. El plan starter usa el onboarding normal.",
+        error: "plan_id debe ser starter (solo con add-ons), business o premium.",
       });
     }
 
     if (!PERIODICIDAD_TO_FLOW_INTERVAL[periodicidad]) {
       return res.status(400).json({ error: `periodicidad no soportada: ${periodicidad}` });
-    }
-
-    // El monto SIEMPRE se calcula acá, nunca se toma del body -- ver
-    // computePlanNetAmount (fix 2026-09-01, ver comentario ahí).
-    const monto = computePlanNetAmount(normalizedPlan, periodicidad);
-    if (!monto) {
-      return res.status(400).json({ error: "No se pudo calcular el monto para ese plan/periodicidad" });
     }
 
     // Add-ons elegidos en /planes antes de llegar al checkout (fix
@@ -13279,6 +13278,22 @@ app.post("/signup/start-paid", publicLimiter, async (req, res) => {
     const addonsCharge = computeSignupAddonsCharge(addons, normalizedPlan);
     if (!addonsCharge.valid) {
       return res.status(400).json({ error: addonsCharge.error });
+    }
+
+    if (isFreeBasePlan && addonsCharge.items.length === 0) {
+      return res.status(400).json({
+        error: "El plan starter sin add-ons no usa este endpoint -- usa /signup.",
+      });
+    }
+
+    // El monto del PLAN se calcula acá, nunca se toma del body (fix
+    // 2026-09-01, ver computePlanNetAmount). Starter es gratis durante el
+    // trial -- se fuerza a 0 en vez de usar PLAN_PRICES.starter, que es el
+    // precio de starter para un tenant que YA pasó su trial y lo contrata
+    // de vuelta pagando (billing/change-plan), un caso distinto a este.
+    const monto = isFreeBasePlan ? 0 : computePlanNetAmount(normalizedPlan, periodicidad);
+    if (monto === null || monto === undefined) {
+      return res.status(400).json({ error: "No se pudo calcular el monto para ese plan/periodicidad" });
     }
 
     const { data: intent, error: insertErr } = await supabase
@@ -13424,22 +13439,31 @@ async function attemptSignupIntentTenantCreation(intent) {
       .eq("id", intent.id);
     if (updateErr) throw updateErr;
 
-    try {
-      const { error: subInsertErr } = await supabase.from("subscriptions").insert({
-        tenant_id: tenant.id,
-        plan_id: intent.plan_id,
-        flow_customer_id: intent.flow_customer_id,
-        flow_subscription_id: intent.flow_subscription_id,
-        status: "active",
-        periodicidad: intent.periodicidad,
-        monto: intent.monto,
-      });
-      if (subInsertErr) throw subInsertErr;
-    } catch (subErr) {
-      console.error(
-        `signup_intent ${intent.id}: tenant ${tenant.id} creado OK, pero falló el insert en subscriptions (requiere corrección manual):`,
-        subErr.message
-      );
+    // Starter con add-ons (fix 2026-09-02) no tiene ninguna suscripción de
+    // Flow real que registrar -- el plan es gratis (trial), no se inserta
+    // fila en subscriptions, igual que cualquier signup starter normal
+    // (sin add-ons) que pasa por /signup en vez de por acá. Insertar una
+    // fila "active" con monto 0 rompería deriveTenantBucket/
+    // GET /billing/account-status (tratarían al tenant como "activo"
+    // pagado en vez de "en trial").
+    if (intent.plan_id !== "starter") {
+      try {
+        const { error: subInsertErr } = await supabase.from("subscriptions").insert({
+          tenant_id: tenant.id,
+          plan_id: intent.plan_id,
+          flow_customer_id: intent.flow_customer_id,
+          flow_subscription_id: intent.flow_subscription_id,
+          status: "active",
+          periodicidad: intent.periodicidad,
+          monto: intent.monto,
+        });
+        if (subInsertErr) throw subInsertErr;
+      } catch (subErr) {
+        console.error(
+          `signup_intent ${intent.id}: tenant ${tenant.id} creado OK, pero falló el insert en subscriptions (requiere corrección manual):`,
+          subErr.message
+        );
+      }
     }
 
     // Add-ons elegidos en /planes antes del checkout (fix 2026-09-01):
@@ -13579,41 +13603,53 @@ app.post(
           );
         }
 
-        const flowPlanId = await getOrCreateFlowPlan(intent.plan_id, intent.periodicidad, intent.monto);
+        // Starter con add-ons (fix 2026-09-02): el plan en sí es gratis
+        // (trial de 30 días), no hay ninguna suscripción de Flow que
+        // crear para él -- el cobro real es solo por los add-ons, que se
+        // hace más abajo en attemptSignupIntentTenantCreation una vez que
+        // el customer ya tiene tarjeta registrada. business/premium sí
+        // siguen suscribiéndose a un Flow Plan como siempre.
+        let flowSubscriptionId = null;
 
-        let flowSubscription;
-        try {
-          flowSubscription = await flowApiRequest("/subscription/create", {
-            planId: flowPlanId,
-            customerId: intent.flow_customer_id,
-          });
-        } catch (subErr) {
-          console.error(
-            `POST /signup/register-card-callback: subscription/create falló para signup_intent ${intent.id}:`,
-            subErr.message
-          );
-          return res.redirect(
-            `${frontendBase}/checkout-premium?signup_intent_id=${intent.id}&status=retry`
-          );
-        }
+        if (intent.plan_id !== "starter") {
+          const flowPlanId = await getOrCreateFlowPlan(intent.plan_id, intent.periodicidad, intent.monto);
 
-        // status de Flow: 0=Inactive, 1=Active, 2=Trial, 4=Cancelled.
-        const paymentConfirmed = Number(flowSubscription.status) === 1;
+          let flowSubscription;
+          try {
+            flowSubscription = await flowApiRequest("/subscription/create", {
+              planId: flowPlanId,
+              customerId: intent.flow_customer_id,
+            });
+          } catch (subErr) {
+            console.error(
+              `POST /signup/register-card-callback: subscription/create falló para signup_intent ${intent.id}:`,
+              subErr.message
+            );
+            return res.redirect(
+              `${frontendBase}/checkout-premium?signup_intent_id=${intent.id}&status=retry`
+            );
+          }
 
-        if (!paymentConfirmed) {
-          console.error(
-            `POST /signup/register-card-callback: status inesperado de Flow (${flowSubscription.status}) para signup_intent ${intent.id}`
-          );
-          return res.redirect(
-            `${frontendBase}/checkout-premium?signup_intent_id=${intent.id}&status=retry`
-          );
+          // status de Flow: 0=Inactive, 1=Active, 2=Trial, 4=Cancelled.
+          const paymentConfirmed = Number(flowSubscription.status) === 1;
+
+          if (!paymentConfirmed) {
+            console.error(
+              `POST /signup/register-card-callback: status inesperado de Flow (${flowSubscription.status}) para signup_intent ${intent.id}`
+            );
+            return res.redirect(
+              `${frontendBase}/checkout-premium?signup_intent_id=${intent.id}&status=retry`
+            );
+          }
+
+          flowSubscriptionId = flowSubscription.subscriptionId;
         }
 
         const { data: paidIntent, error: paidUpdateErr } = await supabase
           .from("signup_intents")
           .update({
             status: "paid",
-            flow_subscription_id: flowSubscription.subscriptionId,
+            flow_subscription_id: flowSubscriptionId,
             updated_at: new Date().toISOString(),
           })
           .eq("id", intent.id)
