@@ -11562,7 +11562,7 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     const { data: tenant, error: tenantErr } = await supabase
       .from("tenants")
       .select(
-        "id, plan_slug, trial_ends_at, billing_cycle_end, wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name"
+        "id, plan_slug, trial_ends_at, billing_cycle_end, paused_at, wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name"
       )
       .eq("id", tenant_id)
       .single();
@@ -11587,10 +11587,18 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     const trialEndsAt = tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null;
     const billingCycleEnd = tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null;
 
-    const trialActive = Boolean(trialEndsAt && now < trialEndsAt && !hasActiveSubscription);
+    const isPaused = Boolean(tenant.paused_at);
+
+    const trialActive = Boolean(!isPaused && trialEndsAt && now < trialEndsAt && !hasActiveSubscription);
     const awaitingPayment = !hasActiveSubscription && !trialActive && !isTrialingInFlow;
-    const trialExpired = Boolean(awaitingPayment && trialEndsAt && now >= trialEndsAt);
-    const blocked = Boolean(awaitingPayment && billingCycleEnd && now >= billingCycleEnd);
+    const trialExpired = Boolean(!isPaused && awaitingPayment && trialEndsAt && now >= trialEndsAt);
+    // Pausado por Super Admin bloquea el dashboard igual que un tenant
+    // vencido (mismo mecanismo, ver middleware.ts), independiente del
+    // ciclo de facturación o trial — el admin canceló la suscripción en
+    // Flow al pausar (ver POST /admin/tenants/:id/pause), así que esto
+    // también evita que el resto de las condiciones de abajo lo saquen
+    // del bloqueo antes de tiempo.
+    const blocked = isPaused || Boolean(awaitingPayment && billingCycleEnd && now >= billingCycleEnd);
 
     const msPerDay = 24 * 60 * 60 * 1000;
     const diasRestantesTrial = trialActive
@@ -11647,7 +11655,7 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       awaiting_payment: awaitingPayment,
       dias_restantes_pago: diasRestantesPago,
       blocked,
-      blocked_reason: !blocked ? null : trialExpired ? "trial_expired" : "payment_overdue",
+      blocked_reason: !blocked ? null : isPaused ? "paused" : trialExpired ? "trial_expired" : "payment_overdue",
       wa_confirmacion: usageEntry(caps.max_wa_confirmacion, "wa_confirmacion"),
       wa_confirmation_enabled: Boolean(tenant.wa_confirmation_enabled),
       wa_reminder_enabled: Boolean(tenant.wa_reminder_enabled),
@@ -17385,7 +17393,11 @@ const ADMIN_PLAN_PRICES_ALL = {
 // vez de tocar ese endpoint (billing, alto riesgo, cambios mínimos).
 // IMPORTANTE: si la lógica de /billing/account-status cambia, replicar el
 // cambio acá también — no hay una sola fuente de verdad compartida todavía.
-function deriveTenantBucket({ subscriptionStatus, trialEndsAt, billingCycleEnd, now }) {
+function deriveTenantBucket({ subscriptionStatus, trialEndsAt, billingCycleEnd, pausedAt, now }) {
+  // Pausado por Super Admin es su propio bucket, independiente de todo lo
+  // demás — mismo criterio que GET /billing/account-status/middleware.ts.
+  if (pausedAt) return "paused";
+
   const hasActiveSubscription = subscriptionStatus === "active";
   const isTrialingInFlow = subscriptionStatus === "trialing";
 
@@ -17415,7 +17427,7 @@ app.get("/admin/estadisticas", requireAdminAuth, async (req, res) => {
   try {
     const { data: tenants, error: tenantsError } = await supabase
       .from("tenants")
-      .select("id, plan_slug, trial_ends_at, billing_cycle_end, is_active")
+      .select("id, plan_slug, trial_ends_at, billing_cycle_end, paused_at, is_active")
       .eq("is_active", true);
     if (tenantsError) throw tenantsError;
 
@@ -17438,7 +17450,7 @@ app.get("/admin/estadisticas", requireAdminAuth, async (req, res) => {
     }
 
     const now = new Date();
-    const counts = { active: 0, trial: 0, expired_or_canceled: 0 };
+    const counts = { active: 0, trial: 0, expired_or_canceled: 0, paused: 0 };
     const revenueByPlan = {};
     let revenueTotal = 0;
 
@@ -17448,6 +17460,7 @@ app.get("/admin/estadisticas", requireAdminAuth, async (req, res) => {
         subscriptionStatus: subscription?.status || "none",
         trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
         billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
+        pausedAt: tenant.paused_at ? new Date(tenant.paused_at) : null,
         now,
       });
       counts[bucket] = (counts[bucket] || 0) + 1;
@@ -17476,6 +17489,7 @@ app.get("/admin/estadisticas", requireAdminAuth, async (req, res) => {
         active: counts.active,
         trial: counts.trial,
         expired_or_canceled: counts.expired_or_canceled,
+        paused: counts.paused,
         total: (tenants || []).length,
       },
       revenue: {
@@ -17531,7 +17545,7 @@ app.get("/admin/tenants", requireAdminAuth, async (req, res) => {
   try {
     const { data: tenants, error: tenantsError } = await supabase
       .from("tenants")
-      .select("id, name, slug, plan_slug, business_category, trial_ends_at, billing_cycle_end, created_at, is_active")
+      .select("id, name, slug, plan_slug, business_category, trial_ends_at, billing_cycle_end, paused_at, created_at, is_active")
       .eq("is_active", true)
       .order("created_at", { ascending: false });
     if (tenantsError) throw tenantsError;
@@ -17569,6 +17583,7 @@ app.get("/admin/tenants", requireAdminAuth, async (req, res) => {
         subscriptionStatus: subscription?.status || "none",
         trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
         billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
+        pausedAt: tenant.paused_at ? new Date(tenant.paused_at) : null,
         now,
       });
       const amount =
@@ -17608,7 +17623,7 @@ app.get("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .select(
-        "id, name, slug, business_category, business_subtype, phone, email, whatsapp, address, plan_slug, trial_ends_at, billing_cycle_start, billing_cycle_end, scheduled_plan_slug, scheduled_change_at, pending_change_type, is_active, created_at"
+        "id, name, slug, business_category, business_subtype, phone, email, whatsapp, address, plan_slug, trial_ends_at, billing_cycle_start, billing_cycle_end, scheduled_plan_slug, scheduled_change_at, pending_change_type, is_active, paused_at, created_at"
       )
       .eq("id", id)
       .single();
@@ -17631,6 +17646,7 @@ app.get("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
       subscriptionStatus: subscription?.status || "none",
       trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
       billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
+      pausedAt: tenant.paused_at ? new Date(tenant.paused_at) : null,
       now,
     });
     const amount =
@@ -17734,6 +17750,7 @@ app.get("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
         scheduled_plan_slug: tenant.scheduled_plan_slug,
         scheduled_change_at: tenant.scheduled_change_at,
         pending_change_type: tenant.pending_change_type,
+        paused_at: tenant.paused_at,
       },
       addons: addonsDetailed,
       branches: branches || [],
@@ -18050,6 +18067,92 @@ app.post("/admin/tenants/:id/credit-balance", requireAdminAuth, async (req, res)
     }
 
     res.status(500).json({ error: err.message || "Error otorgando el crédito" });
+  }
+});
+
+/* ======================================================
+   ⏸️ POST /admin/tenants/:id/pause
+   ▶️ POST /admin/tenants/:id/reactivate
+   Pausa/reactiva un tenant temporalmente. Flow no soporta pausar una
+   suscripción (solo cancelar o crear una nueva) -- pausar cancela la
+   suscripción activa en Flow (mismo mecanismo que
+   POST /billing/flow/cancel-subscription) y marca tenants.paused_at.
+   Mientras está pausado, el tenant queda bloqueado de su dashboard igual
+   que uno vencido (ver GET /billing/account-status y middleware.ts,
+   blocked_reason: "paused"). Reactivar solo limpia paused_at -- el
+   tenant necesita volver a ingresar una tarjeta para que se le vuelva a
+   cobrar, no hay reanudación automática de cobro.
+====================================================== */
+app.post("/admin/tenants/:id/pause", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: tenant } = await supabase.from("tenants").select("id, name, slug, paused_at").eq("id", id).single();
+    if (!tenant) return res.status(404).json({ error: "Tenant no encontrado" });
+    if (tenant.paused_at) return res.status(400).json({ error: "El tenant ya está pausado" });
+
+    const { data: subscription, error: subErr } = await supabase
+      .from("subscriptions")
+      .select("id, flow_subscription_id")
+      .eq("tenant_id", id)
+      .in("status", ["active", "card_registered", "trialing"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (subErr) throw subErr;
+
+    let flowCanceled = false;
+    if (subscription) {
+      if (subscription.flow_subscription_id) {
+        await flowApiRequest("/subscription/cancel", { subscriptionId: subscription.flow_subscription_id });
+        flowCanceled = true;
+      }
+      await supabase
+        .from("subscriptions")
+        .update({ status: "canceled", updated_at: new Date().toISOString() })
+        .eq("id", subscription.id);
+    }
+
+    const pausedAt = new Date().toISOString();
+    const { error: updateErr } = await supabase.from("tenants").update({ paused_at: pausedAt }).eq("id", id);
+    if (updateErr) throw updateErr;
+
+    await logAdminTenantAction({
+      tenantId: id,
+      adminUserId: req.adminUser.user_id,
+      adminEmail: req.adminUser.email,
+      actionType: "pause",
+      details: { flow_subscription_canceled: flowCanceled },
+    });
+
+    res.json({ ok: true, paused_at: pausedAt });
+  } catch (err) {
+    console.error("POST /admin/tenants/:id/pause error:", err.message);
+    res.status(500).json({ error: err.message || "Error pausando el tenant" });
+  }
+});
+
+app.post("/admin/tenants/:id/reactivate", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: tenant } = await supabase.from("tenants").select("id, paused_at").eq("id", id).single();
+    if (!tenant) return res.status(404).json({ error: "Tenant no encontrado" });
+    if (!tenant.paused_at) return res.status(400).json({ error: "El tenant no está pausado" });
+
+    const { error: updateErr } = await supabase.from("tenants").update({ paused_at: null }).eq("id", id);
+    if (updateErr) throw updateErr;
+
+    await logAdminTenantAction({
+      tenantId: id,
+      adminUserId: req.adminUser.user_id,
+      adminEmail: req.adminUser.email,
+      actionType: "reactivate",
+      details: {},
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /admin/tenants/:id/reactivate error:", err.message);
+    res.status(500).json({ error: err.message || "Error reactivando el tenant" });
   }
 });
 

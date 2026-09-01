@@ -1,0 +1,23 @@
+-- ============================================================
+-- Pausa temporal de tenant (panel Super Admin)
+-- ============================================================
+-- Contexto: Flow (la pasarela de pago) no tiene una API de "pausar", solo
+-- de cancelar (/subscription/cancel) o crear una suscripcion nueva
+-- (/subscription/create) -- no existe un "suspender y reanudar despues".
+-- Por eso pausar un tenant desde el panel admin cancela su suscripcion
+-- Flow (mismo mecanismo que ya usa POST /billing/flow/cancel-subscription)
+-- y solo marca esta columna -- no se toca is_active (esa ya se usa para
+-- ocultar tenants del propio directorio admin, ver GET /admin/tenants) ni
+-- billing_cycle_end/trial_ends_at.
+--
+-- Reactivar solo limpia esta columna: como Flow no permite reanudar una
+-- suscripcion cancelada, el tenant vuelve a quedar en el mismo camino que
+-- cualquier tenant vencido -- necesita volver a ingresar una tarjeta via
+-- el flujo de suscripcion ya existente. No hay cobro automatico que se
+-- reanude solo.
+--
+-- Bloqueo de acceso mientras esta pausado: mismo mecanismo que ya bloquea
+-- a un tenant vencido (middleware.ts redirige todo excepto /billing), ver
+-- server.js GET /billing/account-status (blocked_reason: "paused") y
+-- deriveTenantBucket (bucket "paused", antes de cualquier otro chequeo).
+alter table tenants add column if not exists paused_at timestamptz;
