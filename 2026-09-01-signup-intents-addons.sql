@@ -1,0 +1,13 @@
+-- ============================================================
+-- Add-ons elegidos durante el signup pagado (checkout-premium)
+-- ============================================================
+-- Contexto: bug critico reportado por Camilo 2026-09-01 -- los add-ons
+-- seleccionados en /planes antes de llegar al checkout ("Confirma tu
+-- plan") se perdian por completo: nunca llegaban a POST
+-- /signup/start-paid ni al cobro real en Flow. Se agrega esta columna
+-- para guardar SOLO la seleccion (addon_key + quantity, sin ningun monto
+-- calculado del lado del cliente) -- el cobro real se calcula de nuevo
+-- server-side en el momento de crear el tenant
+-- (attemptSignupIntentTenantCreation, ver server.js), nunca se confia en
+-- un total guardado.
+alter table signup_intents add column if not exists addons jsonb not null default '[]'::jsonb;

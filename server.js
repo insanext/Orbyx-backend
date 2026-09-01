@@ -464,6 +464,39 @@ function isAddonAvailableForPlan(addonKey, plan) {
   return getPlanLevel(plan) >= getPlanLevel(addon.min_plan);
 }
 
+// Valida y calcula el neto de un lote de add-ons elegidos durante el
+// signup pagado (/signup/start-paid, ver más abajo) -- mismas reglas que
+// POST /billing/addons/activate (isAddonAvailableForPlan,
+// tieredAddonChargeAmount con currentQty=0 porque siempre son add-ons
+// nuevos para un tenant que todavía no existe). Nunca confía en ningún
+// monto que venga del cliente, solo en addon_key + quantity.
+function computeSignupAddonsCharge(addons, planId) {
+  const items = [];
+  let netTotal = 0;
+
+  for (const entry of Array.isArray(addons) ? addons : []) {
+    const addonKey = String(entry?.addon_key || "");
+    const quantity = parseInt(entry?.quantity, 10);
+
+    if (!ADDON_CATALOG[addonKey]) {
+      return { valid: false, error: `addon_key inválido: ${addonKey}` };
+    }
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      return { valid: false, error: `quantity inválida para ${addonKey}` };
+    }
+    if (!isAddonAvailableForPlan(addonKey, planId)) {
+      return { valid: false, error: `El plan ${planId} no permite el add-on ${addonKey}` };
+    }
+
+    const netAmount = tieredAddonChargeAmount(addonKey, 0, quantity);
+    const unitPrice = addonUnitTierPrice(addonKey, quantity - 1);
+    netTotal += netAmount;
+    items.push({ addon_key: addonKey, quantity, netAmount, unitPrice });
+  }
+
+  return { valid: true, items, netTotal };
+}
+
 function getAddonsForPlan(plan) {
   return Object.values(ADDON_CATALOG).filter((addon) =>
     isAddonAvailableForPlan(addon.key, plan)
@@ -13206,7 +13239,7 @@ const PAID_SIGNUP_PLANS = new Set(["business", "premium"]);
 ====================================================== */
 app.post("/signup/start-paid", publicLimiter, async (req, res) => {
   try {
-    const { email, business_name, phone, plan_id, periodicidad } = req.body || {};
+    const { email, business_name, phone, plan_id, periodicidad, addons } = req.body || {};
 
     if (!email || !plan_id || !periodicidad) {
       return res.status(400).json({
@@ -13236,6 +13269,18 @@ app.post("/signup/start-paid", publicLimiter, async (req, res) => {
       return res.status(400).json({ error: "No se pudo calcular el monto para ese plan/periodicidad" });
     }
 
+    // Add-ons elegidos en /planes antes de llegar al checkout (fix
+    // 2026-09-01: antes se perdían por completo -- nunca llegaban a este
+    // endpoint ni al cobro real). Se validan y se recalcula su neto acá
+    // mismo (nunca se confía en un monto de add-ons mandado por el
+    // cliente); solo se guarda la selección (addon_key + quantity), el
+    // cobro real se calcula de nuevo a partir de eso al crear el tenant
+    // (ver attemptSignupIntentTenantCreation).
+    const addonsCharge = computeSignupAddonsCharge(addons, normalizedPlan);
+    if (!addonsCharge.valid) {
+      return res.status(400).json({ error: addonsCharge.error });
+    }
+
     const { data: intent, error: insertErr } = await supabase
       .from("signup_intents")
       .insert({
@@ -13245,6 +13290,7 @@ app.post("/signup/start-paid", publicLimiter, async (req, res) => {
         plan_id: normalizedPlan,
         periodicidad,
         monto,
+        addons: addonsCharge.items.map((i) => ({ addon_key: i.addon_key, quantity: i.quantity })),
         status: "started",
       })
       .select("id")
@@ -13330,7 +13376,7 @@ app.post("/signup/register-card", publicLimiter, async (req, res) => {
 });
 
 const SIGNUP_INTENT_SELECT_FIELDS =
-  "id, email, business_name, phone, plan_id, periodicidad, monto, status, flow_customer_id, flow_subscription_id, recovery_token, tenant_id";
+  "id, email, business_name, phone, plan_id, periodicidad, monto, addons, status, flow_customer_id, flow_subscription_id, recovery_token, tenant_id";
 
 // Reclamo atómico: solo el request que gana la carrera pasa de fromStatus a
 // patch.status. Los demás reciben null y deben releer el estado actual en vez
@@ -13351,7 +13397,12 @@ async function claimSignupIntentStatus(intentId, fromStatus, patch) {
 
 // Intenta crear el tenant real para un signup_intent ya pagado. Reusable desde
 // el callback de tarjeta y desde /signup/resume (retry vía recovery_token).
-// Nunca vuelve a llamar a Flow: solo provisiona el tenant.
+// Nunca vuelve a cobrar el PLAN en Flow (eso ya se hizo en
+// register-card-callback vía subscription/create) -- solo provisiona el
+// tenant. Sí puede llamar a Flow una vez para cobrar add-ons iniciales
+// (ver más abajo), pero solo ocurre después de que la provisión del
+// tenant ya tuvo éxito, así que un retry (que solo se dispara cuando esta
+// función falló ANTES de llegar ahí) nunca puede volver a cobrarlos.
 async function attemptSignupIntentTenantCreation(intent) {
   try {
     const { tenant } = await provisionTenantCore({
@@ -13388,6 +13439,58 @@ async function attemptSignupIntentTenantCreation(intent) {
       console.error(
         `signup_intent ${intent.id}: tenant ${tenant.id} creado OK, pero falló el insert en subscriptions (requiere corrección manual):`,
         subErr.message
+      );
+    }
+
+    // Add-ons elegidos en /planes antes del checkout (fix 2026-09-01):
+    // se cobran una sola vez acá, aparte de la suscripción del plan (mismo
+    // patrón que POST /billing/addons/activate: un customer/charge
+    // puntual + fila en tenant_addons con renewal_mode "manual" -- la
+    // renovación recurrente de estos add-ons la maneja el cron existente
+    // de chargeRecurringAddons si el tenant activa auto-renovación más
+    // adelante, igual que cualquier otro add-on comprado desde el
+    // dashboard). Nunca se re-calcula el monto desde nada guardado: se
+    // recalcula desde intent.addons (solo addon_key+quantity) con la
+    // misma función que validó el monto en /signup/start-paid. Si el
+    // cobro o el insert fallan, el tenant y su plan ya quedaron activos
+    // igual -- esto es best-effort y nunca debe tumbar el signup.
+    try {
+      const addonsCharge = computeSignupAddonsCharge(intent.addons, intent.plan_id);
+      if (addonsCharge.valid && addonsCharge.items.length > 0 && intent.flow_customer_id) {
+        await flowApiRequest("/customer/charge", {
+          customerId: intent.flow_customer_id,
+          amount: applyIva(addonsCharge.netTotal),
+          subject: `Add-ons iniciales: ${addonsCharge.items.map((i) => `${i.addon_key} x${i.quantity}`).join(", ")}`,
+          commerceOrder: `addons_signup_${intent.id}_${Date.now()}`,
+        });
+
+        const nowIso = new Date().toISOString();
+        for (const item of addonsCharge.items) {
+          const addonDef = ADDON_CATALOG[item.addon_key];
+          const balanceGrant = addonDef?.resets_monthly ? item.quantity * (addonDef.pack_size || 0) : 0;
+          const { error: addonInsertErr } = await supabase.from("tenant_addons").insert({
+            tenant_id: tenant.id,
+            addon_key: item.addon_key,
+            quantity: item.quantity,
+            balance: balanceGrant,
+            billing_cycle: "mensual",
+            unit_price: item.unitPrice,
+            status: "active",
+            renewal_mode: "manual",
+            last_charged_at: nowIso,
+          });
+          if (addonInsertErr) {
+            console.error(
+              `signup_intent ${intent.id}: tenant ${tenant.id} - se cobró el add-on ${item.addon_key} pero falló el insert en tenant_addons (requiere corrección manual):`,
+              addonInsertErr.message
+            );
+          }
+        }
+      }
+    } catch (addonErr) {
+      console.error(
+        `signup_intent ${intent.id}: tenant ${tenant.id} - fallo cobrando/activando add-ons iniciales, no se activan:`,
+        addonErr.message
       );
     }
 
