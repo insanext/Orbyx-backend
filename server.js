@@ -18255,9 +18255,32 @@ app.delete("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
     // 3) Usuario de Supabase Auth — solo se borra si no pertenece a
     // ningún otro tenant (tenant_users de ESTE tenant ya se borró en el
     // paso anterior dentro de delete_tenant_cascade, así que cualquier
-    // fila restante para ese user_id es de OTRO tenant).
+    // fila restante para ese user_id es de OTRO tenant) Y si NO es un
+    // Super Admin (admin_users) -- pase lo que pase con sus membresías de
+    // tenant. Bug real 2026-08-31: un Super Admin que además era owner de
+    // un tenant de prueba (sin otras membresías activas) quedó sin
+    // ninguna fila en tenant_users tras borrar ese tenant, y este chequeo
+    // solo miraba tenant_users -> terminó borrando su propio usuario de
+    // Auth (y, por FK ON DELETE CASCADE, su fila en admin_users también),
+    // dejándolo sin acceso al panel admin. admin_users.user_id tiene su
+    // propia FK a auth.users con ON DELETE CASCADE, así que esta
+    // comprobación es la única defensa posible del lado de la app.
+    const { data: adminUserRows } = await supabase
+      .from("admin_users")
+      .select("user_id")
+      .in("user_id", memberUserIds.length > 0 ? memberUserIds : [null]);
+    const protectedAdminUserIds = new Set((adminUserRows || []).map((r) => r.user_id));
+
     const authUsersDeleted = [];
+    const authUsersSkippedAdmin = [];
     for (const userId of memberUserIds) {
+      if (protectedAdminUserIds.has(userId)) {
+        authUsersSkippedAdmin.push(userId);
+        console.warn(
+          `[admin/delete-tenant] usuario ${userId} es Super Admin (admin_users) -- NO se borra su cuenta de Auth aunque no le queden más membresías de tenant`
+        );
+        continue;
+      }
       const { data: otherMemberships } = await supabase
         .from("tenant_users")
         .select("tenant_id")
@@ -18279,6 +18302,7 @@ app.delete("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
       db_counts: dbCounts,
       storage: storageSummary,
       auth_users_deleted: authUsersDeleted,
+      auth_users_skipped_admin: authUsersSkippedAdmin,
     };
 
     await supabase.from("admin_tenant_deletions").insert({
@@ -18305,6 +18329,7 @@ app.delete("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
       db_counts: dbCounts,
       storage: storageSummary,
       auth_users_deleted: authUsersDeleted,
+      auth_users_skipped_admin: authUsersSkippedAdmin,
     });
   } catch (err) {
     console.error("DELETE /admin/tenants/:id error:", err.message);
@@ -19070,19 +19095,37 @@ app.delete("/members/:id", tenantAuthWrite, async (req, res) => {
 
     if (deleteError) throw deleteError;
 
-    // Solo borrar la cuenta de Supabase Auth si no tiene membresías activas en otros tenants.
-    const { data: otherMemberships } = await supabase
-      .from("tenant_users")
-      .select("tenant_id")
+    // Solo borrar la cuenta de Supabase Auth si no tiene membresías activas
+    // en otros tenants Y no es Super Admin (admin_users) -- mismo criterio
+    // y mismo bug real que en DELETE /admin/tenants/:id (ver ese
+    // endpoint): admin_users.user_id tiene ON DELETE CASCADE hacia
+    // auth.users, así que borrar la cuenta de Auth de alguien con acceso
+    // al panel admin también le borra ese acceso, sin importar sus
+    // membresías de tenant.
+    const { data: adminUserRow } = await supabase
+      .from("admin_users")
+      .select("user_id")
       .eq("user_id", member.user_id)
-      .eq("is_active", true)
-      .neq("tenant_id", tenant_id);
+      .maybeSingle();
 
-    if (!otherMemberships || otherMemberships.length === 0) {
-      const { error: authDeleteError } = await supabase.auth.admin.deleteUser(member.user_id);
-      if (authDeleteError) {
-        console.error("DELETE /members/:id auth.admin.deleteUser error:", authDeleteError.message);
+    if (!adminUserRow) {
+      const { data: otherMemberships } = await supabase
+        .from("tenant_users")
+        .select("tenant_id")
+        .eq("user_id", member.user_id)
+        .eq("is_active", true)
+        .neq("tenant_id", tenant_id);
+
+      if (!otherMemberships || otherMemberships.length === 0) {
+        const { error: authDeleteError } = await supabase.auth.admin.deleteUser(member.user_id);
+        if (authDeleteError) {
+          console.error("DELETE /members/:id auth.admin.deleteUser error:", authDeleteError.message);
+        }
       }
+    } else {
+      console.warn(
+        `[DELETE /members/:id] usuario ${member.user_id} es Super Admin (admin_users) -- NO se borra su cuenta de Auth`
+      );
     }
 
     return res.json({ ok: true });
