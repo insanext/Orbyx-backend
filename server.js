@@ -17108,6 +17108,24 @@ async function requireAdminAuth(req, res, next) {
   }
 }
 
+// Registro generico de auditoria para cualquier accion de Super Admin sobre
+// un tenant desde el panel /admin (ver 2026-08-31-admin-tenant-actions.sql).
+// Best-effort: nunca bloquea ni rompe la accion que la dispara, mismo
+// criterio que el resto de las funciones de tracking en este archivo.
+async function logAdminTenantAction({ tenantId, adminUserId, adminEmail, actionType, details }) {
+  try {
+    await supabase.from("admin_tenant_actions").insert({
+      tenant_id: tenantId,
+      admin_user_id: adminUserId,
+      admin_email: adminEmail,
+      action_type: actionType,
+      details: details || {},
+    });
+  } catch (err) {
+    console.warn("logAdminTenantAction error:", err.message);
+  }
+}
+
 const PRIORITY_ORDER = { maxima: 0, alta: 1, media: 2, normal: 3 };
 
 app.get("/admin/tickets", requireAdminAuth, async (req, res) => {
@@ -17860,17 +17878,27 @@ app.delete("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
 
     // 4) Registro de auditoría simple (no existía ninguna tabla de
     // auditoría de acciones admin hasta ahora).
+    const deletionDetails = {
+      db_counts: dbCounts,
+      storage: storageSummary,
+      auth_users_deleted: authUsersDeleted,
+    };
+
     await supabase.from("admin_tenant_deletions").insert({
       tenant_id: id,
       tenant_name: tenant.name,
       tenant_slug: tenant.slug,
       deleted_by_admin_user_id: req.adminUser.user_id,
       deleted_by_admin_email: req.adminUser.email,
-      details: {
-        db_counts: dbCounts,
-        storage: storageSummary,
-        auth_users_deleted: authUsersDeleted,
-      },
+      details: deletionDetails,
+    });
+
+    await logAdminTenantAction({
+      tenantId: id,
+      adminUserId: req.adminUser.user_id,
+      adminEmail: req.adminUser.email,
+      actionType: "delete",
+      details: { tenant_name: tenant.name, tenant_slug: tenant.slug, ...deletionDetails },
     });
 
     return res.json({
