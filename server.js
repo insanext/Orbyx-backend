@@ -206,6 +206,24 @@ function normalizeBillingCycle(cycle) {
   return BILLING_CYCLE_ALIASES[normalized] || "mensual";
 }
 
+// Monto neto (sin IVA) del plan para un ciclo de facturación dado. Mismo
+// cálculo que cycleTotalPrice() en orbyx-web/lib/plans.ts (monthlyPrice *
+// months * discount, redondeado) -- duplicado acá a propósito porque el
+// backend no puede importar el submodule frontend (mismo criterio que
+// ADMIN_PLAN_PRICES_ALL). Fix 2026-09-01: antes /signup/start-paid usaba
+// el `monto` que mandaba el cliente tal cual, sin ningún chequeo -- un
+// bug real (el checkout mostraba el precio sin IVA) y, peor, una
+// vulnerabilidad de manipulación de precio (nada impedía a un cliente
+// mandar un monto arbitrario). Este es ahora el único monto neto de plan
+// que se usa para cobrar: nunca se vuelve a confiar en un monto de plan
+// mandado por el cliente.
+function computePlanNetAmount(plan_id, periodicidad) {
+  const basePrice = PLAN_PRICES[String(plan_id || "").toLowerCase()];
+  if (!basePrice) return null;
+  const cycle = BILLING_CYCLES[normalizeBillingCycle(periodicidad)];
+  return Math.round(basePrice * cycle.months * cycle.discount);
+}
+
 // El ciclo no se persiste en una columna propia: se infiere de la duración
 // entre billing_cycle_start y billing_cycle_end (mensual ~30d, semestral ~180d, anual ~360d).
 function inferBillingCycle(billingStart, billingEnd) {
@@ -13188,11 +13206,11 @@ const PAID_SIGNUP_PLANS = new Set(["business", "premium"]);
 ====================================================== */
 app.post("/signup/start-paid", publicLimiter, async (req, res) => {
   try {
-    const { email, business_name, phone, plan_id, periodicidad, monto } = req.body || {};
+    const { email, business_name, phone, plan_id, periodicidad } = req.body || {};
 
-    if (!email || !plan_id || !periodicidad || !monto) {
+    if (!email || !plan_id || !periodicidad) {
       return res.status(400).json({
-        error: "email, plan_id, periodicidad y monto son obligatorios",
+        error: "email, plan_id y periodicidad son obligatorios",
       });
     }
 
@@ -13209,6 +13227,13 @@ app.post("/signup/start-paid", publicLimiter, async (req, res) => {
 
     if (!PERIODICIDAD_TO_FLOW_INTERVAL[periodicidad]) {
       return res.status(400).json({ error: `periodicidad no soportada: ${periodicidad}` });
+    }
+
+    // El monto SIEMPRE se calcula acá, nunca se toma del body -- ver
+    // computePlanNetAmount (fix 2026-09-01, ver comentario ahí).
+    const monto = computePlanNetAmount(normalizedPlan, periodicidad);
+    if (!monto) {
+      return res.status(400).json({ error: "No se pudo calcular el monto para ese plan/periodicidad" });
     }
 
     const { data: intent, error: insertErr } = await supabase
