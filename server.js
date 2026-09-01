@@ -17966,6 +17966,94 @@ app.post("/admin/tenants/:id/send-password-reset", requireAdminAuth, async (req,
 });
 
 /* ======================================================
+   💳 POST /admin/tenants/:id/credit-balance
+   Otorga saldo de compensación a un tenant, sumándolo directamente al
+   mismo saldo acumulable de add-ons ya pagados (tenant_addons.balance --
+   ver decrementAddonBalance/checkMonthlyUsage más arriba) en vez de crear
+   un sistema paralelo. Solo aplica a los add-ons con cupo mensual
+   acumulable (resets_monthly:true en ADDON_CATALOG: wa_confirmacion,
+   campanas_wa, emails_campana hoy) -- staff/sucursal/group_capacity usan
+   quantity como capacidad directa, no balance, así que no aplican acá.
+   renewal_mode se deja/crea en 'manual' para que este crédito nunca sea
+   tomado por chargeRecurringAddons (que solo mira renewal_mode=
+   'automatico') -- es plata que el tenant no pagó, no debe cobrarse de
+   vuelta.
+====================================================== */
+app.post("/admin/tenants/:id/credit-balance", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { addon_key, amount } = req.body || {};
+
+    const creditableKeys = Object.keys(ADDON_CATALOG).filter((k) => ADDON_CATALOG[k]?.resets_monthly);
+    if (!addon_key || !creditableKeys.includes(addon_key)) {
+      return res.status(400).json({
+        error: `addon_key inválido. Válidos: ${creditableKeys.join(", ")}`,
+      });
+    }
+
+    const credit = parseInt(amount, 10);
+    if (!Number.isInteger(credit) || credit <= 0) {
+      return res.status(400).json({ error: "amount debe ser un entero positivo" });
+    }
+
+    const { data: tenant } = await supabase.from("tenants").select("id").eq("id", id).single();
+    if (!tenant) return res.status(404).json({ error: "Tenant no encontrado" });
+
+    const { data: existing, error: existingError } = await supabase
+      .from("tenant_addons")
+      .select("id, balance")
+      .eq("tenant_id", id)
+      .eq("addon_key", addon_key)
+      .eq("status", "active")
+      .maybeSingle();
+    if (existingError) throw existingError;
+
+    let newBalance;
+    if (existing) {
+      newBalance = Number(existing.balance || 0) + credit;
+      const { error } = await supabase
+        .from("tenant_addons")
+        .update({ balance: newBalance, updated_at: new Date().toISOString() })
+        .eq("id", existing.id);
+      if (error) throw error;
+    } else {
+      newBalance = credit;
+      const { error } = await supabase.from("tenant_addons").insert({
+        tenant_id: id,
+        addon_key,
+        quantity: 0,
+        balance: newBalance,
+        billing_cycle: "mensual",
+        unit_price: 0,
+        status: "active",
+        renewal_mode: "manual",
+      });
+      if (error) throw error;
+    }
+
+    await logAdminTenantAction({
+      tenantId: id,
+      adminUserId: req.adminUser.user_id,
+      adminEmail: req.adminUser.email,
+      actionType: "balance_credit",
+      details: { addon_key, amount: credit, new_balance: newBalance },
+    });
+
+    res.json({ ok: true, addon_key, amount: credit, new_balance: newBalance });
+  } catch (err) {
+    console.error("POST /admin/tenants/:id/credit-balance error:", err.message);
+
+    if (isMissingAddonsTableError(err)) {
+      return res.status(503).json({
+        error: "La tabla tenant_addons no existe aún. Ejecuta tenant_addons.sql en el SQL editor de Supabase.",
+      });
+    }
+
+    res.status(500).json({ error: err.message || "Error otorgando el crédito" });
+  }
+});
+
+/* ======================================================
    🗑️ DELETE /admin/tenants/:id
    Borrado completo e irreversible de un tenant — panel Super Admin.
    Borra filas en ~35 tablas (vía la función Postgres
