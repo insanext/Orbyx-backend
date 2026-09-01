@@ -17760,6 +17760,64 @@ app.get("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
 });
 
 /* ======================================================
+   📝 Notas internas de Super Admin por tenant (admin_tenant_notes)
+   Bitacora acumulable, visible solo en el panel admin.
+====================================================== */
+app.get("/admin/tenants/:id/notes", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from("admin_tenant_notes")
+      .select("id, admin_email, note, created_at")
+      .eq("tenant_id", id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json({ ok: true, notes: data || [] });
+  } catch (err) {
+    console.error("GET /admin/tenants/:id/notes error:", err.message);
+    res.status(500).json({ error: err.message || "Error obteniendo notas" });
+  }
+});
+
+app.post("/admin/tenants/:id/notes", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { note } = req.body || {};
+    if (!note || !note.trim()) {
+      return res.status(400).json({ error: "La nota no puede estar vacía" });
+    }
+
+    const { data: tenant } = await supabase.from("tenants").select("id").eq("id", id).single();
+    if (!tenant) return res.status(404).json({ error: "Tenant no encontrado" });
+
+    const { data, error } = await supabase
+      .from("admin_tenant_notes")
+      .insert({
+        tenant_id: id,
+        admin_user_id: req.adminUser.user_id,
+        admin_email: req.adminUser.email,
+        note: note.trim(),
+      })
+      .select("id, admin_email, note, created_at")
+      .single();
+    if (error) throw error;
+
+    await logAdminTenantAction({
+      tenantId: id,
+      adminUserId: req.adminUser.user_id,
+      adminEmail: req.adminUser.email,
+      actionType: "note_added",
+      details: { note: note.trim() },
+    });
+
+    res.json({ ok: true, note: data });
+  } catch (err) {
+    console.error("POST /admin/tenants/:id/notes error:", err.message);
+    res.status(500).json({ error: err.message || "Error agregando nota" });
+  }
+});
+
+/* ======================================================
    🗑️ DELETE /admin/tenants/:id
    Borrado completo e irreversible de un tenant — panel Super Admin.
    Borra filas en ~35 tablas (vía la función Postgres
