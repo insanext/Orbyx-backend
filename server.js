@@ -17130,12 +17130,13 @@ const PRIORITY_ORDER = { maxima: 0, alta: 1, media: 2, normal: 3 };
 
 app.get("/admin/tickets", requireAdminAuth, async (req, res) => {
   try {
-    const { status } = req.query;
+    const { status, tenant_id } = req.query;
     let query = supabase
       .from("support_tickets")
       .select("*, tenants!inner(name, slug, plan, plan_slug)")
       .order("created_at", { ascending: false });
     if (status) query = query.eq("status", status);
+    if (tenant_id) query = query.eq("tenant_id", tenant_id);
     const { data, error } = await query;
     if (error) throw error;
     const tickets = (data ?? [])
