@@ -17832,30 +17832,36 @@ app.post("/admin/tenants/:id/notes", requireAdminAuth, async (req, res) => {
    auditado en admin_tenant_actions en cada uso. Gateado por
    requireAdminAuth (incluye MFA obligatorio).
 ====================================================== */
+// Reusado por view-session, resend-welcome-email y send-password-reset:
+// mismo criterio que GET /admin/tenants/:id para identificar al owner
+// (tenant_users role=owner is_active=true), pero acá solo se necesita el
+// primero con su email, no la lista completa con teléfono.
+async function getActiveOwnerEmail(tenantId) {
+  const { data: ownerMemberships } = await supabase
+    .from("tenant_users")
+    .select("user_id")
+    .eq("tenant_id", tenantId)
+    .eq("is_active", true)
+    .eq("role", "owner")
+    .limit(1);
+
+  const ownerUserId = (ownerMemberships || [])[0]?.user_id;
+  if (!ownerUserId) return { ownerUserId: null, ownerEmail: null };
+
+  const { data: authUser } = await supabase.auth.admin.getUserById(ownerUserId);
+  return { ownerUserId, ownerEmail: authUser?.user?.email || null };
+}
+
 app.post("/admin/tenants/:id/view-session", requireAdminAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { data: tenant } = await supabase.from("tenants").select("id, slug, name").eq("id", id).single();
     if (!tenant) return res.status(404).json({ error: "Tenant no encontrado" });
 
-    const { data: ownerMemberships } = await supabase
-      .from("tenant_users")
-      .select("user_id")
-      .eq("tenant_id", id)
-      .eq("is_active", true)
-      .eq("role", "owner")
-      .limit(1);
-
-    const ownerUserId = (ownerMemberships || [])[0]?.user_id;
-    if (!ownerUserId) {
+    const { ownerEmail } = await getActiveOwnerEmail(id);
+    if (!ownerEmail) {
       return res.status(400).json({ error: "No se encontró un usuario owner activo para este tenant" });
     }
-
-    const { data: authUser, error: authUserError } = await supabase.auth.admin.getUserById(ownerUserId);
-    if (authUserError || !authUser?.user?.email) {
-      return res.status(400).json({ error: "No se pudo obtener el email del owner" });
-    }
-    const ownerEmail = authUser.user.email;
 
     const { data: linkData, error: linkError } = await supabase.auth.admin.generateLink({
       type: "magiclink",
@@ -17892,6 +17898,70 @@ app.post("/admin/tenants/:id/view-session", requireAdminAuth, async (req, res) =
   } catch (err) {
     console.error("POST /admin/tenants/:id/view-session error:", err.message);
     res.status(500).json({ error: err.message || "Error generando sesión de vista" });
+  }
+});
+
+/* ======================================================
+   ✉️ POST /admin/tenants/:id/resend-welcome-email
+   Reenvía el email de confirmación de cuenta que Supabase Auth ya envía
+   automáticamente al hacer signUp() (mismo mecanismo estándar, via
+   supabase.auth.resend) -- no es un email custom de este proyecto.
+   🔑 POST /admin/tenants/:id/send-password-reset
+   Dispara el flujo estándar de reset de contraseña de Supabase Auth
+   (mismo supabase.auth.resetPasswordForEmail que usa /recuperar-password
+   en el frontend, mismo redirectTo).
+====================================================== */
+app.post("/admin/tenants/:id/resend-welcome-email", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { ownerEmail } = await getActiveOwnerEmail(id);
+    if (!ownerEmail) {
+      return res.status(400).json({ error: "No se encontró un usuario owner activo para este tenant" });
+    }
+
+    const { error: resendError } = await supabase.auth.resend({ type: "signup", email: ownerEmail });
+    if (resendError) throw resendError;
+
+    await logAdminTenantAction({
+      tenantId: id,
+      adminUserId: req.adminUser.user_id,
+      adminEmail: req.adminUser.email,
+      actionType: "resend_welcome_email",
+      details: { owner_email: ownerEmail },
+    });
+
+    res.json({ ok: true, owner_email: ownerEmail });
+  } catch (err) {
+    console.error("POST /admin/tenants/:id/resend-welcome-email error:", err.message);
+    res.status(500).json({ error: err.message || "Error reenviando el email de bienvenida" });
+  }
+});
+
+app.post("/admin/tenants/:id/send-password-reset", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { ownerEmail } = await getActiveOwnerEmail(id);
+    if (!ownerEmail) {
+      return res.status(400).json({ error: "No se encontró un usuario owner activo para este tenant" });
+    }
+
+    const { error: resetError } = await supabase.auth.resetPasswordForEmail(ownerEmail, {
+      redirectTo: "https://orbyx.cl/actualizar-password",
+    });
+    if (resetError) throw resetError;
+
+    await logAdminTenantAction({
+      tenantId: id,
+      adminUserId: req.adminUser.user_id,
+      adminEmail: req.adminUser.email,
+      actionType: "password_reset_sent",
+      details: { owner_email: ownerEmail },
+    });
+
+    res.json({ ok: true, owner_email: ownerEmail });
+  } catch (err) {
+    console.error("POST /admin/tenants/:id/send-password-reset error:", err.message);
+    res.status(500).json({ error: err.message || "Error enviando el reset de contraseña" });
   }
 });
 
