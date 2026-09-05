@@ -11007,12 +11007,13 @@ async function provisionTenantCore({ email, plan = "starter", billing_cycle, bus
   return { tenant, calendar, branch };
 }
 
-async function linkTenantOwner({ tenant_id, user_id, phone = null }) {
+async function linkTenantOwner({ tenant_id, user_id, phone = null, full_name = null }) {
   const { error: userError } = await supabase.from("tenant_users").insert({
     user_id,
     tenant_id,
     role: "owner",
     phone: phone || null,
+    full_name: full_name || null,
   });
 
   if (userError) throw userError;
@@ -11169,7 +11170,7 @@ async function recordLegalAcceptancesAndSendConfirmation({
 ====================================================== */
 app.post("/tenants/provision", [publicLimiter, requireTenantAuth], async (req, res) => {
   try {
-    const { email, plan = "starter", billing_cycle, phone } = req.body;
+    const { email, plan = "starter", billing_cycle, phone, full_name } = req.body;
     // user_id viene del token verificado (requireTenantAuth), nunca del
     // body — antes se confiaba en el user_id que mandaba el cliente, sin
     // confirmar que quien llama esté autenticado como ese usuario.
@@ -11179,13 +11180,13 @@ app.post("/tenants/provision", [publicLimiter, requireTenantAuth], async (req, r
       return res.status(400).json({ error: "Falta campo: email" });
     }
 
-    // phone NO es hard-required acá (a diferencia de POST /signup/start-paid):
-    // el formulario de /signup ya lo exige, pero este endpoint corre en el
-    // PRIMER LOGIN después de verificar el email — que puede ser días
-    // después del signup. Bloquear acá rompería a alguien que se registró
-    // justo antes de este deploy y recién ahora verifica su email (su
-    // metadata no tiene phone, sin culpa suya). Mejor: guardar si viene,
-    // no bloquear si no viene.
+    // phone/full_name NO son hard-required acá (a diferencia de POST
+    // /signup/start-paid): el formulario de /signup ya los exige, pero este
+    // endpoint corre en el PRIMER LOGIN después de verificar el email — que
+    // puede ser días después del signup. Bloquear acá rompería a alguien
+    // que se registró justo antes de este deploy y recién ahora verifica su
+    // email (su metadata no tiene estos campos, sin culpa suya). Mejor:
+    // guardar si vienen, no bloquear si no vienen.
 
     const maxRetries = 5;
     let authUser = null;
@@ -11199,7 +11200,7 @@ app.post("/tenants/provision", [publicLimiter, requireTenantAuth], async (req, r
     }
 
     const { tenant, calendar, branch } = await provisionTenantCore({ email, plan, billing_cycle });
-    await linkTenantOwner({ tenant_id: tenant.id, user_id, phone });
+    await linkTenantOwner({ tenant_id: tenant.id, user_id, phone, full_name });
 
     await recordLegalAcceptancesAndSendConfirmation({
       tenant_id: tenant.id,
@@ -13291,7 +13292,7 @@ const PAID_SIGNUP_PLANS = new Set(["business", "premium"]);
 ====================================================== */
 app.post("/signup/start-paid", publicLimiter, async (req, res) => {
   try {
-    const { email, business_name, phone, plan_id, periodicidad, addons } = req.body || {};
+    const { email, business_name, full_name, phone, plan_id, periodicidad, addons } = req.body || {};
 
     if (!email || !plan_id || !periodicidad) {
       return res.status(400).json({
@@ -13301,6 +13302,10 @@ app.post("/signup/start-paid", publicLimiter, async (req, res) => {
 
     if (!phone || !String(phone).trim()) {
       return res.status(400).json({ error: "phone es obligatorio" });
+    }
+
+    if (!full_name || !String(full_name).trim()) {
+      return res.status(400).json({ error: "full_name es obligatorio" });
     }
 
     const normalizedPlan = String(plan_id).toLowerCase();
@@ -13353,6 +13358,7 @@ app.post("/signup/start-paid", publicLimiter, async (req, res) => {
       .insert({
         email,
         business_name: business_name || null,
+        full_name: String(full_name).trim(),
         phone: String(phone).trim(),
         plan_id: normalizedPlan,
         periodicidad,
@@ -13443,7 +13449,7 @@ app.post("/signup/register-card", publicLimiter, async (req, res) => {
 });
 
 const SIGNUP_INTENT_SELECT_FIELDS =
-  "id, email, business_name, phone, plan_id, periodicidad, monto, addons, status, flow_customer_id, flow_subscription_id, recovery_token, tenant_id";
+  "id, email, business_name, full_name, phone, plan_id, periodicidad, monto, addons, status, flow_customer_id, flow_subscription_id, recovery_token, tenant_id";
 
 // Reclamo atómico: solo el request que gana la carrera pasa de fromStatus a
 // patch.status. Los demás reciben null y deben releer el estado actual en vez
@@ -13950,7 +13956,7 @@ app.post("/signup/claim-account", publicLimiter, async (req, res) => {
       }
     }
 
-    await linkTenantOwner({ tenant_id: intent.tenant_id, user_id: authUser.id, phone: intent.phone });
+    await linkTenantOwner({ tenant_id: intent.tenant_id, user_id: authUser.id, phone: intent.phone, full_name: intent.full_name });
 
     await recordLegalAcceptancesAndSendConfirmation({
       tenant_id: intent.tenant_id,
