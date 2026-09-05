@@ -10869,19 +10869,55 @@ app.get("/_ping", (req, res) => {
 // provisionTenantCore/linkTenantOwner: lógica interna de /tenants/provision
 // extraída para reusarse desde el flujo de signup pagado (premium/vip/platinum),
 // donde el tenant se crea antes de que exista un user_id de Supabase Auth.
-async function provisionTenantCore({ email, plan = "starter", billing_cycle }) {
+async function provisionTenantCore({ email, plan = "starter", billing_cycle, business_name }) {
   const provisionCycle = normalizeBillingCycle(billing_cycle);
 
-  const baseSlug = String(email).split("@")[0] || "tenant";
-  const cleanBase =
-    baseSlug
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 30) || "tenant";
+  // El nombre/slug público del negocio debe salir de business_name cuando
+  // viene (signup pagado, vía signup_intents.business_name) -- antes acá se
+  // ignoraba por completo y se usaba el email para ambos, aunque el
+  // formulario de checkout-premium sí pedía "Nombre del negocio" (fix
+  // 2026-09-05, bug reportado por Camilo: tenant "Sonex" terminaba con
+  // slug/nombre del correo). Starter (/tenants/provision) no pide este
+  // campo en su formulario -- sigue usando el email como antes, sin
+  // cambios de comportamiento para ese flujo.
+  let tenantName;
+  let slug;
+  if (business_name && String(business_name).trim()) {
+    tenantName = String(business_name).trim();
 
-  const suffix = Math.random().toString(16).slice(2, 8);
-  const slug = `${cleanBase}-${suffix}`;
+    // Misma normalización que PATCH /tenants/:id (generación de slug desde
+    // business_name) -- solo letras (sin tildes/ñ) y números, reusada tal
+    // cual para no introducir un segundo criterio de slug en el proyecto.
+    const baseSlug =
+      tenantName
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[̀-ͯ]/g, "")
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 30) || "negocio";
+
+    const { data: existingTenant } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", baseSlug)
+      .maybeSingle();
+
+    const suffix = Math.random().toString(16).slice(2, 6);
+    slug = existingTenant ? `${baseSlug}-${suffix}` : baseSlug;
+  } else {
+    tenantName = email;
+    const baseSlug = String(email).split("@")[0] || "tenant";
+    const cleanBase =
+      baseSlug
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 30) || "tenant";
+
+    const suffix = Math.random().toString(16).slice(2, 8);
+    slug = `${cleanBase}-${suffix}`;
+  }
 
   const billing_cycle_start = new Date().toISOString();
   const billing_cycle_end = addMonths(
@@ -10919,7 +10955,7 @@ async function provisionTenantCore({ email, plan = "starter", billing_cycle }) {
   const { data: tenant, error: tenantError } = await supabase
     .from("tenants")
     .insert({
-      name: email,
+      name: tenantName,
       slug,
       plan_slug: normalizedProvisionPlan,
       is_trial: isTrialProvision,
@@ -13424,6 +13460,7 @@ async function attemptSignupIntentTenantCreation(intent) {
       email: intent.email,
       plan: intent.plan_id,
       billing_cycle: intent.periodicidad,
+      business_name: intent.business_name,
     });
 
     const recoveryToken = intent.recovery_token || crypto.randomBytes(32).toString("hex");
