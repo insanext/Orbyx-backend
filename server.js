@@ -17845,6 +17845,24 @@ app.get("/admin/tenants", requireAdminAuth, async (req, res) => {
       addonsByTenant[row.tenant_id].push(ADDON_CATALOG[row.addon_key]?.name || row.addon_key);
     }
 
+    // Nombre del propietario para el directorio -- a diferencia del email
+    // (que exige auth.admin.getUserById, uno por owner), full_name vive
+    // directo en tenant_users, así que esto es una sola query extra para
+    // todo el listado, no una por tenant.
+    const { data: ownerRows, error: ownerRowsError } = await supabase
+      .from("tenant_users")
+      .select("tenant_id, full_name")
+      .eq("role", "owner")
+      .eq("is_active", true);
+    if (ownerRowsError) throw ownerRowsError;
+
+    const ownerNameByTenant = {};
+    for (const row of ownerRows || []) {
+      if (row.full_name && !ownerNameByTenant[row.tenant_id]) {
+        ownerNameByTenant[row.tenant_id] = row.full_name;
+      }
+    }
+
     const now = new Date();
     const result = (tenants || []).map((tenant) => {
       const subscription = latestSubscriptionByTenant[tenant.id] || null;
@@ -17865,6 +17883,7 @@ app.get("/admin/tenants", requireAdminAuth, async (req, res) => {
         id: tenant.id,
         name: tenant.name,
         slug: tenant.slug,
+        owner_name: ownerNameByTenant[tenant.id] || null,
         plan_slug: planSlug,
         amount,
         addons_summary: (addonsByTenant[tenant.id] || []).join(", "),
@@ -17962,15 +17981,13 @@ app.get("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
       .order("created_at", { ascending: true });
     if (branchesError) throw branchesError;
 
-    // Contacto del administrador: tenant_users no tiene columnas propias de
-    // nombre/teléfono (confirmado, no existen en ningún select/insert de
-    // este archivo) — el único dato real disponible es el email, vía
-    // auth.users (mismo patrón que GET /members y el fallback de email de
-    // facturación). Se reporta explícitamente qué falta en vez de dejarlo
-    // en blanco sin explicación.
+    // Contacto del administrador: el email vive en auth.users (mismo patrón
+    // que GET /members y el fallback de email de facturación); phone y
+    // full_name viven directo en tenant_users desde 2026-08-27-owner-phone.sql
+    // y 2026-09-05-owner-full-name.sql respectivamente.
     const { data: ownerMemberships } = await supabase
       .from("tenant_users")
-      .select("user_id, role, phone")
+      .select("user_id, role, phone, full_name")
       .eq("tenant_id", id)
       .eq("is_active", true)
       .eq("role", "owner");
@@ -17982,14 +17999,15 @@ app.get("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
         owners.push({
           user_id: membership.user_id,
           email: authUser?.user?.email || null,
-          name: null,
-          // Solo tenants registrados DESPUÉS de 2026-08-27-owner-phone.sql
-          // tienen este dato (se pide obligatorio en el registro desde esa
-          // fecha) — null acá para uno anterior es esperado, no un bug.
+          // Solo tenants registrados DESPUÉS de 2026-08-27-owner-phone.sql /
+          // 2026-09-05-owner-full-name.sql tienen estos datos (se piden
+          // obligatorios en el registro desde esas fechas) — null acá para
+          // uno anterior es esperado, no un bug.
+          name: membership.full_name || null,
           phone: membership.phone || null,
         });
       } catch (_) {
-        owners.push({ user_id: membership.user_id, email: null, name: null, phone: membership.phone || null });
+        owners.push({ user_id: membership.user_id, email: null, name: membership.full_name || null, phone: membership.phone || null });
       }
     }
 

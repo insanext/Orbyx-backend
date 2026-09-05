@@ -167,6 +167,11 @@ Any public booking change must account for generic, veterinary, and group bookin
 - WhatsApp campaigns are saved/logged only; no real backend WhatsApp send.
 - Campaign audiences must be branch-aware when the UI context is branch-specific.
 
+## Person Name Fields
+
+- Any field that captures a real person's name (customer, patient, tenant owner/admin, staff, emergency contact) must use the exact label `"Nombre y Apellido"` — never `"Nombre completo"` or other variants.
+- Does not apply to business names, pet names, or other non-person entity names.
+
 ## Security Rules
 
 - Never expose Supabase service role keys, OAuth tokens, Resend API key, Google client secret, or other secrets.
