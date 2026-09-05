@@ -11664,7 +11664,7 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     const { data: tenant, error: tenantErr } = await supabase
       .from("tenants")
       .select(
-        "id, plan_slug, trial_ends_at, billing_cycle_end, paused_at, wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name"
+        "id, plan_slug, trial_ends_at, billing_cycle_end, paused_at, wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name, dashboard_welcome_seen_at"
       )
       .eq("id", tenant_id)
       .single();
@@ -11770,6 +11770,7 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       deposit_account_number: tenant.deposit_account_number || "",
       deposit_holder_rut: tenant.deposit_holder_rut || "",
       deposit_holder_name: tenant.deposit_holder_name || "",
+      dashboard_welcome_seen: Boolean(tenant.dashboard_welcome_seen_at),
     });
   } catch (err) {
     console.error("GET /billing/account-status error:", err.message);
@@ -14746,6 +14747,35 @@ app.patch("/tenants/:id/deposit-settings", tenantAuthParamWrite, async (req, res
     }
 
     return res.json({ ok: true, ...data });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /tenants/:id/dashboard-welcome-seen
+   Marca el modal de bienvenida del dashboard como visto (una sola vez por
+   tenant, persistido en tenants.dashboard_welcome_seen_at -- no localStorage,
+   para que no vuelva a aparecer al borrar datos del navegador ni entrando
+   desde otro dispositivo). GET /billing/account-status expone la columna
+   (null = todavía no se mostró) para que el dashboard decida si mostrarlo.
+   El .is(...) hace que solo la primera llamada realmente escriba -- llamadas
+   repetidas (doble click, remount) son no-op sin pisar el timestamp original.
+====================================================== */
+app.post("/tenants/:id/dashboard-welcome-seen", tenantAuthParamWrite, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase
+      .from("tenants")
+      .update({ dashboard_welcome_seen_at: new Date().toISOString() })
+      .eq("id", id)
+      .is("dashboard_welcome_seen_at", null);
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
