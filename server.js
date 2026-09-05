@@ -11041,6 +11041,21 @@ function extractClientIp(req) {
 // criterio que recordLegalAcceptancesAndSendConfirmation: nunca lanza,
 // cualquier falla se loguea y no debe bloquear la respuesta del endpoint
 // que lo llama.
+// Mismo texto legal que buildRenewalConsentTextRaw en
+// orbyx-web/components/addons/AddonManager.tsx (duplicado a propósito, igual
+// que el catálogo de precios -- ver comentario ahí) -- usado para dejar
+// consentimiento registrado cuando un add-on se activa en renewal_mode
+// "automatico" desde un flujo 100% server-side (signup pagado) que no tiene
+// un modal de checkout donde mostrarle este texto al tenant en el momento.
+function buildAddonRenewalConsentText(addonLabel, quantity, unitPrice) {
+  const monto = unitPrice * quantity;
+  const montoFormatted = `$${Math.round(monto).toLocaleString("es-CL")}`;
+  const isPlural = quantity !== 1;
+  const unidadPlural = isPlural ? "unidades" : "unidad";
+  const activaPlural = isPlural ? "activas" : "activa";
+  return `Autorizo a que se me cobre automáticamente ${montoFormatted} + IVA cada ~30 días mientras esta opción esté activa, para mantener mis ${quantity} ${unidadPlural} de ${addonLabel} ${activaPlural}. Este cobro no se prorratea: la renovación de este addon se calcula desde la fecha de tu último pago de este addon en particular, no desde la fecha de tu plan. Puedo desactivar esta renovación cuando quiera desde "Mi suscripción" → Add-ons.`;
+}
+
 async function recordAddonAutoChargeConsent({
   tenant_id,
   addon_key,
@@ -13454,7 +13469,7 @@ async function claimSignupIntentStatus(intentId, fromStatus, patch) {
 // (ver más abajo), pero solo ocurre después de que la provisión del
 // tenant ya tuvo éxito, así que un retry (que solo se dispara cuando esta
 // función falló ANTES de llegar ahí) nunca puede volver a cobrarlos.
-async function attemptSignupIntentTenantCreation(intent) {
+async function attemptSignupIntentTenantCreation(intent, req) {
   try {
     const { tenant } = await provisionTenantCore({
       email: intent.email,
@@ -13503,18 +13518,23 @@ async function attemptSignupIntentTenantCreation(intent) {
       }
     }
 
-    // Add-ons elegidos en /planes antes del checkout (fix 2026-09-01):
-    // se cobran una sola vez acá, aparte de la suscripción del plan (mismo
-    // patrón que POST /billing/addons/activate: un customer/charge
-    // puntual + fila en tenant_addons con renewal_mode "manual" -- la
-    // renovación recurrente de estos add-ons la maneja el cron existente
-    // de chargeRecurringAddons si el tenant activa auto-renovación más
-    // adelante, igual que cualquier otro add-on comprado desde el
-    // dashboard). Nunca se re-calcula el monto desde nada guardado: se
-    // recalcula desde intent.addons (solo addon_key+quantity) con la
-    // misma función que validó el monto en /signup/start-paid. Si el
-    // cobro o el insert fallan, el tenant y su plan ya quedaron activos
-    // igual -- esto es best-effort y nunca debe tumbar el signup.
+    // Add-ons elegidos en /planes antes del checkout (fix 2026-09-01, ajustado
+    // 2026-09-05): se cobran una sola vez acá, aparte de la suscripción del
+    // plan. Los add-ons de Orbyx son intencionalmente solo de cobro mensual
+    // recurrente vía Flow (decisión de producto cerrada) -- no existe un
+    // "pago único" real, así que quedan en renewal_mode "automatico" desde
+    // el momento en que se activan, no en "manual" esperando que el tenant
+    // vuelva a buscarlos por separado (antes eso dejaba el toggle "Cobro
+    // automático mensual" apagado incluso recién comprado -- bug reportado
+    // por Camilo). El texto de consentimiento ya se mostró en el resumen de
+    // checkout-premium antes de pagar (ver checkout-premium/page.tsx) -- acá
+    // se reconstruye el mismo texto para dejarlo registrado en
+    // addon_auto_charge_consents junto con IP/user-agent de esta request.
+    // Nunca se re-calcula el monto desde nada guardado: se recalcula desde
+    // intent.addons (solo addon_key+quantity) con la misma función que
+    // validó el monto en /signup/start-paid. Si el cobro o el insert
+    // fallan, el tenant y su plan ya quedaron activos igual -- esto es
+    // best-effort y nunca debe tumbar el signup.
     try {
       const addonsCharge = computeSignupAddonsCharge(intent.addons, intent.plan_id);
       if (addonsCharge.valid && addonsCharge.items.length > 0 && intent.flow_customer_id) {
@@ -13537,7 +13557,7 @@ async function attemptSignupIntentTenantCreation(intent) {
             billing_cycle: "mensual",
             unit_price: item.unitPrice,
             status: "active",
-            renewal_mode: "manual",
+            renewal_mode: "automatico",
             last_charged_at: nowIso,
           });
           if (addonInsertErr) {
@@ -13545,6 +13565,19 @@ async function attemptSignupIntentTenantCreation(intent) {
               `signup_intent ${intent.id}: tenant ${tenant.id} - se cobró el add-on ${item.addon_key} pero falló el insert en tenant_addons (requiere corrección manual):`,
               addonInsertErr.message
             );
+          } else if (req) {
+            await recordAddonAutoChargeConsent({
+              tenant_id: tenant.id,
+              addon_key: item.addon_key,
+              consent_type: "renewal_mode",
+              req,
+              amount_shown: item.unitPrice * item.quantity,
+              text_shown: buildAddonRenewalConsentText(
+                addonDef?.name || item.addon_key,
+                item.quantity,
+                item.unitPrice
+              ),
+            });
           }
         }
       }
@@ -13707,7 +13740,7 @@ app.post(
 
       // intent.status === "paid" en este punto (recién marcado arriba, o ya
       // lo estaba de un golpe anterior del callback): crear el tenant.
-      const result = await attemptSignupIntentTenantCreation(intent);
+      const result = await attemptSignupIntentTenantCreation(intent, req);
 
       if (result.ok) {
         return res.redirect(`${frontendBase}/completar-registro?token=${result.recoveryToken}`);
@@ -13762,7 +13795,7 @@ app.get("/signup/resume", publicLimiter, async (req, res) => {
       });
 
       if (claimed) {
-        const result = await attemptSignupIntentTenantCreation(claimed);
+        const result = await attemptSignupIntentTenantCreation(claimed, req);
         current = {
           ...claimed,
           status: result.ok ? "completed" : "tenant_creation_failed",
