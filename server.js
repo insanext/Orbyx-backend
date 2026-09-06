@@ -28,6 +28,7 @@ const {
   formatDateCL,
   formatTimeCL,
 } = require("./whatsapp");
+const { compressImage } = require("./imageCompression");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -16934,14 +16935,15 @@ app.post("/upload/campaign-image", [dashboardLimiter, requireTenantAuth, require
       return res.status(400).json({ error: "Límite de imágenes alcanzado" });
     }
 
-    // 3. Subir a storage
-    const fileExt = req.file.mimetype.split("/")[1];
-    const filePath = `${business.id}/${Date.now()}.${fileExt}`;
+    // 3. Comprimir y subir a storage
+    const { buffer: compressedBuffer, contentType: compressedContentType, extension: compressedExt } =
+      await compressImage(req.file.buffer, "campana");
+    const filePath = `${business.id}/${Date.now()}.${compressedExt}`;
 
     const { error: uploadError } = await supabase.storage
       .from(BUCKET)
-      .upload(filePath, req.file.buffer, {
-        contentType: req.file.mimetype,
+      .upload(filePath, compressedBuffer, {
+        contentType: compressedContentType,
       });
 
     if (uploadError) {
@@ -16961,8 +16963,8 @@ app.post("/upload/campaign-image", [dashboardLimiter, requireTenantAuth, require
         tenant_id: business.id,
         file_path: filePath,
         public_url: publicUrl,
-        mime_type: req.file.mimetype,
-        size_bytes: req.file.size,
+        mime_type: compressedContentType,
+        size_bytes: compressedBuffer.length,
       })
       .select()
       .single();
@@ -17052,11 +17054,12 @@ app.post("/upload/ticket-attachment", [dashboardLimiter, requireTenantAuth], upl
     // tenant_id/timestamp-nombreOriginal, predecible dentro de una ventana
     // acotada). El bucket es privado — la URL pública ya no se usa para
     // mostrar el adjunto, ver GET /support/tickets/:id/attachment-url.
-    const fileExt = req.file.mimetype.split("/")[1] || "jpg";
-    const fileName = `${tenant_id}/${crypto.randomUUID()}.${fileExt}`;
+    const { buffer: compressedBuffer, contentType: compressedContentType, extension: compressedExt } =
+      await compressImage(req.file.buffer, "documento");
+    const fileName = `${tenant_id}/${crypto.randomUUID()}.${compressedExt}`;
     const { error } = await supabase.storage
       .from("ticket-attachments")
-      .upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
+      .upload(fileName, compressedBuffer, { contentType: compressedContentType });
     if (error) throw error;
     const { data: urlData } = supabase.storage.from("ticket-attachments").getPublicUrl(fileName);
     res.json({ url: urlData.publicUrl });
