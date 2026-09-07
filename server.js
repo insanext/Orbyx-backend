@@ -1405,6 +1405,25 @@ app.use(corsUnlessFlowInbound);
 app.options(/.*/, corsUnlessFlowInbound);
 app.use(jsonUnlessFlowInbound);
 
+// --- INSTRUMENTACIÓN TEMPORAL DE PERFORMANCE (diagnóstico 2026-09-06) ---
+// Mide el tiempo total de cada request autenticado del dashboard vs. lo que
+// tarda específicamente supabase.auth.getUser() y la resolución de
+// tenant_id/membership, para confirmar si ahí está el cuello de botella de
+// ~5s reportado en Agenda/Staff/Servicios/Sucursales/Negocio. Solo loguea
+// requests con Authorization (dashboard), no tráfico público. Remover una
+// vez confirmado (o descartado) el diagnóstico.
+app.use((req, res, next) => {
+  if (!req.headers.authorization) return next();
+  req.__perfStart = Date.now();
+  res.on("finish", () => {
+    const total = Date.now() - req.__perfStart;
+    console.log(
+      `[PERF] ${req.method} ${req.originalUrl} status=${res.statusCode} total=${total}ms getUser=${req.__perfGetUserMs ?? "n/a"}ms tenantUsers=${req.__perfTenantUsersMs ?? "n/a"}ms branchAccess=${req.__perfBranchAccessMs ?? "n/a"}ms slugTenantLookup=${req.__perfSlugLookupMs ?? "n/a"}ms`
+    );
+  });
+  next();
+});
+
 const publicLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 100,
@@ -1443,7 +1462,9 @@ async function requireTenantAuth(req, res, next) {
       return res.status(401).json({ error: "Token requerido" });
     }
     const token = authHeader.split(" ")[1];
+    const __perfGetUserStart = Date.now(); // instrumentación temporal, ver arriba
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    req.__perfGetUserMs = Date.now() - __perfGetUserStart;
     if (authError || !user) {
       return res.status(401).json({ error: "Token inválido o sesión expirada" });
     }
@@ -1457,6 +1478,7 @@ async function requireTenantAuth(req, res, next) {
 
 async function resolveTenantMembership(req, res, tenantId) {
   const userId = req.authenticatedUser.user_id;
+  const __perfTenantUsersStart = Date.now(); // instrumentación temporal, ver arriba
   const { data: membership, error: membershipError } = await supabase
     .from("tenant_users")
     .select("tenant_id, role, is_active, permissions")
@@ -1464,15 +1486,18 @@ async function resolveTenantMembership(req, res, tenantId) {
     .eq("tenant_id", tenantId)
     .eq("is_active", true)
     .single();
+  req.__perfTenantUsersMs = Date.now() - __perfTenantUsersStart;
   if (membershipError || !membership) {
     return null;
   }
+  const __perfBranchAccessStart = Date.now(); // instrumentación temporal, ver arriba
   const { data: branchRows } = await supabase
     .from("branch_access")
     .select("branch_id")
     .eq("user_id", userId)
     .eq("tenant_id", tenantId)
     .eq("is_active", true);
+  req.__perfBranchAccessMs = Date.now() - __perfBranchAccessStart;
   req.authenticatedUser = {
     user_id: userId,
     tenant_id: tenantId,
@@ -1613,12 +1638,14 @@ async function enforceTenantId(req, res, next) {
 async function enforceSlugOwnership(req, res, next) {
   const slug = req.params.slug || req.body?.slug || req.query?.slug;
   if (!slug) return next();
+  const __perfSlugLookupStart = Date.now(); // instrumentación temporal, ver arriba
   const { data: tenant } = await supabase
     .from("tenants")
     .select("id")
     .eq("slug", slug)
     .eq("is_active", true)
     .single();
+  req.__perfSlugLookupMs = Date.now() - __perfSlugLookupStart;
   if (!tenant) {
     return res.status(404).json({ error: "Negocio no encontrado" });
   }
