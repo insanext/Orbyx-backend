@@ -1455,6 +1455,58 @@ const passwordVerifyLimiter = rateLimit({
 // =======================
 // AUTH MIDDLEWARE — TENANT DASHBOARD
 // =======================
+
+// Caché corto de supabase.auth.getUser() (perf fix 2026-09-07, ver [PERF]
+// arriba): cada carga de página del dashboard dispara ~11-14 requests con
+// el mismo Bearer token, y cada una repetía el round-trip de red completo
+// a Supabase Auth (~200-250ms medidos, con picos de hasta 600ms) solo para
+// validar el mismo token. TTL corto (30s) y además acotado por el `exp`
+// real del JWT: nunca sirve un token como válido más allá de su propia
+// expiración, sin importar el TTL. Solo se cachean validaciones exitosas
+// — un token inválido/expirado nunca queda cacheado. El chequeo de
+// membresía (tenant_users.is_active) sigue sin caché en cada request, así
+// que desactivar a un usuario le corta el acceso de inmediato igual que
+// antes, sin depender de este caché.
+const AUTH_GETUSER_CACHE_TTL_MS = 30 * 1000;
+const authGetUserCache = new Map(); // token -> { user, expiresAt }
+
+function decodeJwtExpiryMs(token) {
+  try {
+    const payload = token.split(".")[1];
+    const decoded = JSON.parse(Buffer.from(payload, "base64").toString("utf8"));
+    return typeof decoded.exp === "number" ? decoded.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getUserCached(token) {
+  const now = Date.now();
+  const cached = authGetUserCache.get(token);
+  if (cached && cached.expiresAt > now) {
+    return { data: { user: cached.user }, error: null };
+  }
+
+  const result = await supabase.auth.getUser(token);
+
+  if (!result.error && result.data?.user) {
+    const jwtExpiryMs = decodeJwtExpiryMs(token);
+    const expiresAt = jwtExpiryMs
+      ? Math.min(now + AUTH_GETUSER_CACHE_TTL_MS, jwtExpiryMs)
+      : now + AUTH_GETUSER_CACHE_TTL_MS;
+    authGetUserCache.set(token, { user: result.data.user, expiresAt });
+
+    // Limpieza perezosa para no crecer sin límite (sin cron/timer extra).
+    if (authGetUserCache.size > 500) {
+      for (const [key, value] of authGetUserCache) {
+        if (value.expiresAt <= now) authGetUserCache.delete(key);
+      }
+    }
+  }
+
+  return result;
+}
+
 async function requireTenantAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
@@ -1463,7 +1515,7 @@ async function requireTenantAuth(req, res, next) {
     }
     const token = authHeader.split(" ")[1];
     const __perfGetUserStart = Date.now(); // instrumentación temporal, ver arriba
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    const { data: { user }, error: authError } = await getUserCached(token);
     req.__perfGetUserMs = Date.now() - __perfGetUserStart;
     if (authError || !user) {
       return res.status(401).json({ error: "Token inválido o sesión expirada" });
@@ -6398,7 +6450,6 @@ const { data: tenant, error: tenantError } = await supabase
 ====================================================== */
 app.get("/appointments/by-range/:slug", tenantAuthSlug, async (req, res) => {
   try {
-    const { slug } = req.params;
     const { from, to, branch_id, staff_id } = req.query;
 
     if (!from || !to) {
@@ -6407,15 +6458,9 @@ app.get("/appointments/by-range/:slug", tenantAuthSlug, async (req, res) => {
       });
     }
 
-    const { data: tenant, error: tenantError } = await supabase
-      .from("tenants")
-      .select("id")
-      .eq("slug", slug)
-      .single();
-
-    if (tenantError || !tenant) {
-      return res.status(404).json({ error: "Negocio no encontrado" });
-    }
+    // tenantAuthSlug (enforceSlugOwnership) ya resolvió y validó el tenant
+    // del slug — se reutiliza en vez de volver a consultar "tenants".
+    const tenantId = req.authenticatedUser.tenant_id;
 
 const start = new Date(`${from}T00:00:00-04:00`).toISOString();
 const end = new Date(`${to}T23:59:59-04:00`).toISOString();
@@ -6423,7 +6468,7 @@ const end = new Date(`${to}T23:59:59-04:00`).toISOString();
     let query = supabase
       .from("appointments")
       .select("*")
-      .eq("tenant_id", tenant.id)
+      .eq("tenant_id", tenantId)
       .gte("start_at", start)
       .lte("start_at", end)
       .order("start_at", { ascending: true });
@@ -6513,23 +6558,16 @@ function formatDateForServer(date) {
 ====================================================== */
 app.get("/appointments/pending-close/:slug", tenantAuthSlug, async (req, res) => {
   try {
-    const { slug } = req.params;
     const { branch_id, staff_id } = req.query;
 
-    const { data: tenant, error: tenantError } = await supabase
-      .from("tenants")
-      .select("id")
-      .eq("slug", slug)
-      .single();
-
-    if (tenantError || !tenant) {
-      return res.status(404).json({ error: "Negocio no encontrado" });
-    }
+    // tenantAuthSlug (enforceSlugOwnership) ya resolvió y validó el tenant
+    // del slug — se reutiliza en vez de volver a consultar "tenants".
+    const tenantId = req.authenticatedUser.tenant_id;
 
     let query = supabase
       .from("appointments")
       .select("*")
-      .eq("tenant_id", tenant.id)
+      .eq("tenant_id", tenantId)
       .eq("status", "booked")
       .lt("start_at", new Date().toISOString())
       .order("start_at", { ascending: true });
@@ -10002,23 +10040,16 @@ const nextControl = resolveNextControlDate({
 ====================================================== */
 app.get("/appointments/clinical-pending/:slug", tenantAuthSlug, async (req, res) => {
   try {
-    const { slug } = req.params;
     const { branch_id, staff_id } = req.query;
 
-    const { data: tenant, error: tenantError } = await supabase
-      .from("tenants")
-      .select("id")
-      .eq("slug", slug)
-      .single();
-
-    if (tenantError || !tenant) {
-      return res.status(404).json({ error: "Negocio no encontrado" });
-    }
+    // tenantAuthSlug (enforceSlugOwnership) ya resolvió y validó el tenant
+    // del slug — se reutiliza en vez de volver a consultar "tenants".
+    const tenantId = req.authenticatedUser.tenant_id;
 
     let query = supabase
       .from("appointments")
       .select("*")
-      .eq("tenant_id", tenant.id)
+      .eq("tenant_id", tenantId)
       .eq("status", "completed")
       .eq("clinical_note_pending", true)
       .order("start_at", { ascending: false });
