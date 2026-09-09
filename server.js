@@ -16427,115 +16427,121 @@ app.get("/jobs/send-reminders", [publicLimiter, requireSignupMaintenanceSecret],
 
 /* ======================================================
    🔔 RECORDATORIO POR WHATSAPP (1h/2h antes, por tenant)
-   Pensado para un cron externo (cron-job.org) cada 15-30 min, con el
-   mismo header x-maintenance-secret que /signup/maintenance/sweep y
-   /billing/addons/maintenance/charge-recurring.
+   Lógica extraída a función propia para que tanto el endpoint HTTP como
+   el cron interno (más abajo, junto a los otros 3 jobs programados)
+   llamen exactamente el mismo código.
 ====================================================== */
+async function sendWhatsAppReminders() {
+  const now = new Date();
+  // Debe ser >= al intervalo real del cron (interno o externo), para no
+  // dejar citas sin cubrir entre una corrida y la siguiente.
+  const marginMs = 30 * 60 * 1000;
+
+  // Ventana amplia que cubre tanto reminder_hours=1 como =2 (+ margen).
+  // El filtro fino por tenant (horas exactas configuradas) se hace
+  // abajo, fila por fila, porque reminder_hours varía por tenant.
+  const windowStart = new Date(now.getTime() + 1 * 60 * 60 * 1000);
+  const windowEnd = new Date(now.getTime() + 2 * 60 * 60 * 1000 + marginMs);
+
+  const { data: appointments, error } = await supabase
+    .from("appointments")
+    .select("id, tenant_id, customer_name, customer_phone, start_at")
+    .eq("status", "booked")
+    .eq("wa_recordatorio_enviado", false)
+    .gte("start_at", windowStart.toISOString())
+    .lte("start_at", windowEnd.toISOString());
+
+  if (error) throw new Error(error.message);
+
+  let sent = 0;
+  let skippedByCap = 0;
+
+  for (const appt of appointments || []) {
+    if (!appt.customer_phone) continue;
+
+    const { data: tenantInfo } = await supabase
+      .from("tenants")
+      .select("name, address, wa_reminder_enabled, wa_reminder_hours_before")
+      .eq("id", appt.tenant_id)
+      .single();
+
+    if (!tenantInfo?.wa_reminder_enabled) continue;
+
+    const reminderHours = [1, 2].includes(Number(tenantInfo.wa_reminder_hours_before))
+      ? Number(tenantInfo.wa_reminder_hours_before)
+      : 1;
+
+    const targetSendAt = new Date(
+      new Date(appt.start_at).getTime() - reminderHours * 60 * 60 * 1000
+    );
+
+    // Todavía no llega la hora de enviar este recordatorio en particular.
+    if (now.getTime() < targetSendAt.getTime()) continue;
+    // Ya pasó la ventana de margen (el cron se atrasó o esta cita quedó
+    // fuera de rango) — no reenviar fuera de tiempo.
+    if (now.getTime() > targetSendAt.getTime() + marginMs) continue;
+
+    const waUsage = await checkMonthlyUsage(appt.tenant_id, "wa_confirmacion");
+    if (!waUsage.allowed) {
+      console.warn(
+        `WhatsApp recordatorio omitido: tenant ${appt.tenant_id} alcanzó su cupo mensual (wa_confirmacion).`
+      );
+      skippedByCap++;
+      continue;
+    }
+
+    const waResult = await sendWhatsAppTemplate({
+      to: appt.customer_phone,
+      contentSid: process.env.TEMPLATE_RECORDATORIO_SID,
+      variables: {
+        1: appt.customer_name || "",
+        2: tenantInfo.name || "Tu negocio",
+        3: formatTimeCL(appt.start_at),
+        4: tenantInfo.address || "",
+      },
+    });
+
+    if (!waResult.ok) {
+      console.warn(
+        `WhatsApp recordatorio no enviado (tenant ${appt.tenant_id}):`,
+        waResult.reason
+      );
+      continue;
+    }
+
+    await trackWhatsAppMessage({
+      messageSid: waResult.sid,
+      tenantId: appt.tenant_id,
+      resource: "wa_confirmacion",
+    });
+
+    // Se marca enviado ANTES que nada más pueda fallar después: evita
+    // reenvíos si el cron vuelve a correr dentro de la misma ventana.
+    await supabase
+      .from("appointments")
+      .update({ wa_recordatorio_enviado: true })
+      .eq("id", appt.id);
+
+    sent++;
+  }
+
+  return { sent, skippedByCap };
+}
+
+// POST /whatsapp/maintenance/send-reminders
+// Respaldo manual / cron externo (cron-job.org) — el disparo real en
+// producción es el cron interno de abajo, que llama a la misma función.
 app.post(
   "/whatsapp/maintenance/send-reminders",
   publicLimiter,
   requireSignupMaintenanceSecret,
   async (req, res) => {
     try {
-      const now = new Date();
-      // Debe ser >= al intervalo real del cron externo, para no dejar citas
-      // sin cubrir entre una corrida y la siguiente.
-      const marginMs = 30 * 60 * 1000;
-
-      // Ventana amplia que cubre tanto reminder_hours=1 como =2 (+ margen).
-      // El filtro fino por tenant (horas exactas configuradas) se hace
-      // abajo, fila por fila, porque reminder_hours varía por tenant.
-      const windowStart = new Date(now.getTime() + 1 * 60 * 60 * 1000);
-      const windowEnd = new Date(now.getTime() + 2 * 60 * 60 * 1000 + marginMs);
-
-      const { data: appointments, error } = await supabase
-        .from("appointments")
-        .select("id, tenant_id, customer_name, customer_phone, start_at")
-        .eq("status", "booked")
-        .eq("wa_recordatorio_enviado", false)
-        .gte("start_at", windowStart.toISOString())
-        .lte("start_at", windowEnd.toISOString());
-
-      if (error) {
-        return res.status(500).json({ error: error.message });
-      }
-
-      let sent = 0;
-      let skippedByCap = 0;
-
-      for (const appt of appointments || []) {
-        if (!appt.customer_phone) continue;
-
-        const { data: tenantInfo } = await supabase
-          .from("tenants")
-          .select("name, address, wa_reminder_enabled, wa_reminder_hours_before")
-          .eq("id", appt.tenant_id)
-          .single();
-
-        if (!tenantInfo?.wa_reminder_enabled) continue;
-
-        const reminderHours = [1, 2].includes(Number(tenantInfo.wa_reminder_hours_before))
-          ? Number(tenantInfo.wa_reminder_hours_before)
-          : 1;
-
-        const targetSendAt = new Date(
-          new Date(appt.start_at).getTime() - reminderHours * 60 * 60 * 1000
-        );
-
-        // Todavía no llega la hora de enviar este recordatorio en particular.
-        if (now.getTime() < targetSendAt.getTime()) continue;
-        // Ya pasó la ventana de margen (el cron se atrasó o esta cita quedó
-        // fuera de rango) — no reenviar fuera de tiempo.
-        if (now.getTime() > targetSendAt.getTime() + marginMs) continue;
-
-        const waUsage = await checkMonthlyUsage(appt.tenant_id, "wa_confirmacion");
-        if (!waUsage.allowed) {
-          console.warn(
-            `WhatsApp recordatorio omitido: tenant ${appt.tenant_id} alcanzó su cupo mensual (wa_confirmacion).`
-          );
-          skippedByCap++;
-          continue;
-        }
-
-        const waResult = await sendWhatsAppTemplate({
-          to: appt.customer_phone,
-          contentSid: process.env.TEMPLATE_RECORDATORIO_SID,
-          variables: {
-            1: appt.customer_name || "",
-            2: tenantInfo.name || "Tu negocio",
-            3: formatTimeCL(appt.start_at),
-            4: tenantInfo.address || "",
-          },
-        });
-
-        if (!waResult.ok) {
-          console.warn(
-            `WhatsApp recordatorio no enviado (tenant ${appt.tenant_id}):`,
-            waResult.reason
-          );
-          continue;
-        }
-
-        await trackWhatsAppMessage({
-          messageSid: waResult.sid,
-          tenantId: appt.tenant_id,
-          resource: "wa_confirmacion",
-        });
-
-        // Se marca enviado ANTES que nada más pueda fallar después: evita
-        // reenvíos si el cron vuelve a correr dentro de la misma ventana.
-        await supabase
-          .from("appointments")
-          .update({ wa_recordatorio_enviado: true })
-          .eq("id", appt.id);
-
-        sent++;
-      }
-
+      const result = await sendWhatsAppReminders();
       return res.json({
         ok: true,
-        reminders_sent: sent,
-        skipped_by_cap: skippedByCap,
+        reminders_sent: result.sent,
+        skipped_by_cap: result.skippedByCap,
       });
     } catch (err) {
       return res.status(500).json({ error: err.message });
@@ -18693,10 +18699,10 @@ app.listen(PORT, () => {
 // =======================
 // TAREAS PROGRAMADAS INTERNAS (node-cron)
 // =======================
-// Reemplazan la necesidad de crons externos (cron-job.org) para estos 3
+// Reemplazan la necesidad de crons externos (cron-job.org) para estos 4
 // jobs: llaman directo a la misma función que ya usa el endpoint HTTP
 // equivalente, así que el comportamiento y el resultado son idénticos.
-// Los 3 endpoints HTTP siguen funcionando igual (protegidos con
+// Los 4 endpoints HTTP siguen funcionando igual (protegidos con
 // x-maintenance-secret) — esto es solo una vía adicional de disparo.
 
 cron.schedule("*/5 * * * *", async () => {
@@ -18730,6 +18736,18 @@ cron.schedule("0 5 * * *", async () => {
     );
   } catch (err) {
     console.error("[CRON] billing/addons/maintenance/charge-recurring: falló —", err.message);
+  }
+});
+
+cron.schedule("*/10 * * * *", async () => {
+  console.log("[CRON] whatsapp/maintenance/send-reminders: iniciando...");
+  try {
+    const result = await sendWhatsAppReminders();
+    console.log(
+      `[CRON] whatsapp/maintenance/send-reminders: terminado — sent=${result.sent} skippedByCap=${result.skippedByCap}`
+    );
+  } catch (err) {
+    console.error("[CRON] whatsapp/maintenance/send-reminders: falló —", err.message);
   }
 });
 
