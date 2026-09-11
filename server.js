@@ -1405,6 +1405,12 @@ app.use(corsUnlessFlowInbound);
 app.options(/.*/, corsUnlessFlowInbound);
 app.use(jsonUnlessFlowInbound);
 
+// Health check liviano, sin auth, para keep-alive externo (Render Free duerme
+// el servicio tras ~15 min sin tráfico) y para monitoreo básico de uptime.
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 // --- INSTRUMENTACIÓN TEMPORAL DE PERFORMANCE (diagnóstico 2026-09-06) ---
 // Mide el tiempo total de cada request autenticado del dashboard vs. lo que
 // tarda específicamente supabase.auth.getUser() y la resolución de
