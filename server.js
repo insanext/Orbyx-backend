@@ -7094,13 +7094,48 @@ app.get("/stats/:slug", tenantAuthSlug, async (req, res) => {
       .sort((a, b) => Number(b.total_visits || 0) - Number(a.total_visits || 0))
       .slice(0, 15);
 
+    // "Inactivos" debe basarse en la ÚLTIMA VISITA COMPLETADA, no en
+    // customers.last_visit_at (que se actualiza con cualquier reserva no
+    // cancelada — ver recalculateCustomerStats — incluyendo no-show/booked/
+    // rescheduled). Con el criterio viejo, un cliente que solo tuvo
+    // reservas canceladas/no-show y NUNCA asistió terminaba mostrándose
+    // como "inactivo" cuando en realidad nunca fue un cliente activo. Se
+    // recalcula acá con datos reales de citas completadas, independiente
+    // de `segment` (que solo se usa arriba para "activos").
+    const customerIdsForStats = (customerRows || []).map((c) => c.id);
+    const completedByCustomer = new Map();
+    if (customerIdsForStats.length > 0) {
+      const { data: completedRows, error: completedRowsError } = await supabase
+        .from("appointments")
+        .select("customer_id, start_at")
+        .eq("tenant_id", tenant.id)
+        .eq("status", "completed")
+        .in("customer_id", customerIdsForStats);
+      if (completedRowsError) throw completedRowsError;
+      for (const row of completedRows || []) {
+        if (!row.customer_id) continue;
+        const startAtMs = row.start_at ? new Date(row.start_at).getTime() : 0;
+        const prev = completedByCustomer.get(row.customer_id);
+        if (prev) {
+          prev.count += 1;
+          if (startAtMs > prev.lastCompletedAt) prev.lastCompletedAt = startAtMs;
+        } else {
+          completedByCustomer.set(row.customer_id, { count: 1, lastCompletedAt: startAtMs });
+        }
+      }
+    }
+
     const inactiveCustomers = classifiedCustomers
-      .filter((c) => c.segment === "inactive")
-      .sort((a, b) => {
-        const at = a.last_visit_at ? new Date(a.last_visit_at).getTime() : 0;
-        const bt = b.last_visit_at ? new Date(b.last_visit_at).getTime() : 0;
-        return bt - at;
+      .map((c) => {
+        const completed = completedByCustomer.get(c.id);
+        // Sin ninguna visita completada: no es "inactivo", es un caso
+        // distinto (reservó pero nunca asistió) — se excluye de esta lista.
+        if (!completed || completed.count === 0) return null;
+        if (completed.lastCompletedAt > inactiveCutoff.getTime()) return null;
+        return { ...c, total_visits: completed.count, last_visit_at: new Date(completed.lastCompletedAt).toISOString() };
       })
+      .filter((c) => c !== null)
+      .sort((a, b) => new Date(b.last_visit_at).getTime() - new Date(a.last_visit_at).getTime())
       .slice(0, 15);
 
     // ---- Servicios más reservados ----
@@ -7450,7 +7485,49 @@ app.get("/stats/:slug", tenantAuthSlug, async (req, res) => {
           waDelivery.total > 0 ? Number(((deliveredOrRead / waDelivery.total) * 100).toFixed(1)) : 0;
       }
 
+      // ---- Tasa de conversión + nuevos vs. recurrentes (del período) ----
+      const conversionRate =
+        appointments.length > 0 ? Number(((byStatus.completed / appointments.length) * 100).toFixed(1)) : 0;
+
+      // "Nuevo" reusa el mismo criterio que basic.customers.new_in_period
+      // (customers.created_at dentro del rango) — no se inventa un segundo
+      // concepto de "nuevo". Se consulta solo para los clientes que
+      // realmente aparecen en las reservas del período (acotado, no los 500
+      // de customerRows) para no perder clientes fuera de ese top 500.
+      const periodCustomerIds = Array.from(new Set(appointments.map((a) => a.customer_id).filter(Boolean)));
+      const newCustomerIdSet = new Set();
+      if (periodCustomerIds.length > 0) {
+        const { data: periodCustomerRows, error: periodCustomerRowsError } = await supabase
+          .from("customers")
+          .select("id, created_at")
+          .eq("tenant_id", tenant.id)
+          .in("id", periodCustomerIds);
+        if (periodCustomerRowsError) throw periodCustomerRowsError;
+        for (const c of periodCustomerRows || []) {
+          if (c.created_at && c.created_at >= fromIso && c.created_at <= toIso) {
+            newCustomerIdSet.add(c.id);
+          }
+        }
+      }
+      let newCustomerAppts = 0;
+      let recurringCustomerAppts = 0;
+      for (const appt of appointments) {
+        if (!appt.customer_id) continue;
+        if (newCustomerIdSet.has(appt.customer_id)) newCustomerAppts++;
+        else recurringCustomerAppts++;
+      }
+      const newVsRecurringTotal = newCustomerAppts + recurringCustomerAppts;
+      const newVsRecurring = {
+        new_appointments: newCustomerAppts,
+        recurring_appointments: recurringCustomerAppts,
+        new_rate: newVsRecurringTotal > 0 ? Number(((newCustomerAppts / newVsRecurringTotal) * 100).toFixed(1)) : 0,
+        recurring_rate:
+          newVsRecurringTotal > 0 ? Number(((recurringCustomerAppts / newVsRecurringTotal) * 100).toFixed(1)) : 0,
+      };
+
       premiumTier = {
+        conversion_rate: conversionRate,
+        new_vs_recurring: newVsRecurring,
         occupancy_heatmap: occupancyHeatmap,
         avg_lead_time_hours: leadTimeCount > 0 ? Number((leadTimeSumHours / leadTimeCount).toFixed(1)) : null,
         revenue_estimated: {
