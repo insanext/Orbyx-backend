@@ -1626,6 +1626,7 @@ const WRITE_ACCESS_MODULE_RULES = [
   { prefix: "/pets", module: "clientes" },
   { prefix: "/clinical-notes", module: "clientes" },
   { prefix: "/customers", module: "clientes" },
+  { prefix: "/reviews", module: "clientes" },
   { prefix: "/appointments", module: "agenda" },
   { prefix: "/staff", module: "staff" },
   { prefix: "/service", module: "servicios" }, // cubre /services y /service-groups
@@ -2819,7 +2820,54 @@ async function upsertCustomerFromAppointment({
   return createdCustomer;
 }
 
+// Reviews — compartido entre check-eligibility y el submit público. Acepta
+// teléfono chileno o correo como identificador; devuelve null si no calza
+// con ninguno de los dos formatos (el caller responde 400).
+function normalizeReviewIdentifier(rawIdentifier) {
+  const raw = String(rawIdentifier || "").trim();
+  if (!raw) return null;
 
+  if (raw.includes("@")) {
+    return { type: "email", value: raw.toLowerCase() };
+  }
+
+  const phone = normalizeChileanPhone(raw);
+  if (!phone) return null;
+
+  return { type: "phone", value: phone };
+}
+
+// Elegibilidad = existe un customer del tenant con ese teléfono/correo Y
+// existe al menos una cita status='completed' de ese customer en ese
+// tenant. Se reverifica siempre server-side (nunca se confía en un
+// customer_id que venga del cliente) para no abrir una vía de IDOR.
+async function findEligibleCustomerForReview(tenantId, identifier) {
+  const column = identifier.type === "email" ? "email" : "phone";
+
+  const { data: customer, error: customerError } = await supabase
+    .from("customers")
+    .select("id, name")
+    .eq("tenant_id", tenantId)
+    .eq(column, identifier.value)
+    .maybeSingle();
+
+  if (customerError) throw customerError;
+  if (!customer) return null;
+
+  const { data: completedAppt, error: apptError } = await supabase
+    .from("appointments")
+    .select("id")
+    .eq("tenant_id", tenantId)
+    .eq("customer_id", customer.id)
+    .eq("status", "completed")
+    .limit(1)
+    .maybeSingle();
+
+  if (apptError) throw apptError;
+  if (!completedAppt) return null;
+
+  return customer;
+}
 
 
 async function resolvePetFromAppointment({
@@ -8093,6 +8141,10 @@ app.get("/customers/:slug", tenantAuthSlug, async (req, res) => {
     let rows = Array.isArray(data) ? data : [];
     let customerIds = rows.map((customer) => customer.id).filter(Boolean);
     const activityByCustomer = new Map();
+    // Usado por el botón "Pedir reseña" del dashboard (link wa.me manual, sin
+    // Twilio): solo debe mostrarse para clientes con >=1 cita 'completed',
+    // no simplemente total_visits > 0 (eso incluye booked/no_show/rescheduled).
+    const completedVisitByCustomer = new Set();
 
     if (customerIds.length > 0) {
       let activityQuery = supabase
@@ -8121,6 +8173,10 @@ app.get("/customers/:slug", tenantAuthSlug, async (req, res) => {
 
         const status = String(appt.status || "").toLowerCase();
         const isCanceled = ["canceled", "cancelled"].includes(status);
+
+        if (status === "completed") {
+          completedVisitByCustomer.add(customerId);
+        }
 
         if (!isCanceled) {
           current.total_visits += 1;
@@ -8188,6 +8244,7 @@ const isInactive =
         last_visit_at: activityLastVisitAt,
         segment: customerSegment,
         is_inactive: customerSegment === "inactive",
+        has_completed_visit: completedVisitByCustomer.has(customer.id),
       };
     });
 
@@ -8471,6 +8528,89 @@ app.patch("/customers/:id/extra-data", tenantAuthSlugWrite, async (req, res) => 
   } catch (err) {
     console.error("PATCH /customers/:id/extra-data error:", err.message);
     return res.status(500).json({ error: err.message || "Error guardando datos extra" });
+  }
+});
+
+/* ======================================================
+   ✅ GET /reviews/:slug
+   Dashboard: todas las reseñas del tenant, incluyendo ocultas y
+   private_feedback. Nunca usado desde la página pública.
+====================================================== */
+app.get("/reviews/:slug", tenantAuthSlug, async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data, error } = await supabase
+      .from("reviews")
+      .select(
+        "id, client_name, client_identifier, rating, comment, private_feedback, status, created_at, updated_at"
+      )
+      .eq("tenant_id", tenant.id)
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    return res.json({ reviews: data || [] });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ PATCH /reviews/:id/status
+   Moderación: ocultar/mostrar una reseña puntual (abuso/spam/ofensiva —
+   nunca por ser simplemente negativa, ver CLAUDE.md/product spec).
+====================================================== */
+app.patch("/reviews/:id/status", [dashboardLimiter, requireTenantAuth, requireWriteAccess], async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    const allowed = ["visible", "hidden"];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ error: "Estado inválido" });
+    }
+
+    const { data: review, error: reviewError } = await supabase
+      .from("reviews")
+      .select("id, tenant_id")
+      .eq("id", id)
+      .single();
+
+    if (reviewError || !review) {
+      return res.status(404).json({ error: "Reseña no encontrada" });
+    }
+
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, review.tenant_id, "clientes");
+    if (!hasWriteAccess) return;
+
+    const { data, error } = await supabase
+      .from("reviews")
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, review: data });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -16434,6 +16574,180 @@ return res.json({
       date,
       total: slots.length,
       slots,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /public/reviews/:slug/check-eligibility
+   Verifica si un teléfono/correo tiene al menos una cita completed en el
+   tenant, sin revelar información de otros clientes.
+====================================================== */
+app.post("/public/reviews/:slug/check-eligibility", publicLimiter, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { identifier } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const parsedIdentifier = normalizeReviewIdentifier(identifier);
+    if (!parsedIdentifier) {
+      return res.status(400).json({ error: "Ingresa un teléfono o correo válido" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const customer = await findEligibleCustomerForReview(tenant.id, parsedIdentifier);
+
+    if (!customer) {
+      return res.json({
+        eligible: false,
+        message: "No encontramos una visita completada asociada a este contacto.",
+      });
+    }
+
+    return res.json({ eligible: true, customer_name: customer.name || "" });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /public/reviews/:slug
+   Crea o actualiza (upsert, 1 reseña por cliente por tenant) una reseña.
+   Reverifica elegibilidad server-side siempre — nunca confía en un
+   customer_id enviado por el cliente.
+====================================================== */
+app.post("/public/reviews/:slug", publicLimiter, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { identifier, rating, comment, private_feedback } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const parsedIdentifier = normalizeReviewIdentifier(identifier);
+    if (!parsedIdentifier) {
+      return res.status(400).json({ error: "Ingresa un teléfono o correo válido" });
+    }
+
+    const numericRating = Number(rating);
+    if (!Number.isInteger(numericRating) || numericRating < 1 || numericRating > 5) {
+      return res.status(400).json({ error: "La calificación debe ser un número entre 1 y 5" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const customer = await findEligibleCustomerForReview(tenant.id, parsedIdentifier);
+
+    if (!customer) {
+      return res.status(403).json({
+        error: "No encontramos una visita completada asociada a este contacto.",
+      });
+    }
+
+    const trimmedComment = comment ? String(comment).trim().slice(0, 300) : "";
+    // private_feedback solo se guarda si el rating es bajo (<=3) — ver spec
+    // de producto. Un rating alto nunca debería traer texto acá, pero por
+    // si el cliente ya había dejado uno bajo antes y ahora sube el rating,
+    // se limpia explícitamente en vez de arrastrar el feedback anterior.
+    const trimmedPrivateFeedback =
+      numericRating <= 3 && private_feedback
+        ? String(private_feedback).trim().slice(0, 500)
+        : "";
+
+    const { data, error } = await supabase
+      .from("reviews")
+      .upsert(
+        {
+          tenant_id: tenant.id,
+          customer_id: customer.id,
+          client_identifier: parsedIdentifier.value,
+          client_name: customer.name || null,
+          rating: numericRating,
+          comment: trimmedComment || null,
+          private_feedback: trimmedPrivateFeedback || null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "tenant_id,customer_id" }
+      )
+      .select("id, rating, comment")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, review: data });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ GET /public/reviews/:slug
+   Reseñas visibles + promedio + conteo, para la página pública.
+   NUNCA devuelve private_feedback, client_identifier ni status.
+====================================================== */
+app.get("/public/reviews/:slug", publicLimiter, async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data: visibleReviews, error: reviewsError } = await supabase
+      .from("reviews")
+      .select("id, client_name, rating, comment, created_at")
+      .eq("tenant_id", tenant.id)
+      .eq("status", "visible")
+      .order("created_at", { ascending: false })
+      .limit(200);
+
+    if (reviewsError) throw reviewsError;
+
+    const rows = visibleReviews || [];
+    const count = rows.length;
+    const average =
+      count > 0 ? rows.reduce((sum, r) => sum + r.rating, 0) / count : 0;
+
+    return res.json({
+      average: Math.round(average * 10) / 10,
+      count,
+      reviews: rows,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
