@@ -2837,6 +2837,22 @@ function normalizeReviewIdentifier(rawIdentifier) {
   return { type: "phone", value: phone };
 }
 
+// Extraído para no repetir la misma consulta en findEligibleCustomerForReview
+// y findEligibleCustomerById (verificación por token, ver ronda 2).
+async function hasCompletedAppointment(tenantId, customerId) {
+  const { data: completedAppt, error: apptError } = await supabase
+    .from("appointments")
+    .select("id")
+    .eq("tenant_id", tenantId)
+    .eq("customer_id", customerId)
+    .eq("status", "completed")
+    .limit(1)
+    .maybeSingle();
+
+  if (apptError) throw apptError;
+  return Boolean(completedAppt);
+}
+
 // Elegibilidad = existe un customer del tenant con ese teléfono/correo Y
 // existe al menos una cita status='completed' de ese customer en ese
 // tenant. Se reverifica siempre server-side (nunca se confía en un
@@ -2854,19 +2870,49 @@ async function findEligibleCustomerForReview(tenantId, identifier) {
   if (customerError) throw customerError;
   if (!customer) return null;
 
-  const { data: completedAppt, error: apptError } = await supabase
-    .from("appointments")
-    .select("id")
-    .eq("tenant_id", tenantId)
-    .eq("customer_id", customer.id)
-    .eq("status", "completed")
-    .limit(1)
-    .maybeSingle();
-
-  if (apptError) throw apptError;
-  if (!completedAppt) return null;
+  if (!(await hasCompletedAppointment(tenantId, customer.id))) return null;
 
   return customer;
+}
+
+// Misma elegibilidad que findEligibleCustomerForReview, pero partiendo de un
+// customer_id conocido en vez de un teléfono/correo — usado por el link
+// personalizado con token (ver "Pedir reseña" en Clientes/Agenda, ronda 2).
+async function findEligibleCustomerById(tenantId, customerId) {
+  if (!customerId) return null;
+
+  const { data: customer, error: customerError } = await supabase
+    .from("customers")
+    .select("id, name, phone, email")
+    .eq("tenant_id", tenantId)
+    .eq("id", customerId)
+    .maybeSingle();
+
+  if (customerError) throw customerError;
+  if (!customer) return null;
+
+  if (!(await hasCompletedAppointment(tenantId, customer.id))) return null;
+
+  return customer;
+}
+
+// Token público y no adivinable que reemplaza la verificación manual cuando
+// el negocio ya le manda el link directo al cliente por WhatsApp (ver
+// POST /reviews/:slug/request-link). Un row por (tenant, customer) — se
+// reutiliza el mismo token en pedidos repetidos, ver esa ruta.
+async function findCustomerByReviewToken(tenantId, token) {
+  if (!token) return null;
+
+  const { data, error } = await supabase
+    .from("review_request_tokens")
+    .select("customer_id, tenant_id")
+    .eq("token", token)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data || data.tenant_id !== tenantId) return null;
+
+  return data;
 }
 
 
@@ -8566,6 +8612,88 @@ app.get("/reviews/:slug", tenantAuthSlug, async (req, res) => {
     if (error) throw error;
 
     return res.json({ reviews: data || [] });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /reviews/:slug/request-link
+   Genera (o reutiliza) el token del link personalizado de reseña para un
+   cliente puntual — usado por el botón "Pedir reseña" en Clientes y en el
+   modal de Detalle de reserva de Agenda. Un token por (tenant, customer):
+   si ya existe, se devuelve el mismo (así el link enviado es siempre
+   estable aunque se pida varias veces).
+====================================================== */
+app.post("/reviews/:slug/request-link", tenantAuthSlugWrite, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { customer_id } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+    if (!customer_id) {
+      return res.status(400).json({ error: "customer_id es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const customer = await findEligibleCustomerById(tenant.id, customer_id);
+    if (!customer) {
+      return res.status(400).json({
+        error: "Este cliente no tiene una visita completada en este negocio.",
+      });
+    }
+
+    const { data: existingToken, error: existingError } = await supabase
+      .from("review_request_tokens")
+      .select("token")
+      .eq("tenant_id", tenant.id)
+      .eq("customer_id", customer.id)
+      .maybeSingle();
+
+    if (existingError) throw existingError;
+
+    let token = existingToken?.token;
+
+    if (!token) {
+      token = crypto.randomBytes(24).toString("hex");
+
+      const { error: insertError } = await supabase
+        .from("review_request_tokens")
+        .insert({ token, tenant_id: tenant.id, customer_id: customer.id });
+
+      if (insertError) {
+        // Carrera entre 2 clics simultáneos contra el UNIQUE(tenant_id,
+        // customer_id) — recupera el token que ganó la carrera en vez de
+        // fallar.
+        if (insertError.code === "23505") {
+          const { data: raceToken, error: raceError } = await supabase
+            .from("review_request_tokens")
+            .select("token")
+            .eq("tenant_id", tenant.id)
+            .eq("customer_id", customer.id)
+            .single();
+
+          if (raceError) throw raceError;
+          token = raceToken.token;
+        } else {
+          throw insertError;
+        }
+      }
+    }
+
+    return res.json({ token, customer_name: customer.name || "" });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -16626,23 +16754,75 @@ app.post("/public/reviews/:slug/check-eligibility", publicLimiter, async (req, r
 });
 
 /* ======================================================
+   ✅ POST /public/reviews/:slug/verify-token
+   Verifica el link personalizado (?t=<token>) generado por "Pedir reseña".
+   Reemplaza la verificación manual por teléfono/correo cuando el negocio ya
+   le mandó el link directo al cliente — misma regla de elegibilidad
+   (cita completed) que check-eligibility, nunca expone datos de otros
+   clientes.
+====================================================== */
+app.post("/public/reviews/:slug/verify-token", publicLimiter, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { token } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+    if (!token) {
+      return res.status(400).json({ error: "token es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const tokenRow = await findCustomerByReviewToken(tenant.id, token);
+    if (!tokenRow) {
+      return res.json({ eligible: false, message: "Este link ya no es válido." });
+    }
+
+    const customer = await findEligibleCustomerById(tenant.id, tokenRow.customer_id);
+    if (!customer) {
+      return res.json({ eligible: false, message: "Este link ya no es válido." });
+    }
+
+    return res.json({ eligible: true, customer_name: customer.name || "" });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    ✅ POST /public/reviews/:slug
    Crea o actualiza (upsert, 1 reseña por cliente por tenant) una reseña.
    Reverifica elegibilidad server-side siempre — nunca confía en un
-   customer_id enviado por el cliente.
+   customer_id enviado por el cliente. Acepta identificación por `token`
+   (link personalizado, ver request-link) o por `identifier`
+   (teléfono/correo, flujo manual de fallback).
 ====================================================== */
 app.post("/public/reviews/:slug", publicLimiter, async (req, res) => {
   try {
     const { slug } = req.params;
-    const { identifier, rating, comment, private_feedback } = req.body;
+    const { identifier, token, rating, comment, private_feedback } = req.body;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
     }
 
-    const parsedIdentifier = normalizeReviewIdentifier(identifier);
-    if (!parsedIdentifier) {
-      return res.status(400).json({ error: "Ingresa un teléfono o correo válido" });
+    let parsedIdentifier = null;
+    if (!token) {
+      parsedIdentifier = normalizeReviewIdentifier(identifier);
+      if (!parsedIdentifier) {
+        return res.status(400).json({ error: "Ingresa un teléfono o correo válido" });
+      }
     }
 
     const numericRating = Number(rating);
@@ -16661,7 +16841,23 @@ app.post("/public/reviews/:slug", publicLimiter, async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    const customer = await findEligibleCustomerForReview(tenant.id, parsedIdentifier);
+    let customer = null;
+    let clientIdentifier = null;
+
+    if (token) {
+      const tokenRow = await findCustomerByReviewToken(tenant.id, token);
+      if (tokenRow) {
+        customer = await findEligibleCustomerById(tenant.id, tokenRow.customer_id);
+      }
+      // client_identifier siempre debe quedar registrado (columna NOT NULL,
+      // usada para mostrarlo en el dashboard) — con token no hay un
+      // teléfono/correo tipeado por el cliente, así que se usa el que ya
+      // tiene guardado el customer.
+      clientIdentifier = customer?.phone || customer?.email || "link personalizado";
+    } else {
+      customer = await findEligibleCustomerForReview(tenant.id, parsedIdentifier);
+      clientIdentifier = parsedIdentifier.value;
+    }
 
     if (!customer) {
       return res.status(403).json({
@@ -16685,7 +16881,7 @@ app.post("/public/reviews/:slug", publicLimiter, async (req, res) => {
         {
           tenant_id: tenant.id,
           customer_id: customer.id,
-          client_identifier: parsedIdentifier.value,
+          client_identifier: clientIdentifier,
           client_name: customer.name || null,
           rating: numericRating,
           comment: trimmedComment || null,
