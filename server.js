@@ -6679,6 +6679,31 @@ const end = new Date(`${to}T23:59:59-04:00`).toISOString();
       staffById = new Map((staffRows || []).map((staff) => [staff.id, staff]));
     }
 
+    // Usado por el botón "Pedir reseña" del modal de Detalle de reserva: si
+    // el cliente de esta cita ya tiene una fila en `reviews` (upsert único
+    // por tenant_id+customer_id), el botón se reemplaza por un indicador
+    // "Ya reseñó" — mismo criterio que GET /customers/:slug.
+    const customerIds = [
+      ...new Set((appointments || []).map((appt) => appt.customer_id).filter(Boolean)),
+    ];
+
+    const reviewedCustomerIds = new Set();
+    if (customerIds.length > 0) {
+      const { data: reviewRows, error: reviewsError } = await supabase
+        .from("reviews")
+        .select("customer_id")
+        .eq("tenant_id", tenantId)
+        .in("customer_id", customerIds);
+
+      if (reviewsError) {
+        return res.status(500).json({ error: reviewsError.message });
+      }
+
+      for (const review of reviewRows || []) {
+        if (review.customer_id) reviewedCustomerIds.add(review.customer_id);
+      }
+    }
+
     const enrichedAppointments = (appointments || []).map((appt) => {
       const service = appt.service_id ? servicesById.get(appt.service_id) : null;
       const staff = appt.staff_id ? staffById.get(appt.staff_id) : null;
@@ -6688,6 +6713,7 @@ const end = new Date(`${to}T23:59:59-04:00`).toISOString();
         service_is_group: Boolean(service?.is_group),
         service_capacity: service ? Number(service.capacity || 1) : null,
         staff_name: staff?.name || null,
+        has_review: appt.customer_id ? reviewedCustomerIds.has(appt.customer_id) : false,
       };
     });
 
@@ -8302,6 +8328,25 @@ app.get("/customers/:slug", tenantAuthSlug, async (req, res) => {
       }
     }
 
+    // Usado por el botón "Pedir reseña" del dashboard: si el cliente ya
+    // tiene una fila en `reviews` (upsert único por tenant_id+customer_id),
+    // el botón se reemplaza por un indicador "Ya reseñó" en vez de dejarlo
+    // clickeable de nuevo.
+    const reviewedCustomerIds = new Set();
+    if (customerIds.length > 0) {
+      const { data: reviewRows, error: reviewsError } = await supabase
+        .from("reviews")
+        .select("customer_id")
+        .eq("tenant_id", tenant.id)
+        .in("customer_id", customerIds);
+
+      if (reviewsError) throw reviewsError;
+
+      for (const review of reviewRows || []) {
+        if (review.customer_id) reviewedCustomerIds.add(review.customer_id);
+      }
+    }
+
     const now = new Date();
     const inactiveCutoff = new Date(
       now.getTime() - inactiveDays * 24 * 60 * 60 * 1000
@@ -8347,6 +8392,7 @@ const isInactive =
         segment: customerSegment,
         is_inactive: customerSegment === "inactive",
         has_completed_visit: completedVisitByCustomer.has(customer.id),
+        has_review: reviewedCustomerIds.has(customer.id),
       };
     });
 
