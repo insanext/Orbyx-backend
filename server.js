@@ -2919,6 +2919,10 @@ async function findCustomerByReviewToken(tenantId, token) {
 // sola activa a la vez (ver PUT /reviews/:slug/:reviewId/reaction).
 const ALLOWED_REVIEW_REACTIONS = ["👍", "❤️", "🙏", "😊"];
 
+// Motivos fijos para ocultar una reseña — moderación transparente: deja de
+// ser un borrado sin rastro, el negocio siempre elige uno de estos.
+const ALLOWED_HIDDEN_REASONS = ["Spam", "Insultos", "Contenido inapropiado"];
+
 // Adjunta el hilo de respuestas del negocio (review_replies, orden
 // cronológico) a cada fila de `reviews` — usado tanto por el listado del
 // dashboard como por el listado público (las respuestas son siempre
@@ -8637,7 +8641,7 @@ app.get("/reviews/:slug", tenantAuthSlug, async (req, res) => {
     const { data, error } = await supabase
       .from("reviews")
       .select(
-        "id, client_name, client_identifier, rating, comment, private_feedback, status, reaction, created_at, updated_at"
+        "id, client_name, client_identifier, rating, comment, private_feedback, status, reaction, hidden_reason, created_at, updated_at"
       )
       .eq("tenant_id", tenant.id)
       .order("created_at", { ascending: false });
@@ -8736,17 +8740,25 @@ app.post("/reviews/:slug/request-link", tenantAuthSlugWrite, async (req, res) =>
 
 /* ======================================================
    ✅ PATCH /reviews/:id/status
-   Moderación: ocultar/mostrar una reseña puntual (abuso/spam/ofensiva —
-   nunca por ser simplemente negativa, ver CLAUDE.md/product spec).
+   Moderación transparente: ocultar exige un motivo fijo (Spam/Insultos/
+   Contenido inapropiado), que se guarda y se muestra públicamente en vez
+   del contenido — nunca por ser simplemente negativa, ver CLAUDE.md/product
+   spec. Al volver a mostrarla se limpia hidden_reason.
 ====================================================== */
 app.patch("/reviews/:id/status", [dashboardLimiter, requireTenantAuth, requireWriteAccess], async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body;
+    const { status, hidden_reason } = req.body;
 
     const allowed = ["visible", "hidden"];
     if (!allowed.includes(status)) {
       return res.status(400).json({ error: "Estado inválido" });
+    }
+
+    if (status === "hidden" && !ALLOWED_HIDDEN_REASONS.includes(hidden_reason)) {
+      return res.status(400).json({
+        error: "Debes indicar un motivo válido para ocultar la reseña",
+      });
     }
 
     const { data: review, error: reviewError } = await supabase
@@ -8764,7 +8776,11 @@ app.patch("/reviews/:id/status", [dashboardLimiter, requireTenantAuth, requireWr
 
     const { data, error } = await supabase
       .from("reviews")
-      .update({ status, updated_at: new Date().toISOString() })
+      .update({
+        status,
+        hidden_reason: status === "hidden" ? hidden_reason : null,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", id)
       .select()
       .single();
@@ -8828,6 +8844,57 @@ app.post("/reviews/:slug/:reviewId/replies", tenantAuthSlugWrite, async (req, re
     if (error) throw error;
 
     return res.json({ ok: true, reply: data });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ DELETE /reviews/:slug/:reviewId/replies/:replyId
+   Borrado real (sin marca de "editado"/soft-delete) de una respuesta propia
+   del negocio — no hay edición, solo borrar. Verifica que la respuesta
+   pertenezca a ese tenant y esa reseña antes de borrar.
+====================================================== */
+app.delete("/reviews/:slug/:reviewId/replies/:replyId", tenantAuthSlugWrite, async (req, res) => {
+  try {
+    const { slug, reviewId, replyId } = req.params;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data: reply, error: replyError } = await supabase
+      .from("review_replies")
+      .select("id")
+      .eq("id", replyId)
+      .eq("review_id", reviewId)
+      .eq("tenant_id", tenant.id)
+      .maybeSingle();
+
+    if (replyError) throw replyError;
+    if (!reply) {
+      return res.status(404).json({ error: "Respuesta no encontrada" });
+    }
+
+    const { error } = await supabase
+      .from("review_replies")
+      .delete()
+      .eq("id", reply.id);
+
+    if (error) throw error;
+
+    return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -17053,8 +17120,15 @@ app.post("/public/reviews/:slug", publicLimiter, async (req, res) => {
 
 /* ======================================================
    ✅ GET /public/reviews/:slug
-   Reseñas visibles + promedio + conteo, para la página pública.
-   NUNCA devuelve private_feedback, client_identifier ni status.
+   Promedio + conteo + listado, para la página pública. NUNCA devuelve
+   private_feedback ni client_identifier.
+
+   Moderación transparente (ver PATCH /reviews/:id/status): una reseña
+   'hidden' SIGUE contando en el promedio/conteo (su rating entra igual al
+   cálculo), pero en el listado se devuelve redactada — sin rating,
+   client_name, comment, reaction ni replies — reemplazada por
+   status + hidden_reason, que el frontend usa para mostrar el mensaje
+   genérico "Reseña oculta por el negocio — Motivo: {motivo}".
 ====================================================== */
 app.get("/public/reviews/:slug", publicLimiter, async (req, res) => {
   try {
@@ -17075,27 +17149,50 @@ app.get("/public/reviews/:slug", publicLimiter, async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    const { data: visibleReviews, error: reviewsError } = await supabase
+    const { data: allReviews, error: reviewsError } = await supabase
       .from("reviews")
-      .select("id, client_name, rating, comment, reaction, created_at")
+      .select("id, client_name, rating, comment, reaction, status, hidden_reason, created_at")
       .eq("tenant_id", tenant.id)
-      .eq("status", "visible")
       .order("created_at", { ascending: false })
       .limit(200);
 
     if (reviewsError) throw reviewsError;
 
-    const rows = visibleReviews || [];
+    const rows = allReviews || [];
     const count = rows.length;
     const average =
       count > 0 ? rows.reduce((sum, r) => sum + r.rating, 0) / count : 0;
 
-    const reviewsWithReplies = await attachReviewReplies(tenant.id, rows);
+    const visibleRows = rows.filter((r) => r.status === "visible");
+    const visibleWithReplies = await attachReviewReplies(tenant.id, visibleRows);
+    const repliesById = new Map(visibleWithReplies.map((r) => [r.id, r.replies]));
+
+    const reviews = rows.map((r) => {
+      if (r.status === "hidden") {
+        return {
+          id: r.id,
+          status: "hidden",
+          hidden_reason: r.hidden_reason,
+          created_at: r.created_at,
+        };
+      }
+
+      return {
+        id: r.id,
+        status: "visible",
+        client_name: r.client_name,
+        rating: r.rating,
+        comment: r.comment,
+        reaction: r.reaction,
+        replies: repliesById.get(r.id) || [],
+        created_at: r.created_at,
+      };
+    });
 
     return res.json({
       average: Math.round(average * 10) / 10,
       count,
-      reviews: reviewsWithReplies,
+      reviews,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
