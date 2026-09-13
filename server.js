@@ -1128,6 +1128,14 @@ async function sendBookingConfirmations({
   // Confirmación por WhatsApp — best-effort, nunca bloquea al caller. Si el
   // tenant no tiene el toggle activo o ya superó su cupo mensual
   // (wa_confirmacion, compartido con el recordatorio), simplemente se omite.
+  //
+  // waConfirmationSent refleja "Twilio aceptó el envío" (waResult.ok), NO
+  // "WhatsApp lo entregó" — a propósito: es solo para decidir si mostrarle
+  // al negocio el botón de confirmación MANUAL como respaldo (ver
+  // appointments.wa_confirmacion_enviada), no para contar cupo (eso sigue
+  // siendo delivered-only vía el status callback, sin cambios acá).
+  let waConfirmationSent = false;
+
   if (tenantInfo?.wa_confirmation_enabled) {
     console.log(`[WA] Intentando enviar WhatsApp de confirmación para tenant ${tenantId}`);
     const waUsage = await checkMonthlyUsage(tenantId, "wa_confirmacion");
@@ -1148,6 +1156,7 @@ async function sendBookingConfirmations({
       });
       if (waResult.ok) {
         await trackWhatsAppMessage({ messageSid: waResult.sid, tenantId, resource: "wa_confirmacion" });
+        waConfirmationSent = true;
       } else {
         console.warn(`WhatsApp confirmación no enviado (tenant ${tenantId}):`, waResult.reason);
       }
@@ -1157,6 +1166,8 @@ async function sendBookingConfirmations({
       );
     }
   }
+
+  return { waConfirmationSent };
 }
 
 function getPlanLevel(plan) {
@@ -6328,7 +6339,7 @@ console.log(
 // templates). El cliente ve el estado "pendiente de depósito" en la propia
 // respuesta de este endpoint, sin un mensaje aparte.
 if (!appointmentRequiresDeposit) {
-  await sendBookingConfirmations({
+  const { waConfirmationSent } = await sendBookingConfirmations({
     tenantId: cal.tenant_id,
     tenantInfo,
     customerName: String(customer_name).trim(),
@@ -6342,6 +6353,14 @@ if (!appointmentRequiresDeposit) {
     branchAddress: branchInfoForEmail?.address || null,
     customerInstructions,
   });
+
+  if (waConfirmationSent) {
+    await supabase
+      .from("appointments")
+      .update({ wa_confirmacion_enviada: true })
+      .eq("id", apptUpdated.id);
+    apptUpdated = { ...apptUpdated, wa_confirmacion_enviada: true };
+  }
 }
 
     return res.status(201).json({
@@ -11003,7 +11022,7 @@ app.post(
         `https://www.orbyx.cl/cancel/${appt.id}?token=${appt.cancel_token}` +
         `&redirect=${encodeURIComponent(bookingUrl)}`;
 
-      await sendBookingConfirmations({
+      const { waConfirmationSent } = await sendBookingConfirmations({
         tenantId: appt.tenant_id,
         tenantInfo,
         customerName: appt.customer_name,
@@ -11016,7 +11035,16 @@ app.post(
         customerInstructions: serviceInfoForEmail?.customer_instructions || null,
       });
 
-      return res.json({ ok: true, appointment: updated });
+      let finalAppointment = updated;
+      if (waConfirmationSent) {
+        await supabase
+          .from("appointments")
+          .update({ wa_confirmacion_enviada: true })
+          .eq("id", id);
+        finalAppointment = { ...updated, wa_confirmacion_enviada: true };
+      }
+
+      return res.json({ ok: true, appointment: finalAppointment });
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
