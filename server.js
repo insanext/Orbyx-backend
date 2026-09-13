@@ -2915,6 +2915,39 @@ async function findCustomerByReviewToken(tenantId, token) {
   return data;
 }
 
+// Set fijo de reacciones que el negocio puede dejar en una reseña — una
+// sola activa a la vez (ver PUT /reviews/:slug/:reviewId/reaction).
+const ALLOWED_REVIEW_REACTIONS = ["👍", "❤️", "🙏", "😊"];
+
+// Adjunta el hilo de respuestas del negocio (review_replies, orden
+// cronológico) a cada fila de `reviews` — usado tanto por el listado del
+// dashboard como por el listado público (las respuestas son siempre
+// públicas, igual que el comentario del cliente).
+async function attachReviewReplies(tenantId, reviews) {
+  const reviewIds = reviews.map((r) => r.id).filter(Boolean);
+  if (reviewIds.length === 0) {
+    return reviews.map((r) => ({ ...r, replies: [] }));
+  }
+
+  const { data: replies, error } = await supabase
+    .from("review_replies")
+    .select("id, review_id, message, created_at")
+    .eq("tenant_id", tenantId)
+    .in("review_id", reviewIds)
+    .order("created_at", { ascending: true });
+
+  if (error) throw error;
+
+  const repliesByReview = new Map();
+  for (const reply of replies || []) {
+    if (!repliesByReview.has(reply.review_id)) {
+      repliesByReview.set(reply.review_id, []);
+    }
+    repliesByReview.get(reply.review_id).push(reply);
+  }
+
+  return reviews.map((r) => ({ ...r, replies: repliesByReview.get(r.id) || [] }));
+}
 
 async function resolvePetFromAppointment({
   tenant_id,
@@ -8604,14 +8637,16 @@ app.get("/reviews/:slug", tenantAuthSlug, async (req, res) => {
     const { data, error } = await supabase
       .from("reviews")
       .select(
-        "id, client_name, client_identifier, rating, comment, private_feedback, status, created_at, updated_at"
+        "id, client_name, client_identifier, rating, comment, private_feedback, status, reaction, created_at, updated_at"
       )
       .eq("tenant_id", tenant.id)
       .order("created_at", { ascending: false });
 
     if (error) throw error;
 
-    return res.json({ reviews: data || [] });
+    const reviewsWithReplies = await attachReviewReplies(tenant.id, data || []);
+
+    return res.json({ reviews: reviewsWithReplies });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -8732,6 +8767,121 @@ app.patch("/reviews/:id/status", [dashboardLimiter, requireTenantAuth, requireWr
       .update({ status, updated_at: new Date().toISOString() })
       .eq("id", id)
       .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, review: data });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ POST /reviews/:slug/:reviewId/replies
+   Respuesta pública del negocio a una reseña. Hilo unidireccional: el
+   cliente nunca escribe acá, así que no hace falta un campo de autor.
+====================================================== */
+app.post("/reviews/:slug/:reviewId/replies", tenantAuthSlugWrite, async (req, res) => {
+  try {
+    const { slug, reviewId } = req.params;
+    const { message } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    const trimmedMessage = String(message || "").trim().slice(0, 500);
+    if (!trimmedMessage) {
+      return res.status(400).json({ error: "El mensaje no puede estar vacío" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data: review, error: reviewError } = await supabase
+      .from("reviews")
+      .select("id")
+      .eq("id", reviewId)
+      .eq("tenant_id", tenant.id)
+      .maybeSingle();
+
+    if (reviewError) throw reviewError;
+    if (!review) {
+      return res.status(404).json({ error: "Reseña no encontrada" });
+    }
+
+    const { data, error } = await supabase
+      .from("review_replies")
+      .insert({ review_id: review.id, tenant_id: tenant.id, message: trimmedMessage })
+      .select("id, review_id, message, created_at")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, reply: data });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ PUT /reviews/:slug/:reviewId/reaction
+   Setea o quita (reaction: null) la reacción del negocio a una reseña —
+   una sola reacción activa a la vez, del set fijo ALLOWED_REVIEW_REACTIONS.
+   Toggle real: si el frontend manda la misma reacción que ya está puesta,
+   la limpia (ver lógica del botón en el dashboard) — este endpoint solo
+   aplica el valor que le llega, no decide el toggle.
+====================================================== */
+app.put("/reviews/:slug/:reviewId/reaction", tenantAuthSlugWrite, async (req, res) => {
+  try {
+    const { slug, reviewId } = req.params;
+    const { reaction } = req.body;
+
+    if (!slug) {
+      return res.status(400).json({ error: "slug es obligatorio" });
+    }
+
+    if (reaction !== null && reaction !== undefined && !ALLOWED_REVIEW_REACTIONS.includes(reaction)) {
+      return res.status(400).json({ error: "Reacción inválida" });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const { data: review, error: reviewError } = await supabase
+      .from("reviews")
+      .select("id")
+      .eq("id", reviewId)
+      .eq("tenant_id", tenant.id)
+      .maybeSingle();
+
+    if (reviewError) throw reviewError;
+    if (!review) {
+      return res.status(404).json({ error: "Reseña no encontrada" });
+    }
+
+    const { data, error } = await supabase
+      .from("reviews")
+      .update({ reaction: reaction || null, updated_at: new Date().toISOString() })
+      .eq("id", review.id)
+      .select("id, reaction")
       .single();
 
     if (error) throw error;
@@ -16927,7 +17077,7 @@ app.get("/public/reviews/:slug", publicLimiter, async (req, res) => {
 
     const { data: visibleReviews, error: reviewsError } = await supabase
       .from("reviews")
-      .select("id, client_name, rating, comment, created_at")
+      .select("id, client_name, rating, comment, reaction, created_at")
       .eq("tenant_id", tenant.id)
       .eq("status", "visible")
       .order("created_at", { ascending: false })
@@ -16940,10 +17090,12 @@ app.get("/public/reviews/:slug", publicLimiter, async (req, res) => {
     const average =
       count > 0 ? rows.reduce((sum, r) => sum + r.rating, 0) / count : 0;
 
+    const reviewsWithReplies = await attachReviewReplies(tenant.id, rows);
+
     return res.json({
       average: Math.round(average * 10) / 10,
       count,
-      reviews: rows,
+      reviews: reviewsWithReplies,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
