@@ -22,6 +22,7 @@ const {
   sendSignupStuckAlertEmail,
   sendLegalAcceptanceConfirmationEmail,
   sendDepositReceiptUploadedEmail,
+  sendTrialEndingReminderEmail,
 } = require("./email");
 const {
   sendWhatsAppTemplate,
@@ -12478,6 +12479,7 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       trial_active: trialActive,
       trial_expired: trialExpired,
       dias_restantes_trial: diasRestantesTrial,
+      trial_ends_at: tenant.trial_ends_at || null,
       subscription_status: subscriptionStatus,
       awaiting_payment: awaitingPayment,
       dias_restantes_pago: diasRestantesPago,
@@ -17488,6 +17490,151 @@ app.post(
   }
 );
 
+// YYYY-MM-DD en zona America/Santiago -- mismo criterio que
+// getSantiagoDayKey() en orbyx-web/app/dashboard/[slug]/layout.tsx,
+// portado acá porque no existía ningún helper de fecha-por-día del lado
+// del servidor todavía.
+function getSantiagoDayKey(date) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Santiago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+/* ======================================================
+   📧 Recordatorio diario de vencimiento de prueba gratis
+   Arranca el mismo día en que el banner del dashboard se pone
+   parpadeante (3 días o menos para trial_ends_at, ver GET
+   /billing/account-status) y se repite una vez al día mientras el
+   tenant siga sin suscripción de pago activa -- incluye los días
+   posteriores al vencimiento, sin tope fijo. Se detiene solo al
+   detectar subscriptions.status === "active" (o "trialing": tarjeta ya
+   registrada en Flow, primer cobro programado -- mismo criterio que
+   awaiting_payment en GET /billing/account-status).
+   last_trial_reminder_sent_at (ver 2026-09-15-trial-reminder-tracking.sql)
+   evita reenviar más de una vez el mismo día si este job corre más de
+   una vez (reinicio del proceso, corrida manual + cron real, etc.).
+====================================================== */
+async function sendTrialEndingReminders() {
+  const now = new Date();
+  const todayKey = getSantiagoDayKey(now);
+  const msPerDay = 24 * 60 * 60 * 1000;
+  const threshold = new Date(now.getTime() + 3 * msPerDay);
+
+  const { data: candidates, error } = await supabase
+    .from("tenants")
+    .select("id, name, slug, trial_ends_at, last_trial_reminder_sent_at")
+    .eq("is_active", true)
+    .is("paused_at", null)
+    .not("trial_ends_at", "is", null)
+    .lte("trial_ends_at", threshold.toISOString());
+  if (error) throw new Error(error.message);
+  if (!candidates || candidates.length === 0) return { sent: 0, skipped: 0 };
+
+  const tenantIds = candidates.map((t) => t.id);
+
+  const { data: subscriptions } = await supabase
+    .from("subscriptions")
+    .select("tenant_id, status, created_at")
+    .in("tenant_id", tenantIds)
+    .order("created_at", { ascending: false });
+  const latestSubscriptionByTenant = {};
+  for (const row of subscriptions || []) {
+    if (!latestSubscriptionByTenant[row.tenant_id]) {
+      latestSubscriptionByTenant[row.tenant_id] = row;
+    }
+  }
+
+  const { data: ownerRows } = await supabase
+    .from("tenant_users")
+    .select("tenant_id, user_id")
+    .eq("role", "owner")
+    .eq("is_active", true)
+    .in("tenant_id", tenantIds);
+  const ownerUserIdByTenant = {};
+  for (const row of ownerRows || []) {
+    if (!ownerUserIdByTenant[row.tenant_id]) ownerUserIdByTenant[row.tenant_id] = row.user_id;
+  }
+
+  const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const emailByUserId = {};
+  for (const u of authList?.users || []) {
+    emailByUserId[u.id] = u.email || null;
+  }
+
+  let sent = 0;
+  let skipped = 0;
+
+  for (const tenant of candidates) {
+    const subscriptionStatus = latestSubscriptionByTenant[tenant.id]?.status || "none";
+    if (subscriptionStatus === "active" || subscriptionStatus === "trialing") {
+      skipped++;
+      continue;
+    }
+
+    if (tenant.last_trial_reminder_sent_at) {
+      const lastSentKey = getSantiagoDayKey(new Date(tenant.last_trial_reminder_sent_at));
+      if (lastSentKey === todayKey) {
+        skipped++;
+        continue;
+      }
+    }
+
+    const ownerUserId = ownerUserIdByTenant[tenant.id];
+    const ownerEmail = ownerUserId ? emailByUserId[ownerUserId] : null;
+    if (!ownerEmail) {
+      skipped++;
+      continue;
+    }
+
+    const diasRestantes = Math.ceil(
+      (new Date(tenant.trial_ends_at).getTime() - now.getTime()) / msPerDay
+    );
+    const billingUrl = `https://orbyx.cl/dashboard/${tenant.slug}/billing`;
+
+    const result = await sendTrialEndingReminderEmail({
+      to: ownerEmail,
+      businessName: tenant.name,
+      diasRestantes,
+      billingUrl,
+    });
+
+    if (!result.ok) {
+      console.warn(`Recordatorio de prueba no enviado (tenant ${tenant.id}):`, result.reason);
+      skipped++;
+      continue;
+    }
+
+    await supabase
+      .from("tenants")
+      .update({ last_trial_reminder_sent_at: now.toISOString() })
+      .eq("id", tenant.id);
+
+    sent++;
+  }
+
+  return { sent, skipped };
+}
+
+// POST /trial/maintenance/send-reminders
+// Respaldo manual / cron externo -- el disparo real en producción es el
+// cron interno de más abajo, que llama a la misma función.
+app.post(
+  "/trial/maintenance/send-reminders",
+  publicLimiter,
+  requireSignupMaintenanceSecret,
+  async (req, res) => {
+    try {
+      const result = await sendTrialEndingReminders();
+      return res.json({ ok: true, reminders_sent: result.sent, skipped: result.skipped });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
 /* ======================================================
    🔔 POST /whatsapp/status-callback
    Twilio llama este endpoint (x-www-form-urlencoded) cada vez que cambia
@@ -18866,15 +19013,19 @@ app.get("/admin/tenants", requireAdminAuth, async (req, res) => {
     // todo el listado, no una por tenant.
     const { data: ownerRows, error: ownerRowsError } = await supabase
       .from("tenant_users")
-      .select("tenant_id, full_name")
+      .select("tenant_id, full_name, phone")
       .eq("role", "owner")
       .eq("is_active", true);
     if (ownerRowsError) throw ownerRowsError;
 
     const ownerNameByTenant = {};
+    const ownerPhoneByTenant = {};
     for (const row of ownerRows || []) {
       if (row.full_name && !ownerNameByTenant[row.tenant_id]) {
         ownerNameByTenant[row.tenant_id] = row.full_name;
+      }
+      if (row.phone && !ownerPhoneByTenant[row.tenant_id]) {
+        ownerPhoneByTenant[row.tenant_id] = row.phone;
       }
     }
 
@@ -18899,12 +19050,14 @@ app.get("/admin/tenants", requireAdminAuth, async (req, res) => {
         name: tenant.name,
         slug: tenant.slug,
         owner_name: ownerNameByTenant[tenant.id] || null,
+        owner_phone: ownerPhoneByTenant[tenant.id] || null,
         plan_slug: planSlug,
         amount,
         addons_summary: (addonsByTenant[tenant.id] || []).join(", "),
         business_category: tenant.business_category || "generic",
         business_category_label: getBusinessCategoryLabel(tenant.business_category),
         status: bucket,
+        trial_ends_at: tenant.trial_ends_at || null,
         created_at: tenant.created_at,
       };
     });
@@ -19374,6 +19527,70 @@ app.post("/admin/tenants/:id/credit-balance", requireAdminAuth, async (req, res)
 });
 
 /* ======================================================
+   📅 PATCH /admin/tenants/:id/trial-end
+   Ajusta manualmente tenants.trial_ends_at -- función permanente de
+   soporte (extender pruebas a clientes reales), no un hack temporal.
+   Solo tiene sentido para un tenant sin suscripción de pago activa
+   (mismo criterio que trial_active/awaiting_payment en
+   GET /billing/account-status) -- el frontend ya oculta el control fuera
+   de ese caso, pero se rechaza acá también por si se llama directo.
+====================================================== */
+app.patch("/admin/tenants/:id/trial-end", requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { trial_ends_at } = req.body || {};
+
+    if (!trial_ends_at) {
+      return res.status(400).json({ error: "trial_ends_at es obligatorio" });
+    }
+    const parsedDate = new Date(trial_ends_at);
+    if (Number.isNaN(parsedDate.getTime())) {
+      return res.status(400).json({ error: "trial_ends_at no es una fecha válida" });
+    }
+
+    const { data: tenant } = await supabase
+      .from("tenants")
+      .select("id, trial_ends_at")
+      .eq("id", id)
+      .single();
+    if (!tenant) return res.status(404).json({ error: "Tenant no encontrado" });
+
+    const { data: subscription } = await supabase
+      .from("subscriptions")
+      .select("status")
+      .eq("tenant_id", id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (subscription?.status === "active") {
+      return res.status(400).json({
+        error: "Este tenant ya tiene una suscripción de pago activa -- no corresponde ajustar su fecha de prueba",
+      });
+    }
+
+    const newValue = parsedDate.toISOString();
+    const { error } = await supabase
+      .from("tenants")
+      .update({ trial_ends_at: newValue })
+      .eq("id", id);
+    if (error) throw error;
+
+    await logAdminTenantAction({
+      tenantId: id,
+      adminUserId: req.adminUser.user_id,
+      adminEmail: req.adminUser.email,
+      actionType: "trial_end_updated",
+      details: { old_trial_ends_at: tenant.trial_ends_at, new_trial_ends_at: newValue },
+    });
+
+    res.json({ ok: true, trial_ends_at: newValue });
+  } catch (err) {
+    console.error("PATCH /admin/tenants/:id/trial-end error:", err.message);
+    res.status(500).json({ error: err.message || "Error actualizando la fecha de prueba" });
+  }
+});
+
+/* ======================================================
    ⏸️ POST /admin/tenants/:id/pause
    ▶️ POST /admin/tenants/:id/reactivate
    Pausa/reactiva un tenant temporalmente. Flow no soporta pausar una
@@ -19747,6 +19964,18 @@ cron.schedule("*/10 * * * *", async () => {
     );
   } catch (err) {
     console.error("[CRON] whatsapp/maintenance/send-reminders: falló —", err.message);
+  }
+});
+
+cron.schedule("0 6 * * *", async () => {
+  console.log("[CRON] trial/maintenance/send-reminders: iniciando...");
+  try {
+    const result = await sendTrialEndingReminders();
+    console.log(
+      `[CRON] trial/maintenance/send-reminders: terminado — sent=${result.sent} skipped=${result.skipped}`
+    );
+  } catch (err) {
+    console.error("[CRON] trial/maintenance/send-reminders: falló —", err.message);
   }
 });
 

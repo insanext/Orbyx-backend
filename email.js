@@ -1522,6 +1522,81 @@ async function sendDepositReceiptUploadedEmail({
   }
 }
 
+// Recordatorio diario de vencimiento de prueba gratis -- arranca el mismo
+// día en que el banner del dashboard se pone parpadeante (3 días o menos
+// para trial_ends_at) y se repite mientras el tenant siga sin suscripción
+// de pago activa, incluidos los días posteriores al vencimiento (sin tope
+// fijo) -- ver sendTrialEndingReminders() en server.js. Mismo patrón que
+// sendDepositReceiptUploadedEmail: retorna { ok, reason } en vez de
+// lanzar, para que el llamador decida si marca last_trial_reminder_sent_at.
+async function sendTrialEndingReminderEmail({ to, businessName, diasRestantes, billingUrl }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Email de recordatorio de prueba omitido.");
+      return { ok: false, reason: "resend_not_configured" };
+    }
+
+    const expired = diasRestantes <= 0;
+    const plural = diasRestantes === 1 ? "" : "s";
+    const headline = expired
+      ? "Tu prueba gratuita ya terminó"
+      : `Te quedan ${diasRestantes} día${plural} de prueba gratuita`;
+
+    const { data, error } = await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: expired
+        ? `Tu prueba gratuita de Orbyx ya terminó — ${businessName || "tu negocio"}`
+        : `Quedan ${diasRestantes} día${plural} de tu prueba gratuita — ${businessName || "tu negocio"}`,
+      html: `
+<div style="margin:0; padding:30px 16px; background:#f1f5f9; font-family:Arial, Helvetica, sans-serif;">
+  <div style="max-width:560px; margin:0 auto;">
+    <div style="background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.1);">
+      <div style="background:linear-gradient(135deg,#0f172a,#312e81); padding:28px; text-align:center;">
+        <div style="color:#cbd5e1; font-size:12px; letter-spacing:0.2em;">PRUEBA GRATUITA</div>
+        <h1 style="color:#ffffff; margin:10px 0 0; font-size:24px;">${businessName || "Tu negocio"}</h1>
+      </div>
+      <div style="padding:24px;">
+        <div style="background:${expired ? "#fee2e2" : "#fef3c7"}; color:${expired ? "#991b1b" : "#92400e"}; display:inline-block; padding:6px 12px; border-radius:999px; font-size:12px; margin-bottom:12px;">
+          ${expired ? "⏰ Prueba vencida" : "⏳ Prueba por terminar"}
+        </div>
+        <h2 style="margin:0 0 10px;">${headline}</h2>
+        <p style="color:#475569; font-size:15px;">
+          Inscribe tu tarjeta para seguir usando tu agenda, reservas online y todo lo que ya configuraste en Orbyx sin interrupciones.
+        </p>
+        <div style="text-align:center; margin-top:24px;">
+          <a href="${billingUrl}" style="background:#0f172a; color:white; padding:12px 24px; border-radius:12px; text-decoration:none; font-weight:bold; font-size:15px;">
+            Inscribir tarjeta
+          </a>
+        </div>
+        <p style="margin-top:20px; font-size:12px; color:#94a3b8; text-align:center;">
+          O copia este enlace en tu navegador:<br/>
+          <a href="${billingUrl}" style="color:#6366f1;">${billingUrl}</a>
+        </p>
+      </div>
+      <div style="padding:16px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
+        <a href="https://orbyx.cl" style="color:#64748b; font-size:12px; text-decoration:none;" target="_blank">
+          Orbyx · Sistema de reservas inteligentes
+        </a>
+      </div>
+    </div>
+  </div>
+</div>`,
+    });
+
+    if (error) {
+      console.error("Error enviando email de recordatorio de prueba:", error);
+      return { ok: false, reason: error.message || "resend_error" };
+    }
+
+    console.log("[TRIAL REMINDER EMAIL] Enviado:", JSON.stringify(data));
+    return { ok: true };
+  } catch (error) {
+    console.error("Error enviando email de recordatorio de prueba:", error);
+    return { ok: false, reason: error?.message || "unknown_error" };
+  }
+}
+
 module.exports = {
   sendBookingEmail,
   sendInvitationEmail,
@@ -1531,4 +1606,5 @@ module.exports = {
   sendSignupStuckAlertEmail,
   sendLegalAcceptanceConfirmationEmail,
   sendDepositReceiptUploadedEmail,
+  sendTrialEndingReminderEmail,
 };
