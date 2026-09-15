@@ -20155,7 +20155,7 @@ app.get("/members", tenantAuth, async (req, res) => {
 
     const { data: members, error: membersError } = await supabase
       .from("tenant_users")
-      .select("user_id, tenant_id, role, is_active, created_at, permissions")
+      .select("user_id, tenant_id, role, is_active, created_at, permissions, full_name")
       .eq("tenant_id", tenant_id)
       .eq("is_active", true)
       .order("created_at", { ascending: true });
