@@ -11881,6 +11881,29 @@ app.post("/tenants/provision", [publicLimiter, requireTenantAuth], async (req, r
       return res.status(400).json({ error: "Falta campo: email" });
     }
 
+    // Defensa en profundidad: una cuenta de Super Admin (admin_users) es un
+    // auth.users normal, misma sesión de Supabase Auth que un tenant (ver
+    // requireAdminAuth) -- si visita /login sin tener fila en tenant_users,
+    // el frontend antes llamaba a este endpoint igual que cualquier usuario
+    // nuevo y le creaba un tenant fantasma (plan starter, name = su email).
+    // Confirmado en vivo: 4 tenants fantasma así para camilo.merino.m@gmail.com
+    // (sesión 2026-09-14/15). El frontend ya no debería llegar a llamar esto
+    // para una cuenta admin, pero este chequeo no depende de eso -- rechaza
+    // acá también por si el endpoint se golpea directo.
+    const { data: adminGuardRow } = await supabase
+      .from("admin_users")
+      .select("user_id")
+      .eq("user_id", user_id)
+      .eq("is_active", true)
+      .maybeSingle();
+    if (adminGuardRow) {
+      return res.status(403).json({
+        error: "admin_account",
+        message:
+          "Esta cuenta es de administrador y no tiene un negocio asociado. Inicia sesión con la cuenta de tu negocio, o ve al panel de administración.",
+      });
+    }
+
     // phone/full_name NO son hard-required acá (a diferencia de POST
     // /signup/start-paid): el formulario de /signup ya los exige, pero este
     // endpoint corre en el PRIMER LOGIN después de verificar el email — que
@@ -18796,10 +18819,19 @@ function getBusinessCategoryLabel(category) {
 ====================================================== */
 app.get("/admin/tenants", requireAdminAuth, async (req, res) => {
   try {
+    // business_category IS NULL == onboarding nunca completado (ver
+    // resolveTenantDestination en orbyx-web/app/login/page.tsx, que decide
+    // "va a /onboarding" exactamente con esta misma condición) -- se
+    // excluyen del directorio de Super Admin para no mostrar tenants
+    // fantasma (cuenta creada por /tenants/provision, sin negocio real
+    // detrás) como si fueran negocios reales. "generic" es una categoría
+    // terminal válida (el dueño eligió "Otro tipo de negocio" a propósito)
+    // y sí debe listarse.
     const { data: tenants, error: tenantsError } = await supabase
       .from("tenants")
       .select("id, name, slug, plan_slug, business_category, trial_ends_at, billing_cycle_end, paused_at, created_at, is_active")
       .eq("is_active", true)
+      .not("business_category", "is", null)
       .order("created_at", { ascending: false });
     if (tenantsError) throw tenantsError;
 
