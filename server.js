@@ -19608,6 +19608,57 @@ app.delete("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
   }
 });
 
+/* ======================================================
+   🔑 POST /admin/change-password
+   Cambio de contraseña del propio Super Admin autenticado.
+   admin_users vive sobre Supabase Auth (mismo auth.users que los
+   tenants) -- no es una tabla de credenciales aparte, así que la
+   contraseña se cambia con supabase.auth.admin.updateUserById, igual
+   que el resto de flujos de este archivo (ver maybeApplyEmailChange).
+
+   No reusa supabase.auth.signInWithPassword() (SDK del navegador) para
+   verificar la contraseña actual porque eso generaría una sesión nueva
+   en aal1 y, si el cliente la persistiera, el admin perdería la
+   elevación aal2 (MFA/TOTP) que requireAdminAuth ya exige -- quedaría
+   con 403 mfa_required en su siguiente request hasta volver a pasar por
+   /admin/login. En su lugar reusa verifyCurrentPassword() (mismo helper
+   que /account/email-change/request), que valida la contraseña con un
+   fetch directo al password grant de Supabase Auth, sin tocar la sesión
+   del navegador para nada -- la sesión aal2 actual del admin queda
+   intacta después de cambiar la contraseña.
+====================================================== */
+app.post("/admin/change-password", [passwordVerifyLimiter, requireAdminAuth], async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body || {};
+    if (!current_password || !new_password) {
+      return res.status(400).json({ error: "current_password y new_password son obligatorios" });
+    }
+    if (String(new_password).length < 8) {
+      return res.status(400).json({ error: "La nueva contraseña debe tener al menos 8 caracteres" });
+    }
+
+    const pwOk = await verifyCurrentPassword(req.adminUser.email, current_password);
+    if (!pwOk) {
+      return res.status(401).json({ error: "La contraseña actual es incorrecta" });
+    }
+
+    const { error: updateError } = await supabase.auth.admin.updateUserById(req.adminUser.user_id, {
+      password: String(new_password),
+    });
+    if (updateError) {
+      console.error("POST /admin/change-password updateUserById error:", updateError.message);
+      return res.status(500).json({ error: "Error actualizando la contraseña" });
+    }
+
+    await logSecurityAudit(req.adminUser.user_id, null, "admin_password_changed", {}, extractClientIp(req));
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /admin/change-password error:", err.message);
+    return res.status(500).json({ error: "Error interno" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Servidor listo en http://localhost:${PORT}`);
 });
