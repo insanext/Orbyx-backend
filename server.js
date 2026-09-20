@@ -12513,12 +12513,18 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     const normalizedPlan = normalizePlanSlug(tenant.plan_slug);
     await resetMonthlyAddons(tenant_id);
     // is_trial: mismo bug real que checkMonthlyUsage (auditoría
-    // 2026-09-20) -- sin esto, el pill de "WA confirmación" en el popup
-    // Activaciones mostraba el cupo completo del plan pagado incluso
-    // durante el trial, aunque el envío real ya estuviera (ahora sí)
-    // bloqueado. awaitingPayment ya está calculado arriba (sin
-    // suscripción activa ni trialing) -- mismo criterio, sin query extra.
-    const caps = getPlanCapabilities(normalizedPlan, { is_trial: awaitingPayment });
+    // 2026-09-20), corregido acá también (auditoría 2026-09-20, ronda 2):
+    // el fix original solo pasaba `awaitingPayment`, pero awaitingPayment y
+    // trialActive son mutuamente excluyentes -- durante un trial VIGENTE
+    // (trialActive=true) is_trial llegaba en false, así que el popup
+    // "Activaciones" seguía mostrando el cupo completo del plan pagado
+    // (ej. "0/100") mientras el envío real ya estaba bloqueado por
+    // checkMonthlyUsage. isStarterTenantInTrial (el criterio real de
+    // enforcement) es "sin suscripción activa ni trialing", que equivale a
+    // `trialActive || awaitingPayment` dado cómo se calculan arriba -- ese
+    // es el criterio que hay que pasar acá para que el contador reboye lo
+    // mismo que ya bloquea el envío.
+    const caps = getPlanCapabilities(normalizedPlan, { is_trial: trialActive || awaitingPayment });
     const period = now.toISOString().slice(0, 7);
 
     const { data: addonRows } = await supabase
