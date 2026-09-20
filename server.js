@@ -19554,8 +19554,21 @@ app.patch("/admin/tenants/:id/trial-end", requireAdminAuth, async (req, res) => 
     if (!trial_ends_at) {
       return res.status(400).json({ error: "trial_ends_at es obligatorio" });
     }
-    const parsedDate = new Date(trial_ends_at);
-    if (Number.isNaN(parsedDate.getTime())) {
+    // trial_ends_at llega como "YYYY-MM-DD" (fecha calendario pura, del
+    // date picker del panel admin) -- se interpreta como el FIN de ese día
+    // en America/Santiago (mismo criterio de zona horaria que el resto del
+    // proyecto, ver santiagoLocalToUtcIso() y sendTrialEndingReminders()),
+    // no como medianoche UTC. Bug real 2026-09-20: new Date("YYYY-MM-DD")
+    // .toISOString() guarda medianoche UTC, que en Santiago (UTC-3/-4) ya
+    // es la noche del día ANTERIOR -- la fecha guardada/mostrada quedaba
+    // corrida un día hacia atrás (20-09 se guardaba como 19-09).
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(trial_ends_at)) {
+      return res.status(400).json({ error: "trial_ends_at debe tener formato YYYY-MM-DD" });
+    }
+    let newValue;
+    try {
+      newValue = santiagoLocalToUtcIso(trial_ends_at, 23, 59);
+    } catch {
       return res.status(400).json({ error: "trial_ends_at no es una fecha válida" });
     }
 
@@ -19573,13 +19586,18 @@ app.patch("/admin/tenants/:id/trial-end", requireAdminAuth, async (req, res) => 
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
-    if (subscription?.status === "active") {
+    // "trialing" (tarjeta ya registrada en Flow, primer cobro programado)
+    // también bloquea el ajuste -- mismo criterio que awaiting_payment en
+    // GET /billing/account-status, y el frontend ahora muestra/oculta el
+    // editor con esta misma condición (ver Bug 1.3, admin/tenants/[id]/
+    // page.tsx).
+    if (subscription?.status === "active" || subscription?.status === "trialing") {
       return res.status(400).json({
-        error: "Este tenant ya tiene una suscripción de pago activa -- no corresponde ajustar su fecha de prueba",
+        error:
+          "Este tenant ya tiene una suscripción de pago activa (o tarjeta registrada) -- no corresponde ajustar su fecha de prueba",
       });
     }
 
-    const newValue = parsedDate.toISOString();
     const { error } = await supabase
       .from("tenants")
       .update({ trial_ends_at: newValue })
