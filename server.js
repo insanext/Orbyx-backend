@@ -18604,6 +18604,51 @@ async function requireAdminAuth(req, res, next) {
   }
 }
 
+/* ======================================================
+   🔒 GET /admin/access-check
+   Fix 2026-09-20 -- gate que faltaba en admin/login/page.tsx: antes,
+   handleLogin() solo hacía signInWithPassword() (válido para CUALQUIER
+   cuenta de la plataforma, no solo Super Admin) y después revisaba
+   supabase.auth.mfa.listFactors() -- si no había un factor TOTP
+   verificado, asumía "primera vez que esta cuenta entra al panel" y
+   llamaba directo a mfa.enroll(), mostrando QR + secreto a cualquier
+   tenant autenticado. No otorgaba acceso real (requireAdminAuth sigue
+   revisando admin_users ANTES de aal2, ver arriba), pero exponía la
+   pantalla de enrolamiento a cualquiera.
+
+   Este endpoint se llama justo después de signInWithPassword, ANTES de
+   decidir si mostrar login normal (ya tiene TOTP) o pantalla de
+   enrolamiento (no tiene TOTP todavía) -- deliberadamente NO exige aal2
+   (en este punto del flujo, legítimamente, todavía no existe para una
+   cuenta admin que nunca configuró MFA). Solo confirma membership en
+   admin_users con un token válido. No es un reemplazo de
+   requireAdminAuth ni se usa para proteger ninguna acción real del
+   panel -- eso lo sigue haciendo requireAdminAuth exactamente igual que
+   antes.
+====================================================== */
+app.get("/admin/access-check", passwordVerifyLimiter, async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Token requerido" });
+    }
+    const token = authHeader.split(" ")[1];
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+    const { data: adminRow } = await supabase
+      .from("admin_users")
+      .select("user_id, is_active")
+      .eq("user_id", user.id)
+      .single();
+    return res.json({ is_admin: Boolean(adminRow && adminRow.is_active) });
+  } catch (err) {
+    console.error("GET /admin/access-check error:", err.message);
+    return res.status(500).json({ error: "Error de verificación" });
+  }
+});
+
 // Registro generico de auditoria para cualquier accion de Super Admin sobre
 // un tenant desde el panel /admin (ver 2026-08-31-admin-tenant-actions.sql).
 // Best-effort: nunca bloquea ni rompe la accion que la dispara, mismo
