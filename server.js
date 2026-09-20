@@ -102,7 +102,11 @@ const DEFAULT_PLAN_CAPS = {
     max_staff: 2,
     max_services: 999999,
     max_branches: 1,
-    max_campaign_emails_per_send: 0,
+    // 100/mes desde la decisión de producto 2026-09-20 (Parte E/F) --
+    // antes 0 ("sin campañas email" era la regla vieja). Igual que
+    // max_wa_confirmacion, arranca en 0 mientras el tenant esté en trial
+    // sin suscripción activa (ver checkMonthlyUsage/isStarterTenantInTrial).
+    max_campaign_emails_per_send: 100,
     max_group_capacity: 5,
     max_wa_confirmacion: 100,
     max_campanas_wa: 0,
@@ -838,9 +842,35 @@ const MONTHLY_RESOURCE_CAP_KEY = {
 // por diseño: es plata ya pagada que no debe perderse). `remaining` sí es la
 // suma de ambos — es el número real que determina si todavía se puede
 // enviar/usar el recurso.
+// Bug real encontrado en la auditoría 2026-09-20: getPlanCapabilities ya
+// soportaba opts.is_trial (cupo de plan en 0 para wa_confirmacion/
+// campanas_wa/emails_campana durante el trial de Starter), pero
+// checkMonthlyUsage -- el único punto real de enforcement antes de cada
+// envío/uso -- nunca se lo pasaba. En la práctica, el cupo de trial nunca
+// se aplicaba: un Starter en trial tenía acceso al cupo completo del plan
+// pagado. Solo se consulta subscriptions para plan "starter" (única
+// combinación afectada), para no sumar una query extra a Business/Premium.
+async function isStarterTenantInTrial(tenant_id) {
+  const { data: latestSub } = await supabase
+    .from("subscriptions")
+    .select("status")
+    .eq("tenant_id", tenant_id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const status = latestSub?.status;
+  // Mismo criterio que awaiting_payment/trial_active en GET
+  // /billing/account-status: sin suscripción activa ni tarjeta
+  // registrada (trialing) -- incluye tanto el trial vigente como uno ya
+  // vencido sin pago, a propósito (Parte D.3/F.2: el cupo empieza a
+  // contar solo cuando hay suscripción real, no antes ni después).
+  return status !== "active" && status !== "trialing";
+}
+
 async function checkMonthlyUsage(tenant_id, resource) {
   const plan = await getPlan(tenant_id);
-  const caps = getPlanCapabilities(plan);
+  const isTrial = plan === "starter" ? await isStarterTenantInTrial(tenant_id) : false;
+  const caps = getPlanCapabilities(plan, { is_trial: isTrial });
   const capKey = MONTHLY_RESOURCE_CAP_KEY[resource];
   if (!capKey) return { allowed: false, limit: 0, base: 0, addon: 0, used: 0, remaining: 0 };
 
@@ -964,7 +994,14 @@ async function decrementAddonBalance(tenant_id, resource, amount) {
 // emails_campana (POST /campaigns/send-email, se descuenta en el momento).
 async function consumeResourceUsage(tenant_id, resource, amount = 1) {
   const plan = await getPlan(tenant_id);
-  const caps = getPlanCapabilities(plan);
+  // Mismo bug real que checkMonthlyUsage (auditoría 2026-09-20): sin
+  // is_trial, un consumo durante el trial de Starter se descontaba del
+  // cupo "de plan" (que durante el trial no debería existir) en vez del
+  // saldo de add-ons ya pagado -- un Starter que compra el add-on de
+  // WhatsApp durante el trial (permitido, ver Parte D.3) nunca le
+  // bajaba el saldo real que pagó.
+  const isTrial = plan === "starter" ? await isStarterTenantInTrial(tenant_id) : false;
+  const caps = getPlanCapabilities(plan, { is_trial: isTrial });
   const capKey = MONTHLY_RESOURCE_CAP_KEY[resource];
   const baseCap = capKey ? caps[capKey] || 0 : 0;
   const period = new Date().toISOString().slice(0, 7);
@@ -12273,7 +12310,14 @@ app.get("/billing/addons", tenantAuth, async (req, res) => {
     let limits = null;
     if (tenant_id && normalizedPlan) {
       try {
-        const caps = getPlanCapabilities(normalizedPlan);
+        // Mismo bug real de checkMonthlyUsage (auditoría 2026-09-20): sin
+        // is_trial, este endpoint mostraba el cupo completo del plan
+        // pagado (wa_confirmacion/campanas_wa/emails_campana) durante el
+        // trial de Starter -- alimenta directo emailUsage/waUsage en el
+        // panel Campañas, así que Starter veía "100 disponibles" aunque
+        // el envío real ya estuviera bloqueado.
+        const isTrial = normalizedPlan === "starter" ? await isStarterTenantInTrial(tenant_id) : false;
+        const caps = getPlanCapabilities(normalizedPlan, { is_trial: isTrial });
         const period = new Date().toISOString().slice(0, 7);
 
         // Cantidades y saldo de add-ons activos (una sola query)
@@ -12452,7 +12496,13 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     // duplicar la lógica de resets/uso.
     const normalizedPlan = normalizePlanSlug(tenant.plan_slug);
     await resetMonthlyAddons(tenant_id);
-    const caps = getPlanCapabilities(normalizedPlan);
+    // is_trial: mismo bug real que checkMonthlyUsage (auditoría
+    // 2026-09-20) -- sin esto, el pill de "WA confirmación" en el popup
+    // Activaciones mostraba el cupo completo del plan pagado incluso
+    // durante el trial, aunque el envío real ya estuviera (ahora sí)
+    // bloqueado. awaitingPayment ya está calculado arriba (sin
+    // suscripción activa ni trialing) -- mismo criterio, sin query extra.
+    const caps = getPlanCapabilities(normalizedPlan, { is_trial: awaitingPayment });
     const period = now.toISOString().slice(0, 7);
 
     const { data: addonRows } = await supabase
@@ -12487,6 +12537,10 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
 
     return res.json({
       ok: true,
+      // Aditivo (Parte D/F, auditoría 2026-09-20) -- para el aviso
+      // comercial de WhatsApp/Email de campañas bloqueados durante el
+      // trial de Starter en el popup Activaciones.
+      plan_slug: normalizedPlan,
       trial_active: trialActive,
       trial_expired: trialExpired,
       dias_restantes_trial: diasRestantesTrial,
