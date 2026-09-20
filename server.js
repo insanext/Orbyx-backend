@@ -1675,7 +1675,13 @@ const WRITE_ACCESS_MODULE_RULES = [
   { prefix: "/pets", module: "clientes" },
   { prefix: "/clinical-notes", module: "clientes" },
   { prefix: "/customers", module: "clientes" },
-  { prefix: "/reviews", module: "clientes" },
+  // "resenas" desde la auditoría 2026-09-20 (antes compartía "clientes",
+  // remanente de cuando Reseñas no tenía toggle propio en el panel de
+  // permisos). POST /reviews/:slug/request-link ("Pedir reseña", acción
+  // del panel Clientes, no de Reviews) queda deliberadamente fuera de
+  // esta regla -- usa tenantAuthSlug + chequeo inline de "clientes" en
+  // vez de tenantAuthWrite, para no heredar esta regla genérica.
+  { prefix: "/reviews", module: "resenas" },
   { prefix: "/appointments", module: "agenda" },
   { prefix: "/staff", module: "staff" },
   { prefix: "/service", module: "servicios" }, // cubre /services y /service-groups
@@ -8767,7 +8773,12 @@ app.get("/reviews/:slug", tenantAuthSlug, async (req, res) => {
    si ya existe, se devuelve el mismo (así el link enviado es siempre
    estable aunque se pida varias veces).
 ====================================================== */
-app.post("/reviews/:slug/request-link", tenantAuthSlugWrite, async (req, res) => {
+// "Pedir reseña" vive en el panel Clientes (no en Reviews), así que se
+// gatea con el módulo "clientes" -- tenantAuthSlug (sin requireWriteAccess)
+// + chequeo inline acá, para no heredar la regla genérica del prefijo
+// /reviews (que desde la auditoría 2026-09-20 mapea a "resenas" para el
+// panel de Reviews en sí, ver WRITE_ACCESS_MODULE_RULES).
+app.post("/reviews/:slug/request-link", tenantAuthSlug, async (req, res) => {
   try {
     const { slug } = req.params;
     const { customer_id } = req.body;
@@ -8777,6 +8788,11 @@ app.post("/reviews/:slug/request-link", tenantAuthSlugWrite, async (req, res) =>
     }
     if (!customer_id) {
       return res.status(400).json({ error: "customer_id es obligatorio" });
+    }
+
+    const accessCheck = evaluateModuleWriteAccess(req.authenticatedUser, "clientes");
+    if (!accessCheck.allowed) {
+      return res.status(403).json({ error: accessCheck.error });
     }
 
     const { data: tenant, error: tenantError } = await supabase
@@ -8874,7 +8890,7 @@ app.patch("/reviews/:id/status", [dashboardLimiter, requireTenantAuth, requireWr
       return res.status(404).json({ error: "Reseña no encontrada" });
     }
 
-    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, review.tenant_id, "clientes");
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, review.tenant_id, "resenas");
     if (!hasWriteAccess) return;
 
     const { data, error } = await supabase
