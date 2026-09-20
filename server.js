@@ -12426,7 +12426,18 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     // Flow al pausar (ver POST /admin/tenants/:id/pause), así que esto
     // también evita que el resto de las condiciones de abajo lo saquen
     // del bloqueo antes de tiempo.
-    const blocked = isPaused || Boolean(awaitingPayment && billingCycleEnd && now >= billingCycleEnd);
+    // trialExpired se agrega acá explícitamente (no solo billingCycleEnd):
+    // para un tenant en trial, billing_cycle_end se fija en el signup
+    // (~1 mes) y trial_ends_at en plan_config.trial_days (30 días por
+    // defecto) -- casi siempre coinciden, pero son columnas independientes
+    // (confirmado 2026-09-15: la fecha de trial_ends_at se puede ajustar a
+    // mano desde el panel admin sin tocar billing_cycle_end). Sin esto,
+    // un trial vencido podía quedar días sin bloquear el dashboard hasta
+    // que billing_cycle_end también pasara -- inconsistente con el aviso
+    // de vencimiento (banner/email/directorio admin), que sí usa
+    // trial_ends_at directamente.
+    const blocked =
+      isPaused || trialExpired || Boolean(awaitingPayment && billingCycleEnd && now >= billingCycleEnd);
 
     const msPerDay = 24 * 60 * 60 * 1000;
     const diasRestantesTrial = trialActive
