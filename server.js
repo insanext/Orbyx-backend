@@ -341,9 +341,9 @@ const DEFAULT_ADDON_CATALOG = {
     key: "staff",
     name: "+ 1 Profesional",
     description: "1 staff adicional sobre límite del plan",
-    price: 5990,
-    price_pack2: 5391,
-    price_pack3: 5092,
+    price: 4990,
+    price_pack2: 4491,
+    price_pack3: 4242,
     pack_size: 1,
     grants: { staff: 1 },
     min_plan: "starter",
@@ -721,6 +721,151 @@ async function checkDowngradeResourceLimits(tenant_id, targetPlan) {
     .join("; ");
 
   return { excesses, message };
+}
+
+// Staff y sucursales activas del tenant + límites efectivos del plan
+// destino (mismo cálculo que checkDowngradeResourceLimits). Base de la
+// selección "qué mantener" de un downgrade: la muestra /planes (vía
+// GET /billing/downgrade-resources), la valida POST /billing/change-plan y
+// la vuelve a revisar applyScheduledPlanChanges el día del cambio.
+async function getDowngradeResourceSnapshot(tenant_id, targetPlan) {
+  const [staffRes, branchesRes, maxStaff, maxBranches] = await Promise.all([
+    supabase
+      .from("staff")
+      .select("id, name, branch_id")
+      .eq("tenant_id", tenant_id)
+      .eq("is_active", true)
+      .order("name", { ascending: true }),
+    supabase
+      .from("branches")
+      .select("id, name")
+      .eq("tenant_id", tenant_id)
+      .eq("is_active", true)
+      .order("name", { ascending: true }),
+    getEffectiveLimitForPlan(tenant_id, targetPlan, "max_staff", "staff"),
+    getEffectiveLimitForPlan(tenant_id, targetPlan, "max_branches", "sucursal"),
+  ]);
+
+  if (staffRes.error) throw staffRes.error;
+  if (branchesRes.error) throw branchesRes.error;
+
+  return {
+    staff: staffRes.data || [],
+    branches: branchesRes.data || [],
+    maxStaff,
+    maxBranches,
+  };
+}
+
+// Valida la selección de qué mantener enviada desde /planes contra el
+// snapshot actual. Solo se exige/guarda selección para el recurso que de
+// verdad excede el límite (el otro queda null = no se toca). Devuelve
+// { missing: true } si falta la selección de un recurso que excede (el
+// caller responde el mismo 409 de siempre), { error } si es inválida, o
+// { keepStaffIds, keepBranchIds } listos para guardar.
+function validateDowngradeKeepSelection(snapshot, keepStaffIds, keepBranchIds) {
+  const normalizeIds = (value) =>
+    Array.isArray(value) ? [...new Set(value.map((id) => String(id)))] : null;
+
+  let keepBranches = null;
+  let keepStaff = null;
+
+  if (snapshot.branches.length > snapshot.maxBranches) {
+    const ids = normalizeIds(keepBranchIds);
+    if (!ids) return { missing: true };
+
+    const validIds = new Set(snapshot.branches.map((b) => b.id));
+    if (ids.length === 0 || ids.some((id) => !validIds.has(id))) {
+      return { error: "La selección de sucursales no es válida. Recarga la página e intenta de nuevo." };
+    }
+    if (ids.length > snapshot.maxBranches) {
+      return { error: `Solo puedes mantener ${snapshot.maxBranches} sucursal(es) activa(s) en el nuevo plan.` };
+    }
+    keepBranches = ids;
+  }
+
+  if (snapshot.staff.length > snapshot.maxStaff) {
+    const ids = normalizeIds(keepStaffIds);
+    if (!ids) return { missing: true };
+
+    const staffById = new Map(snapshot.staff.map((s) => [s.id, s]));
+    if (ids.length === 0 || ids.some((id) => !staffById.has(id))) {
+      return { error: "La selección de profesionales no es válida. Recarga la página e intenta de nuevo." };
+    }
+    if (ids.length > snapshot.maxStaff) {
+      return { error: `Solo puedes mantener ${snapshot.maxStaff} profesional(es) activo(s) en el nuevo plan.` };
+    }
+    if (
+      keepBranches &&
+      ids.some((id) => {
+        const branchId = staffById.get(id).branch_id;
+        return branchId && !keepBranches.includes(branchId);
+      })
+    ) {
+      return { error: "Seleccionaste profesionales de una sucursal que no vas a mantener." };
+    }
+    keepStaff = ids;
+  }
+
+  return { keepStaffIds: keepStaff, keepBranchIds: keepBranches };
+}
+
+// Día del downgrade: desactiva (is_active = false, el mismo cambio que hace
+// la desactivación manual en PUT /staff/:id y PATCH /branches/:id) lo que
+// el tenant no eligió mantener. Primero verifica en memoria que lo elegido
+// (que siga activo) entre en los límites efectivos de HOY — si no entra
+// (ej. se cancelaron add-ons entremedio), no desactiva nada y deja que
+// checkDowngradeResourceLimits bloquee el downgrade como siempre, para no
+// quitarle recursos a un tenant que igual va a seguir en su plan actual.
+async function applyDowngradeKeepSelection(tenant, newPlan) {
+  const keepStaff = Array.isArray(tenant.scheduled_keep_staff_ids)
+    ? new Set(tenant.scheduled_keep_staff_ids)
+    : null;
+  const keepBranches = Array.isArray(tenant.scheduled_keep_branch_ids)
+    ? new Set(tenant.scheduled_keep_branch_ids)
+    : null;
+
+  if (!keepStaff && !keepBranches) return;
+
+  const snapshot = await getDowngradeResourceSnapshot(tenant.id, newPlan);
+  const staffToDeactivate = keepStaff
+    ? snapshot.staff.filter((s) => !keepStaff.has(s.id)).map((s) => s.id)
+    : [];
+  const branchesToDeactivate = keepBranches
+    ? snapshot.branches.filter((b) => !keepBranches.has(b.id)).map((b) => b.id)
+    : [];
+
+  const remainingStaff = snapshot.staff.length - staffToDeactivate.length;
+  const remainingBranches = snapshot.branches.length - branchesToDeactivate.length;
+
+  if (remainingStaff > snapshot.maxStaff || remainingBranches > snapshot.maxBranches) {
+    console.warn(
+      `applyDowngradeKeepSelection: la selección guardada de tenant ${tenant.id} ya no entra en el plan ${newPlan} (staff ${remainingStaff}/${snapshot.maxStaff}, sucursales ${remainingBranches}/${snapshot.maxBranches}) — no se desactiva nada.`
+    );
+    return;
+  }
+
+  if (staffToDeactivate.length > 0) {
+    const { error } = await supabase
+      .from("staff")
+      .update({ is_active: false })
+      .eq("tenant_id", tenant.id)
+      .in("id", staffToDeactivate);
+    if (error) throw error;
+  }
+
+  if (branchesToDeactivate.length > 0) {
+    const { error } = await supabase
+      .from("branches")
+      .update({ is_active: false })
+      .eq("tenant_id", tenant.id)
+      .in("id", branchesToDeactivate);
+    if (error) throw error;
+  }
+
+  console.log(
+    `applyDowngradeKeepSelection: tenant ${tenant.id} → ${newPlan}: desactivados ${staffToDeactivate.length} profesional(es) y ${branchesToDeactivate.length} sucursal(es) según su selección.`
+  );
 }
 
 // Resetea add-ons con resets_monthly:true cuando han pasado ≥30 días desde el último reset.
@@ -12106,6 +12251,43 @@ app.get("/billing/preview-change", tenantAuth, async (req, res) => {
 });
 
 /* ======================================================
+   ✅ GET /billing/downgrade-resources
+   Solo lectura. Staff y sucursales activas + límites efectivos del plan
+   destino (base + add-ons que sobreviven al cambio), para que /planes
+   arme la selección de "qué mantener" con el mismo límite que después
+   valida POST /billing/change-plan.
+====================================================== */
+app.get("/billing/downgrade-resources", tenantAuth, async (req, res) => {
+  try {
+    const { tenant_id, new_plan } = req.query;
+
+    if (!tenant_id || !new_plan) {
+      return res.status(400).json({ error: "tenant_id y new_plan son obligatorios" });
+    }
+
+    const targetPlan = normalizePlanSlug(new_plan);
+    const snapshot = await getDowngradeResourceSnapshot(tenant_id, targetPlan);
+
+    return res.json({
+      new_plan: targetPlan,
+      staff: {
+        limit: snapshot.maxStaff,
+        exceeds: snapshot.staff.length > snapshot.maxStaff,
+        items: snapshot.staff,
+      },
+      branches: {
+        limit: snapshot.maxBranches,
+        exceeds: snapshot.branches.length > snapshot.maxBranches,
+        items: snapshot.branches,
+      },
+    });
+  } catch (err) {
+    console.error("GET /billing/downgrade-resources error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    ✅ POST /billing/change-plan
 ====================================================== */
 app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
@@ -12187,6 +12369,8 @@ app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
           scheduled_plan_slug: null,
           scheduled_change_at: null,
           pending_change_type: null,
+          scheduled_keep_staff_ids: null,
+          scheduled_keep_branch_ids: null,
           proration_credit: 0,
           proration_charge: amountCharged,
         })
@@ -12240,16 +12424,41 @@ app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
     // el frontend (staff/page.tsx, branches/page.tsx) — sin esto, se podía
     // agendar un downgrade aunque el tenant tuviera más staff o sucursales
     // activas de las que el plan destino permite.
+    //
+    // Si hay exceso, el tenant puede enviar keep_staff_ids/keep_branch_ids
+    // (elegidos en /planes): se validan y se guardan con el downgrade
+    // programado, SIN desactivar nada hoy — se aplican recién el día del
+    // cambio (applyScheduledPlanChanges), así sigue usando lo que paga
+    // hasta entonces. Sin selección válida, mismo 409 de siempre.
     const downgradeLimitCheck = await checkDowngradeResourceLimits(
       tenant_id,
       targetPlan
     );
 
+    let keepStaffIds = null;
+    let keepBranchIds = null;
+
     if (downgradeLimitCheck) {
-      return res.status(409).json({
-        error: `No puedes bajar al plan ${targetPlan}: ${downgradeLimitCheck.message}. Desactiva el excedente antes de continuar.`,
-        excess: downgradeLimitCheck.excesses,
-      });
+      const snapshot = await getDowngradeResourceSnapshot(tenant_id, targetPlan);
+      const selection = validateDowngradeKeepSelection(
+        snapshot,
+        req.body.keep_staff_ids,
+        req.body.keep_branch_ids
+      );
+
+      if (selection.missing) {
+        return res.status(409).json({
+          error: `No puedes bajar al plan ${targetPlan}: ${downgradeLimitCheck.message}. Elige qué mantener activo antes de continuar.`,
+          excess: downgradeLimitCheck.excesses,
+        });
+      }
+
+      if (selection.error) {
+        return res.status(400).json({ error: selection.error });
+      }
+
+      keepStaffIds = selection.keepStaffIds;
+      keepBranchIds = selection.keepBranchIds;
     }
 
     const { data, error } = await supabase
@@ -12258,6 +12467,8 @@ app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
         scheduled_plan_slug: targetPlan,
         scheduled_change_at: subscription.billingEnd.toISOString(),
         pending_change_type: "downgrade",
+        scheduled_keep_staff_ids: keepStaffIds,
+        scheduled_keep_branch_ids: keepBranchIds,
       })
       .eq("id", tenant_id)
       .select(`
@@ -12267,7 +12478,9 @@ app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
         billing_cycle_end,
         scheduled_plan_slug,
         scheduled_change_at,
-        pending_change_type
+        pending_change_type,
+        scheduled_keep_staff_ids,
+        scheduled_keep_branch_ids
       `)
       .single();
 
@@ -13203,34 +13416,45 @@ app.patch("/billing/addons/low-balance-recharge", tenantAuthWrite, async (req, r
 });
 
 /* ======================================================
-   ✅ POST /billing/apply-scheduled-changes
-   Lo puedes disparar manualmente o desde cron
+   ✅ applyScheduledPlanChanges + POST /billing/apply-scheduled-changes
+   Aplica los downgrades programados cuyo scheduled_change_at ya llegó.
+   Fix 2026-09-26: antes solo existía como endpoint y NADA lo llamaba (ni
+   cron interno ni externo), así que ningún downgrade programado se
+   aplicaba nunca — el tenant seguía en (y Flow seguía cobrando) el plan
+   anterior. Ahora corre cada hora desde node-cron (ver TAREAS
+   PROGRAMADAS INTERNAS al final del archivo). El endpoint pasa a
+   x-maintenance-secret en vez de tenantAuthWrite: con auth de tenant,
+   cualquier dueño de negocio podía disparar la aplicación de los
+   downgrades de TODOS los tenants.
 ====================================================== */
-app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) => {
-  try {
-    const nowIso = new Date().toISOString();
+async function applyScheduledPlanChanges() {
+  const nowIso = new Date().toISOString();
 
-    const { data: tenantsToApply, error: fetchError } = await supabase
-      .from("tenants")
-      .select(`
-        id,
-        plan_slug,
-        billing_cycle_start,
-        billing_cycle_end,
-        scheduled_plan_slug,
-        scheduled_change_at,
-        pending_change_type
-      `)
-      .not("scheduled_plan_slug", "is", null)
-      .not("scheduled_change_at", "is", null)
-      .lte("scheduled_change_at", nowIso);
+  const { data: tenantsToApply, error: fetchError } = await supabase
+    .from("tenants")
+    .select(`
+      id,
+      plan_slug,
+      billing_cycle_start,
+      billing_cycle_end,
+      scheduled_plan_slug,
+      scheduled_change_at,
+      pending_change_type,
+      scheduled_keep_staff_ids,
+      scheduled_keep_branch_ids
+    `)
+    .not("scheduled_plan_slug", "is", null)
+    .not("scheduled_change_at", "is", null)
+    .lte("scheduled_change_at", nowIso);
 
-    if (fetchError) throw fetchError;
+  if (fetchError) throw fetchError;
 
-    let applied = 0;
-    let blockedByLimits = 0;
+  let applied = 0;
+  let blockedByLimits = 0;
+  let failed = 0;
 
-    for (const tenant of tenantsToApply || []) {
+  for (const tenant of tenantsToApply || []) {
+    try {
       const newPlan = normalizePlanSlug(tenant.scheduled_plan_slug);
 
       // El estado del tenant pudo cambiar entre agendar el downgrade y este
@@ -13247,6 +13471,11 @@ app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) =
       // sync con Flow, cancelUnsupportedAddons) — resetMonthlyAddons más
       // abajo es mantenimiento del tenant independiente del downgrade y
       // debe seguir corriendo siempre, tenga o no exceso de recursos.
+      //
+      // Si el tenant eligió en /planes qué mantener (fix 2026-09-26), lo
+      // no elegido se desactiva recién ahora, justo antes de revalidar.
+      await applyDowngradeKeepSelection(tenant, newPlan);
+
       const downgradeLimitCheck = await checkDowngradeResourceLimits(
         tenant.id,
         newPlan
@@ -13276,6 +13505,8 @@ app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) =
             scheduled_plan_slug: null,
             scheduled_change_at: null,
             pending_change_type: null,
+            scheduled_keep_staff_ids: null,
+            scheduled_keep_branch_ids: null,
             proration_credit: 0,
             proration_charge: 0,
           })
@@ -13351,18 +13582,39 @@ app.post("/billing/apply-scheduled-changes", tenantAuthWrite, async (req, res) =
       // para el tenant, se haya aplicado el downgrade o haya quedado
       // bloqueado por exceso de staff/sucursales.
       await resetMonthlyAddons(tenant.id);
+    } catch (tenantErr) {
+      // Un tenant con error no debe frenar al resto (antes un throw
+      // cortaba el loop entero y los siguientes nunca se aplicaban).
+      failed++;
+      console.error(
+        `applyScheduledPlanChanges: error aplicando cambio programado de tenant ${tenant.id}:`,
+        tenantErr.message
+      );
     }
-
-    return res.json({
-      ok: true,
-      applied,
-      blocked_by_limits: blockedByLimits,
-    });
-  } catch (err) {
-    console.error("POST /billing/apply-scheduled-changes error:", err.message);
-    return res.status(500).json({ error: err.message });
   }
-});
+
+  return { applied, blockedByLimits, failed };
+}
+
+app.post(
+  "/billing/apply-scheduled-changes",
+  publicLimiter,
+  requireSignupMaintenanceSecret,
+  async (req, res) => {
+    try {
+      const result = await applyScheduledPlanChanges();
+      return res.json({
+        ok: true,
+        applied: result.applied,
+        blocked_by_limits: result.blockedByLimits,
+        failed: result.failed,
+      });
+    } catch (err) {
+      console.error("POST /billing/apply-scheduled-changes error:", err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 /* ======================================================
    ✅ POST /billing/flow/create-customer (sandbox)
@@ -20126,6 +20378,23 @@ cron.schedule("0 6 * * *", async () => {
     );
   } catch (err) {
     console.error("[CRON] trial/maintenance/send-reminders: falló —", err.message);
+  }
+});
+
+// Cada hora (no diario): scheduled_change_at = fin del ciclo, y cuanto
+// antes se aplique el downgrade, antes se sincroniza Flow con el plan
+// nuevo (ver applyScheduledPlanChanges). La consulta solo trae tenants con
+// cambio vencido, así que un run sin nada que aplicar es barato.
+cron.schedule("7 * * * *", async () => {
+  try {
+    const result = await applyScheduledPlanChanges();
+    if (result.applied || result.blockedByLimits || result.failed) {
+      console.log(
+        `[CRON] billing/apply-scheduled-changes: terminado — applied=${result.applied} blocked_by_limits=${result.blockedByLimits} failed=${result.failed}`
+      );
+    }
+  } catch (err) {
+    console.error("[CRON] billing/apply-scheduled-changes: falló —", err.message);
   }
 });
 
