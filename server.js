@@ -1828,6 +1828,7 @@ const WRITE_ACCESS_MODULE_RULES = [
   // vez de tenantAuthWrite, para no heredar esta regla genérica.
   { prefix: "/reviews", module: "resenas" },
   { prefix: "/appointments", module: "agenda" },
+  { prefix: "/agenda", module: "agenda" }, // bloqueo rápido de horarios (/agenda/quick-blocks)
   { prefix: "/staff", module: "staff" },
   { prefix: "/service", module: "servicios" }, // cubre /services y /service-groups
   { prefix: "/branches", module: "sucursales" },
@@ -5637,6 +5638,228 @@ app.delete("/staff-special-dates/:id", tenantAuthWrite, async (req, res) => {
   } catch (err) {
     console.error("DELETE /staff-special-dates/:id error:", err.message);
     return res.status(500).json({ error: "Error eliminando staff_special_date" });
+  }
+});
+
+/* ======================================================
+   ✅ POST /agenda/quick-blocks
+   Bloqueo rápido desde la Agenda. Se guarda como filas de
+   staff_special_dates (is_closed, source = 'quick_block'), así
+   getEffectiveStaffAvailability lo respeta en slots públicos y en la
+   validación de POST /appointments/slot sin tocar esa lógica.
+   scope "staff" = 1 fila; scope "branch" = 1 fila por profesional
+   activo de la sucursal, todas con el mismo quick_block_group_id.
+   Si hay reservas "booked" en el rango, responde 409 con la lista y
+   solo bloquea si viene confirm_overlap = true (las reservas existentes
+   NO se cancelan: el bloqueo solo impide reservas nuevas).
+====================================================== */
+app.post("/agenda/quick-blocks", tenantAuthWrite, async (req, res) => {
+  try {
+    const {
+      tenant_id,
+      branch_id,
+      date,
+      scope,
+      staff_id,
+      start_time,
+      end_time,
+      confirm_overlap,
+    } = req.body || {};
+
+    if (!branch_id) {
+      return res.status(400).json({ error: "branch_id es obligatorio" });
+    }
+
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+      return res.status(400).json({ error: "date inválida" });
+    }
+
+    if (scope !== "staff" && scope !== "branch") {
+      return res.status(400).json({ error: "scope debe ser 'staff' o 'branch'" });
+    }
+
+    if (scope === "staff" && !staff_id) {
+      return res.status(400).json({ error: "staff_id es obligatorio para bloquear un profesional" });
+    }
+
+    const isFullDay = !start_time && !end_time;
+    let startMinutes = 0;
+    let endMinutes = 24 * 60;
+
+    if (!isFullDay) {
+      startMinutes = timeToMinutes(start_time);
+      endMinutes = timeToMinutes(end_time);
+
+      if (startMinutes === null || endMinutes === null || endMinutes <= startMinutes) {
+        return res.status(400).json({ error: "El rango de horario no es válido" });
+      }
+    }
+
+    const branch = await getBranchById(branch_id).catch(() => null);
+
+    if (!branch || branch.tenant_id !== tenant_id) {
+      return res.status(404).json({ error: "La sucursal no pertenece a este negocio" });
+    }
+
+    let staffQuery = supabase
+      .from("staff")
+      .select("id, name")
+      .eq("tenant_id", tenant_id)
+      .eq("branch_id", branch_id)
+      .eq("is_active", true);
+
+    if (scope === "staff") {
+      staffQuery = staffQuery.eq("id", staff_id);
+    }
+
+    const { data: staffRows, error: staffError } = await staffQuery;
+
+    if (staffError) throw staffError;
+
+    if (!staffRows || staffRows.length === 0) {
+      return res.status(404).json({
+        error: "No hay profesionales activos para bloquear en esta sucursal",
+      });
+    }
+
+    const staffNameById = new Map(staffRows.map((row) => [row.id, row.name]));
+
+    const [year, month, day] = String(date).split("-").map(Number);
+    const nextDate = new Date(Date.UTC(year, month - 1, day + 1))
+      .toISOString()
+      .slice(0, 10);
+
+    const rangeStartIso = santiagoLocalToUtcIso(
+      date,
+      Math.floor(startMinutes / 60),
+      startMinutes % 60
+    );
+    const rangeEndIso =
+      endMinutes >= 24 * 60
+        ? santiagoLocalToUtcIso(nextDate, 0, 0)
+        : santiagoLocalToUtcIso(date, Math.floor(endMinutes / 60), endMinutes % 60);
+
+    let overlapQuery = supabase
+      .from("appointments")
+      .select("id, start_at, end_at, staff_id, customer_name")
+      .eq("tenant_id", tenant_id)
+      .eq("branch_id", branch_id)
+      .eq("status", "booked")
+      .lt("start_at", rangeEndIso)
+      .gt("end_at", rangeStartIso)
+      .order("start_at", { ascending: true });
+
+    if (scope === "staff") {
+      overlapQuery = overlapQuery.eq("staff_id", staff_id);
+    }
+
+    const { data: overlapping, error: overlapError } = await overlapQuery;
+
+    if (overlapError) throw overlapError;
+
+    const conflicts = (overlapping || []).map((appt) => ({
+      id: appt.id,
+      start_at: appt.start_at,
+      end_at: appt.end_at,
+      customer_name: appt.customer_name || null,
+      staff_id: appt.staff_id || null,
+      staff_name: appt.staff_id ? staffNameById.get(appt.staff_id) || null : null,
+    }));
+
+    if (conflicts.length > 0 && confirm_overlap !== true) {
+      return res.status(409).json({
+        error: "Hay reservas confirmadas dentro del horario que quieres bloquear",
+        requires_confirmation: true,
+        conflicts,
+      });
+    }
+
+    const groupId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
+    const toTime = (minutes) =>
+      `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+
+    const rows = staffRows.map((staff) => ({
+      tenant_id,
+      branch_id,
+      staff_id: staff.id,
+      date,
+      label: "Bloqueo rápido",
+      is_closed: true,
+      start_time: isFullDay ? null : toTime(startMinutes),
+      end_time: isFullDay ? null : toTime(endMinutes),
+      source: "quick_block",
+      quick_block_group_id: groupId,
+      updated_at: nowIso,
+    }));
+
+    const { data: inserted, error: insertError } = await supabase
+      .from("staff_special_dates")
+      .insert(rows)
+      .select("*");
+
+    if (insertError) throw insertError;
+
+    return res.status(201).json({
+      ok: true,
+      group_id: groupId,
+      items: inserted || [],
+      overlapped_appointments: conflicts.length,
+    });
+  } catch (err) {
+    console.error("POST /agenda/quick-blocks error:", err.message);
+    return res.status(500).json({ error: "Error creando el bloqueo de horario" });
+  }
+});
+
+/* ======================================================
+   ✅ DELETE /agenda/quick-blocks/:id?tenant_id=&scope=single|group
+   Solo borra filas creadas por el flujo rápido (source = 'quick_block').
+   Cualquier otra excepción/horario se sigue gestionando desde
+   "Configurar horarios" — acá se rechaza con 403.
+====================================================== */
+app.delete("/agenda/quick-blocks/:id", tenantAuthWrite, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tenantId = req.authenticatedUser.tenant_id;
+    const scope = req.query.scope === "group" ? "group" : "single";
+
+    const { data: existingRow } = await supabase
+      .from("staff_special_dates")
+      .select("id, source, quick_block_group_id")
+      .eq("id", id)
+      .eq("tenant_id", tenantId)
+      .maybeSingle();
+
+    if (!existingRow) {
+      return res.status(404).json({ error: "Bloqueo no encontrado" });
+    }
+
+    if (existingRow.source !== "quick_block") {
+      return res.status(403).json({
+        error: "Este bloqueo viene de la configuración de horarios y se gestiona desde ahí",
+      });
+    }
+
+    let deleteQuery = supabase
+      .from("staff_special_dates")
+      .delete()
+      .eq("tenant_id", tenantId)
+      .eq("source", "quick_block");
+
+    deleteQuery =
+      scope === "group" && existingRow.quick_block_group_id
+        ? deleteQuery.eq("quick_block_group_id", existingRow.quick_block_group_id)
+        : deleteQuery.eq("id", id);
+
+    const { error } = await deleteQuery;
+
+    if (error) throw error;
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /agenda/quick-blocks/:id error:", err.message);
+    return res.status(500).json({ error: "Error desbloqueando el horario" });
   }
 });
 
