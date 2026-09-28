@@ -23,6 +23,8 @@ const {
   sendLegalAcceptanceConfirmationEmail,
   sendDepositReceiptUploadedEmail,
   sendTrialEndingReminderEmail,
+  sendPasswordResetEmail,
+  sendWelcomeAccessEmail,
 } = require("./email");
 const {
   sendWhatsAppTemplate,
@@ -19982,32 +19984,84 @@ app.post("/admin/tenants/:id/view-session", requireAdminAuth, async (req, res) =
 });
 
 /* ======================================================
+   🔑 Reset de contraseña + ✉️ bienvenida — entrega por Resend
+   Supabase Auth solo genera el token (admin.generateLink type "recovery");
+   la ENTREGA va por Resend desde notificaciones.orbyx.cl (email.js).
+   Antes: resetPasswordForEmail (mailer de Supabase -> Gmail lo marcaba
+   sospechoso y le quitaba el link) y auth.resend({type:"signup"}) (no-op
+   silencioso para cuentas ya confirmadas: éxito falso en el panel).
+
+   El link NO es el action_link de Supabase: ese redirige con tokens en el
+   hash (flujo implícito) y el cliente del navegador (@supabase/ssr, PKCE)
+   lo rechaza ("Not a valid PKCE flow url"). Se arma el link propio con el
+   hashed_token y /actualizar-password lo canjea con verifyOtp({ token_hash,
+   type: "recovery" }) — patrón oficial de Supabase para SSR.
+====================================================== */
+const PUBLIC_SITE_URL = "https://www.orbyx.cl"; // canónico de links públicos (invitaciones, legales)
+
+async function sendPasswordResetForEmail(email) {
+  const { data, error } = await supabase.auth.admin.generateLink({
+    type: "recovery",
+    email,
+    options: { redirectTo: `${PUBLIC_SITE_URL}/actualizar-password` },
+  });
+
+  if (error) {
+    const userNotFound =
+      error.status === 404 ||
+      error.code === "user_not_found" ||
+      /not.?found/i.test(error.message || "");
+    return { ok: false, userNotFound, reason: error.message || "generate_link_error" };
+  }
+
+  const hashedToken = data?.properties?.hashed_token;
+  if (!hashedToken) {
+    return { ok: false, reason: "Supabase no devolvió hashed_token para el link de recuperación" };
+  }
+
+  const resetUrl = `${PUBLIC_SITE_URL}/actualizar-password?token_hash=${encodeURIComponent(hashedToken)}&type=recovery`;
+  const sent = await sendPasswordResetEmail({ to: email, resetUrl });
+  if (!sent.ok) {
+    return { ok: false, sendFailed: true, reason: sent.reason || "resend_error" };
+  }
+  return { ok: true };
+}
+
+/* ======================================================
    ✉️ POST /admin/tenants/:id/resend-welcome-email
-   Reenvía el email de confirmación de cuenta que Supabase Auth ya envía
-   automáticamente al hacer signUp() (mismo mecanismo estándar, via
-   supabase.auth.resend) -- no es un email custom de este proyecto.
+   Correo de bienvenida/acceso propio por Resend (se envía siempre, cuenta
+   confirmada o no). No toca la confirmación de cuenta de Supabase del
+   registro normal (/signup), que sigue igual.
    🔑 POST /admin/tenants/:id/send-password-reset
-   Dispara el flujo estándar de reset de contraseña de Supabase Auth
-   (mismo supabase.auth.resetPasswordForEmail que usa /recuperar-password
-   en el frontend, mismo redirectTo).
+   Mismo mecanismo que POST /auth/password-reset (/recuperar-password).
+   Ambos responden error si Resend falla — nada de éxito falso.
 ====================================================== */
 app.post("/admin/tenants/:id/resend-welcome-email", requireAdminAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    const { data: tenant } = await supabase.from("tenants").select("id, name").eq("id", id).single();
+    if (!tenant) return res.status(404).json({ error: "Tenant no encontrado" });
+
     const { ownerEmail } = await getActiveOwnerEmail(id);
     if (!ownerEmail) {
       return res.status(400).json({ error: "No se encontró un usuario owner activo para este tenant" });
     }
 
-    const { error: resendError } = await supabase.auth.resend({ type: "signup", email: ownerEmail });
-    if (resendError) throw resendError;
+    const sent = await sendWelcomeAccessEmail({
+      to: ownerEmail,
+      businessName: tenant.name,
+      loginUrl: `${PUBLIC_SITE_URL}/login`,
+    });
+    if (!sent.ok) {
+      return res.status(502).json({ error: `No se pudo enviar el email de bienvenida: ${sent.reason}` });
+    }
 
     await logAdminTenantAction({
       tenantId: id,
       adminUserId: req.adminUser.user_id,
       adminEmail: req.adminUser.email,
       actionType: "resend_welcome_email",
-      details: { owner_email: ownerEmail },
+      details: { owner_email: ownerEmail, via: "resend" },
     });
 
     res.json({ ok: true, owner_email: ownerEmail });
@@ -20025,23 +20079,109 @@ app.post("/admin/tenants/:id/send-password-reset", requireAdminAuth, async (req,
       return res.status(400).json({ error: "No se encontró un usuario owner activo para este tenant" });
     }
 
-    const { error: resetError } = await supabase.auth.resetPasswordForEmail(ownerEmail, {
-      redirectTo: "https://orbyx.cl/actualizar-password",
-    });
-    if (resetError) throw resetError;
+    const result = await sendPasswordResetForEmail(ownerEmail);
+    if (!result.ok) {
+      return res
+        .status(result.sendFailed ? 502 : 500)
+        .json({ error: `No se pudo enviar el reset de contraseña: ${result.reason}` });
+    }
 
     await logAdminTenantAction({
       tenantId: id,
       adminUserId: req.adminUser.user_id,
       adminEmail: req.adminUser.email,
       actionType: "password_reset_sent",
-      details: { owner_email: ownerEmail },
+      details: { owner_email: ownerEmail, via: "resend" },
     });
 
     res.json({ ok: true, owner_email: ownerEmail });
   } catch (err) {
     console.error("POST /admin/tenants/:id/send-password-reset error:", err.message);
     res.status(500).json({ error: err.message || "Error enviando el reset de contraseña" });
+  }
+});
+
+/* ======================================================
+   🔑 POST /auth/password-reset  (público — /recuperar-password)
+   Reemplaza supabase.auth.resetPasswordForEmail del frontend: mismo
+   mecanismo que el botón del panel admin (sendPasswordResetForEmail, abajo).
+   - Captcha: antes lo validaba Supabase Auth (captchaToken). Ahora que el
+     link se genera con la service role, se valida acá con Turnstile si
+     TURNSTILE_SECRET_KEY está configurada (mismo secret del sitio que usa
+     NEXT_PUBLIC_TURNSTILE_SITE_KEY). Sin la variable: se registra un
+     warning y se sigue (no se corta el reset a clientes reales), con el
+     rate limit (passwordVerifyLimiter) + cooldown por email de resguardo.
+   - Respuesta genérica si el email no existe (no confirmar ni negar
+     cuentas). Si el envío por Resend falla, SÍ se informa error.
+====================================================== */
+const passwordResetCooldown = new Map(); // email -> timestamp último envío
+const PASSWORD_RESET_COOLDOWN_MS = 60 * 1000;
+let warnedMissingTurnstileSecret = false;
+
+async function verifyTurnstileToken(token, ip) {
+  const secret = process.env.TURNSTILE_SECRET_KEY;
+  if (!secret) {
+    if (!warnedMissingTurnstileSecret) {
+      console.warn("[password-reset] TURNSTILE_SECRET_KEY no configurada: captcha NO verificado en backend.");
+      warnedMissingTurnstileSecret = true;
+    }
+    return true;
+  }
+  if (!token) return false;
+  try {
+    const body = new URLSearchParams({ secret, response: String(token) });
+    if (ip) body.set("remoteip", ip);
+    const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      body,
+    });
+    const result = await response.json().catch(() => null);
+    return Boolean(result?.success);
+  } catch (err) {
+    console.error("[password-reset] error verificando Turnstile:", err.message);
+    return false;
+  }
+}
+
+app.post("/auth/password-reset", passwordVerifyLimiter, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Ingresa un correo válido." });
+    }
+
+    const captchaOk = await verifyTurnstileToken(req.body?.captcha_token, extractClientIp(req));
+    if (!captchaOk) {
+      return res.status(400).json({
+        error: "No pudimos verificar que no eres un robot. Recarga la página e intenta de nuevo.",
+      });
+    }
+
+    const now = Date.now();
+    const last = passwordResetCooldown.get(email) || 0;
+    if (now - last < PASSWORD_RESET_COOLDOWN_MS) {
+      // Respuesta genérica: no revela si hubo un envío reciente.
+      return res.json({ ok: true });
+    }
+    passwordResetCooldown.set(email, now);
+    if (passwordResetCooldown.size > 5000) {
+      for (const [key, ts] of passwordResetCooldown) {
+        if (now - ts > PASSWORD_RESET_COOLDOWN_MS) passwordResetCooldown.delete(key);
+      }
+    }
+
+    const result = await sendPasswordResetForEmail(email);
+    if (!result.ok) {
+      if (result.userNotFound) return res.json({ ok: true });
+      passwordResetCooldown.delete(email);
+      console.error("POST /auth/password-reset error:", result.reason);
+      return res.status(502).json({ error: "No pudimos enviar el correo. Intenta de nuevo en unos minutos." });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /auth/password-reset error:", err.message);
+    return res.status(500).json({ error: "No pudimos procesar la solicitud. Intenta de nuevo." });
   }
 });
 

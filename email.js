@@ -1597,6 +1597,160 @@ async function sendTrialEndingReminderEmail({ to, businessName, diasRestantes, b
   }
 }
 
+// Reset de contraseña: el link lo genera Supabase (admin.generateLink,
+// type "recovery") en server.js, pero la ENTREGA va por Resend desde el
+// dominio propio verificado (antes salía por el mailer de Supabase Auth y
+// Gmail lo marcaba sospechoso y le quitaba el link). Mismo patrón que
+// sendTrialEndingReminderEmail: retorna { ok, reason } en vez de lanzar,
+// para que el endpoint propague el error real en vez de responder éxito.
+async function sendPasswordResetEmail({ to, resetUrl }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Email de reset de contraseña omitido.");
+      return { ok: false, reason: "resend_not_configured" };
+    }
+
+    const { data, error } = await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: "Restablece tu contraseña de Orbyx",
+      html: `
+<div style="margin:0; padding:30px 16px; background:#f1f5f9; font-family:Arial, Helvetica, sans-serif;">
+  <div style="max-width:560px; margin:0 auto;">
+    <div style="background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.1);">
+      <div style="background:linear-gradient(135deg,#0f172a,#312e81); padding:28px; text-align:center;">
+        <div style="color:#cbd5e1; font-size:12px; letter-spacing:0.2em;">SEGURIDAD DE TU CUENTA</div>
+        <h1 style="color:#ffffff; margin:10px 0 0; font-size:24px;">Restablecer contraseña</h1>
+      </div>
+      <div style="padding:24px;">
+        <h2 style="margin:0 0 10px;">Crea una nueva contraseña</h2>
+        <p style="color:#475569; font-size:15px;">
+          Recibimos una solicitud para restablecer la contraseña de tu cuenta de Orbyx.
+          Haz clic en el botón para elegir una nueva.
+        </p>
+        <div style="text-align:center; margin-top:24px;">
+          <a href="${resetUrl}" style="background:#0f172a; color:white; padding:12px 24px; border-radius:12px; text-decoration:none; font-weight:bold; font-size:15px;">
+            Restablecer contraseña
+          </a>
+        </div>
+        <p style="margin-top:20px; font-size:12px; color:#94a3b8; text-align:center;">
+          O copia este enlace en tu navegador:<br/>
+          <a href="${resetUrl}" style="color:#6366f1; word-break:break-all;">${resetUrl}</a>
+        </p>
+        <p style="color:#64748b; font-size:13px; margin-top:20px;">
+          El enlace es de un solo uso y expira pronto. Si no pediste este cambio, ignora este correo:
+          tu contraseña actual sigue funcionando.
+        </p>
+      </div>
+      <div style="padding:16px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
+        <a href="https://www.orbyx.cl" style="color:#64748b; font-size:12px; text-decoration:none;" target="_blank">
+          Orbyx · Sistema de reservas inteligentes
+        </a>
+      </div>
+    </div>
+  </div>
+</div>`,
+      text: `Restablece tu contraseña de Orbyx
+
+Recibimos una solicitud para restablecer la contraseña de tu cuenta. Abre este enlace para elegir una nueva:
+${resetUrl}
+
+Si no pediste este cambio, ignora este correo.`,
+    });
+
+    if (error) {
+      console.error("Error enviando email de reset de contraseña:", error);
+      return { ok: false, reason: error.message || "resend_error" };
+    }
+
+    console.log("[PASSWORD RESET EMAIL] Enviado:", JSON.stringify(data));
+    return { ok: true };
+  } catch (error) {
+    console.error("Error enviando email de reset de contraseña:", error);
+    return { ok: false, reason: error?.message || "unknown_error" };
+  }
+}
+
+// Bienvenida / acceso (botón admin "Reenviar email de bienvenida"): correo
+// propio por Resend, se envía siempre (cuenta confirmada o no). No toca el
+// correo de confirmación de cuenta de Supabase del registro normal.
+async function sendWelcomeAccessEmail({ to, businessName, loginUrl }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Email de bienvenida omitido.");
+      return { ok: false, reason: "resend_not_configured" };
+    }
+
+    const name = businessName || "tu negocio";
+    // Nombre del negocio y correo vienen de datos del usuario: escapados
+    // para el HTML (escapeHtml, ya definido en este módulo).
+    const safeName = escapeHtml(name);
+    const safeTo = escapeHtml(to);
+
+    const { data, error } = await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: `Bienvenido a Orbyx — accede a ${name}`,
+      html: `
+<div style="margin:0; padding:30px 16px; background:#f1f5f9; font-family:Arial, Helvetica, sans-serif;">
+  <div style="max-width:560px; margin:0 auto;">
+    <div style="background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.1);">
+      <div style="background:linear-gradient(135deg,#0f172a,#312e81); padding:28px; text-align:center;">
+        <div style="color:#cbd5e1; font-size:12px; letter-spacing:0.2em;">BIENVENIDO A ORBYX</div>
+        <h1 style="color:#ffffff; margin:10px 0 0; font-size:24px;">${safeName}</h1>
+      </div>
+      <div style="padding:24px;">
+        <div style="background:#dcfce7; color:#166534; display:inline-block; padding:6px 12px; border-radius:999px; font-size:12px; margin-bottom:12px;">
+          ✓ Tu cuenta está lista
+        </div>
+        <h2 style="margin:0 0 10px;">Tu agenda te espera</h2>
+        <p style="color:#475569; font-size:15px;">
+          Desde tu panel puedes gestionar tu agenda, tus reservas online, tu equipo y tus clientes.
+          Ingresa con el correo <strong>${safeTo}</strong> y tu contraseña.
+        </p>
+        <div style="text-align:center; margin-top:24px;">
+          <a href="${loginUrl}" style="background:#0f172a; color:white; padding:12px 24px; border-radius:12px; text-decoration:none; font-weight:bold; font-size:15px;">
+            Entrar a mi panel
+          </a>
+        </div>
+        <p style="margin-top:20px; font-size:12px; color:#94a3b8; text-align:center;">
+          O copia este enlace en tu navegador:<br/>
+          <a href="${loginUrl}" style="color:#6366f1;">${loginUrl}</a>
+        </p>
+        <p style="color:#64748b; font-size:13px; margin-top:20px;">
+          ¿No recuerdas tu contraseña? Usa "¿Olvidaste tu contraseña?" en la pantalla de inicio de sesión.
+          ¿Necesitas ayuda? Escríbenos a <a href="mailto:soporte@orbyx.cl" style="color:#6366f1;">soporte@orbyx.cl</a>.
+        </p>
+      </div>
+      <div style="padding:16px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
+        <a href="https://www.orbyx.cl" style="color:#64748b; font-size:12px; text-decoration:none;" target="_blank">
+          Orbyx · Sistema de reservas inteligentes
+        </a>
+      </div>
+    </div>
+  </div>
+</div>`,
+      text: `Bienvenido a Orbyx
+
+Tu cuenta de ${name} está lista. Entra a tu panel con el correo ${to}:
+${loginUrl}
+
+¿Necesitas ayuda? Escríbenos a soporte@orbyx.cl.`,
+    });
+
+    if (error) {
+      console.error("Error enviando email de bienvenida:", error);
+      return { ok: false, reason: error.message || "resend_error" };
+    }
+
+    console.log("[WELCOME EMAIL] Enviado:", JSON.stringify(data));
+    return { ok: true };
+  } catch (error) {
+    console.error("Error enviando email de bienvenida:", error);
+    return { ok: false, reason: error?.message || "unknown_error" };
+  }
+}
+
 module.exports = {
   sendBookingEmail,
   sendInvitationEmail,
@@ -1607,4 +1761,6 @@ module.exports = {
   sendLegalAcceptanceConfirmationEmail,
   sendDepositReceiptUploadedEmail,
   sendTrialEndingReminderEmail,
+  sendPasswordResetEmail,
+  sendWelcomeAccessEmail,
 };
