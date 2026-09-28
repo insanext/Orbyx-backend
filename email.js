@@ -18,12 +18,44 @@ function formatDate(dateString) {
   });
 }
 
+// Link "Agregar a Google Calendar" (sin .ics): plantilla TEMPLATE de
+// calendar.google.com con fechas en UTC (formato YYYYMMDDTHHmmssZ).
+function toGoogleCalendarStamp(date) {
+  return date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+}
+
+function buildGoogleCalendarUrl({ title, start, end, location, details }) {
+  const params = new URLSearchParams({
+    action: "TEMPLATE",
+    text: title,
+    dates: `${toGoogleCalendarStamp(start)}/${toGoogleCalendarStamp(end)}`,
+    ctz: "America/Santiago",
+  });
+  if (location) params.set("location", location);
+  if (details) params.set("details", details);
+  return `https://calendar.google.com/calendar/render?${params.toString()}`;
+}
+
+// Correo de confirmación de reserva (rediseño 2026-09-28, aprobado v2):
+// - Header = el negocio: su logo (tenants.logo_url, tal cual — si no carga,
+//   p.ej. WebP en Outlook, el cliente muestra el alt con el nombre) o, sin
+//   logo, un avatar con la inicial (tenants.brand_color o índigo de Orbyx)
+//   + el nombre debajo. Orbyx solo aparece en el pie.
+// - Sin fotos ni imágenes decorativas (entregabilidad): la única imagen
+//   posible es el logo del negocio. Sin emojis ni SVG (Gmail/Outlook).
+// - branchName solo llega si el negocio tiene 2+ sucursales activas (lo
+//   decide server.js); si no, se muestra solo la dirección.
+// - Instrucciones: solo si el negocio las cargó en el servicio
+//   (services.customer_instructions); sin texto por defecto.
+// - Mismos parámetros de siempre + logoUrl/brandColor/branchName/endAt
+//   (todos opcionales: GET /jobs/send-reminders llama con menos datos).
 async function sendBookingEmail({
   email,
   customerName,
   businessName,
   serviceName,
   startAt,
+  endAt,
   cancelUrl,
   address,
   phone,
@@ -33,6 +65,9 @@ async function sendBookingEmail({
   petName,
   petSpecies,
   customerInstructions,
+  logoUrl,
+  brandColor,
+  branchName,
 }) {
   try {
     // 👇 evita que explote en local
@@ -41,122 +76,204 @@ async function sendBookingEmail({
       return;
     }
 
-    const formattedDate = formatDate(startAt);
+    const esc = (value) =>
+      String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+
+    const business = businessName || "Orbyx";
+    const service = serviceName || "Reserva";
+    const accent = "#0f172a";
+
+    const start = new Date(startAt);
+    const endCandidate = endAt ? new Date(endAt) : null;
+    const end =
+      endCandidate && !Number.isNaN(endCandidate.getTime()) && endCandidate > start
+        ? endCandidate
+        : new Date(start.getTime() + 60 * 60 * 1000);
+
+    const dateLabel = start.toLocaleDateString("es-CL", {
+      timeZone: "America/Santiago",
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+    });
+    const dateCap = dateLabel.charAt(0).toUpperCase() + dateLabel.slice(1);
+    const timeLabel = start.toLocaleTimeString("es-CL", {
+      timeZone: "America/Santiago",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
 
     const isVeterinary = ["veterinaria", "vet"].includes(
       String(businessCategory || "").toLowerCase()
     );
 
-    const petHtml =
+    const calendarUrl = buildGoogleCalendarUrl({
+      title: `${service} · ${business}`,
+      start,
+      end,
+      location: [branchName, address].filter(Boolean).join(" · "),
+      details: `Reserva confirmada en ${business}.${cancelUrl ? `\nSi necesitas cancelar: ${cancelUrl}` : ""}`,
+    });
+
+    // Header: logo del negocio, o avatar de inicial + nombre.
+    const DEFAULT_AVATAR_COLOR = "#312e81";
+    const avatarColor = /^#[0-9a-f]{6}$/i.test(String(brandColor || ""))
+      ? brandColor
+      : DEFAULT_AVATAR_COLOR;
+    const [red, green, blue] = [1, 3, 5].map((i) => parseInt(avatarColor.slice(i, i + 2), 16));
+    const avatarTextColor =
+      (0.299 * red + 0.587 * green + 0.114 * blue) / 255 > 0.62 ? "#0f172a" : "#ffffff";
+    const initial = (business.match(/[A-Za-zÁÉÍÓÚÑÜáéíóúñü0-9]/) || ["O"])[0].toUpperCase();
+
+    const headerHtml = logoUrl
+      ? `<img src="${esc(logoUrl)}" alt="${esc(business)}" height="56" style="display:block; margin:0 auto; max-height:56px; max-width:200px; height:auto; border:0; outline:none; font:700 20px Arial,Helvetica,sans-serif; color:${accent};">`
+      : `<table role="presentation" cellpadding="0" cellspacing="0" align="center" style="margin:0 auto;"><tr>
+            <td width="56" height="56" align="center" valign="middle" style="width:56px; height:56px; background:${avatarColor}; border-radius:28px; font:700 26px/56px Arial,Helvetica,sans-serif; color:${avatarTextColor}; text-align:center;">${esc(initial)}</td>
+          </tr></table>
+          <div style="margin-top:10px; font:600 14px/1.3 Arial,Helvetica,sans-serif; color:#475569;">${esc(business)}</div>`;
+
+    const detailRow = (label, value, sub) => `
+          <tr>
+            <td style="padding:12px 0; border-top:1px solid #eef2f7; width:112px; vertical-align:top;">
+              <span style="font:700 11px/1.4 Arial,Helvetica,sans-serif; color:#64748b; letter-spacing:0.08em; text-transform:uppercase;">${label}</span>
+            </td>
+            <td style="padding:12px 0; border-top:1px solid #eef2f7; vertical-align:top;">
+              <div style="font:600 15px/1.4 Arial,Helvetica,sans-serif; color:#0f172a;">${value}</div>
+              ${sub ? `<div style="font:400 13px/1.45 Arial,Helvetica,sans-serif; color:#64748b; margin-top:2px;">${sub}</div>` : ""}
+            </td>
+          </tr>`;
+
+    const rowsHtml = [
+      detailRow("Servicio", esc(service)),
+      branchName || address
+        ? detailRow(
+            branchName ? "Sucursal" : "Dirección",
+            esc(branchName || address),
+            branchName && address ? esc(address) : ""
+          )
+        : "",
+      locationText
+        ? detailRow(locationType === "online" ? "Modalidad" : "Ubicación", esc(locationText))
+        : "",
+      phone
+        ? detailRow(
+            "Teléfono",
+            `<a href="tel:${esc(String(phone).replace(/\s+/g, ""))}" style="color:#0f172a; text-decoration:none;">${esc(phone)}</a>`
+          )
+        : "",
       isVeterinary && (petName || petSpecies)
-        ? `
-        <div style="margin-top:16px; padding-top:16px; border-top:1px solid #e2e8f0;">
-          <p style="margin:0 0 8px; font-size:15px;">
-            <strong>🐶 Mascota:</strong> ${petName || "-"}
-          </p>
-          <p style="margin:0; font-size:15px;">
-            <strong>🐾 Especie:</strong> ${petSpecies || "-"}
-          </p>
-        </div>
-      `
-        : "";
+        ? detailRow("Mascota", esc(petName || "-"), petSpecies ? esc(petSpecies) : "")
+        : "",
+    ].join("");
 
     const instructionsHtml = customerInstructions
       ? `
-        <div style="background:#fffbeb; border:1px solid #fde68a; border-radius:14px; padding:16px; margin-top:16px;">
-          <p style="margin:0 0 6px; font-size:13px; font-weight:bold; color:#92400e; text-transform:uppercase; letter-spacing:0.05em;">
-            📋 Instrucciones importantes
-          </p>
-          <p style="margin:0; font-size:14px; color:#78350f; white-space:pre-line;">${String(
-            customerInstructions
-          )
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")}</p>
-        </div>
-      `
+        <tr><td style="padding:0 32px 8px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#fffbeb; border:1px solid #fde68a; border-radius:12px;">
+            <tr><td style="padding:14px 16px;">
+              <div style="font:700 11px/1.4 Arial,Helvetica,sans-serif; color:#92400e; letter-spacing:0.08em; text-transform:uppercase;">Antes de tu visita</div>
+              <div style="font:400 14px/1.5 Arial,Helvetica,sans-serif; color:#78350f; margin-top:4px; white-space:pre-line;">${esc(customerInstructions)}</div>
+            </td></tr>
+          </table>
+        </td></tr>`
       : "";
+
+    const cancelButtonHtml = cancelUrl
+      ? `
+            <tr>
+              <td align="center">
+                <a href="${esc(cancelUrl)}" style="display:block; background:#ffffff; color:#0f172a; font:700 14px/1 Arial,Helvetica,sans-serif; text-decoration:none; padding:13px 18px; border-radius:12px; border:1px solid #cbd5e1;">Cancelar reserva</a>
+              </td>
+            </tr>`
+      : "";
+
+    const preheader = `${business}: ${dateCap} a las ${timeLabel} hrs · ${service}`;
+
+    const html = `<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light only"><title>Reserva confirmada</title></head>
+<body style="margin:0; padding:0; background:#f1f5f9;">
+  <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">${esc(preheader)}</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;">
+    <tr><td align="center" style="padding:28px 12px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px; background:#ffffff; border-radius:18px; border:1px solid #e2e8f0;">
+
+        <tr><td align="center" style="padding:28px 32px 20px; border-bottom:1px solid #eef2f7;">
+          ${headerHtml}
+        </td></tr>
+
+        <tr><td style="padding:26px 32px 6px;">
+          <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+            <td style="width:22px; height:22px; background:#16a34a; border-radius:11px; text-align:center; vertical-align:middle; font:700 13px/22px Arial,Helvetica,sans-serif; color:#ffffff;">&#10003;</td>
+            <td style="padding-left:8px; font:700 12px/1.4 Arial,Helvetica,sans-serif; color:#16a34a; letter-spacing:0.08em; text-transform:uppercase;">Reserva confirmada</td>
+          </tr></table>
+          <h1 style="margin:14px 0 4px; font:700 24px/1.25 Arial,Helvetica,sans-serif; color:#0f172a;">${esc(dateCap)}</h1>
+          <div style="font:700 34px/1.1 Arial,Helvetica,sans-serif; color:#0f172a; letter-spacing:-0.5px;">${esc(timeLabel)} <span style="font-size:15px; font-weight:600; color:#64748b; letter-spacing:0;">hrs</span></div>
+          <p style="margin:16px 0 0; font:400 15px/1.55 Arial,Helvetica,sans-serif; color:#475569;">Hola <strong style="color:#0f172a;">${esc(customerName)}</strong>, te esperamos. Aquí está el detalle de tu reserva.</p>
+        </td></tr>
+
+        <tr><td style="padding:14px 32px 18px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${rowsHtml}
+          </table>
+        </td></tr>
+
+        ${instructionsHtml}
+
+        <tr><td style="padding:10px 32px 8px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            <tr>
+              <td align="center" style="padding:0 0 10px;">
+                <a href="${esc(calendarUrl)}" style="display:block; background:${accent}; color:#ffffff; font:700 15px/1 Arial,Helvetica,sans-serif; text-decoration:none; padding:15px 18px; border-radius:12px;">Agregar a Google Calendar</a>
+              </td>
+            </tr>${cancelButtonHtml}
+          </table>
+          <p style="margin:12px 0 0; text-align:center; font:400 12px/1.5 Arial,Helvetica,sans-serif; color:#94a3b8;">Si necesitas cambiar tu hora, cancela y vuelve a reservar.</p>
+        </td></tr>
+
+        <tr><td style="padding:22px 32px 26px;">
+          <div style="border-top:1px solid #eef2f7; padding-top:16px; text-align:center; font:400 12px/1.5 Arial,Helvetica,sans-serif; color:#94a3b8;">
+            Reserva gestionada con <a href="https://www.orbyx.cl" style="color:#64748b; text-decoration:none; font-weight:700;">Orbyx</a>
+          </div>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+
+    const text = [
+      `Reserva confirmada · ${business}`,
+      "",
+      `Hola ${customerName || ""}, te esperamos.`,
+      "",
+      `Servicio: ${service}`,
+      `Fecha: ${dateCap}`,
+      `Hora: ${timeLabel} hrs`,
+      branchName ? `Sucursal: ${branchName}` : null,
+      address ? `Dirección: ${address}` : null,
+      locationText ? `${locationType === "online" ? "Modalidad" : "Ubicación"}: ${locationText}` : null,
+      phone ? `Teléfono: ${phone}` : null,
+      isVeterinary && (petName || petSpecies) ? `Mascota: ${petName || "-"}${petSpecies ? ` (${petSpecies})` : ""}` : null,
+      customerInstructions ? `\nAntes de tu visita:\n${customerInstructions}` : null,
+      "",
+      `Agregar a Google Calendar: ${calendarUrl}`,
+      cancelUrl ? `Cancelar reserva: ${cancelUrl}` : null,
+      "",
+      "Reserva gestionada con Orbyx · https://www.orbyx.cl",
+    ]
+      .filter((line) => line !== null)
+      .join("\n");
 
     await resend.emails.send({
       from: "Orbyx <reservas@notificaciones.orbyx.cl>",
       to: email,
-      subject: `Reserva confirmada · ${businessName || "Orbyx"}`,
-      html: `
-<div style="margin:0; padding:30px 16px; background:#f1f5f9; font-family:Arial, Helvetica, sans-serif;">
-
-  <div style="max-width:560px; margin:0 auto;">
-
-    <div style="background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.1);">
-
-      <div style="background:linear-gradient(135deg,#0f172a,#312e81); padding:28px; text-align:center;">
-        <div style="color:#cbd5e1; font-size:12px; letter-spacing:0.2em;">
-          RESERVA CONFIRMADA
-        </div>
-
-        <h1 style="color:#ffffff; margin:10px 0 0; font-size:26px;">
-          ${businessName}
-        </h1>
-      </div>
-
-      <div style="padding:24px;">
-
-        <div style="background:#dcfce7; color:#166534; display:inline-block; padding:6px 12px; border-radius:999px; font-size:12px; margin-bottom:12px;">
-          ✔ Reserva agendada
-        </div>
-
-        <h2 style="margin:0 0 10px;">Tu hora está confirmada</h2>
-
-        <p style="color:#475569;">
-          Hola <strong>${customerName}</strong>, aquí tienes el detalle de tu reserva.
-        </p>
-
-        <div style="background:#f8fafc; padding:16px; border-radius:14px; border:1px solid #e2e8f0; margin-top:16px;">
-
-          <p><strong>💼 Servicio:</strong> ${serviceName}</p>
-          <p><strong>📅 Fecha:</strong> ${formattedDate}</p>
-
-          ${address ? `<p><strong>📍 Dirección:</strong> ${address}</p>` : ""}
-          ${phone ? `<p><strong>📞 Teléfono:</strong> ${phone}</p>` : ""}
-          ${
-            locationText
-              ? `<p><strong>📌 ${locationType === "online" ? "Modalidad" : "Ubicación"}:</strong> ${locationText}</p>`
-              : ""
-          }
-
-          ${petHtml}
-
-        </div>
-
-        ${instructionsHtml}
-
-        <div style="text-align:center; margin-top:24px;">
-          <a href="${cancelUrl}" style="background:#0f172a; color:white; padding:12px 20px; border-radius:12px; text-decoration:none; font-weight:bold;">
-            Cancelar reserva
-          </a>
-        </div>
-
-        <p style="margin-top:20px; font-size:13px; color:#64748b;">
-          Puedes cancelar y reagendar cuando lo necesites.
-        </p>
-
-      </div>
-
-      <div style="padding:16px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
-        <a 
-          href="https://orbyx.cl"
-          style="color:#64748b; font-size:12px; text-decoration:none;"
-          target="_blank"
-        >
-          Orbyx · Sistema de reservas inteligentes
-        </a>
-      </div>
-
-    </div>
-
-  </div>
-
-</div>
-`,
+      subject: `Reserva confirmada · ${business}`,
+      html,
+      text,
     });
   } catch (error) {
     console.error("Error enviando email:", error);

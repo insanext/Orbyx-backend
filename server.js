@@ -1277,6 +1277,24 @@ function normalizeBookingPhone(rawPhone) {
 // depósito no se re-resuelven desde la mascota (limitación conocida, ver
 // CLAUDE.md: la confirmación disparada desde ahí sale sin datos de mascota
 // incluso para tenants veterinarios).
+// Nombre de sucursal para el correo de confirmación: solo si el negocio
+// tiene 2+ sucursales activas (con una sola, el correo muestra solo la
+// dirección). Best-effort: ante error, sin nombre.
+async function getBranchNameForBookingEmail(tenantId, branchName) {
+  if (!tenantId || !branchName) return null;
+  try {
+    const { count, error } = await supabase
+      .from("branches")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenantId)
+      .eq("is_active", true);
+    if (error) return null;
+    return (count || 0) >= 2 ? branchName : null;
+  } catch {
+    return null;
+  }
+}
+
 async function sendBookingConfirmations({
   tenantId,
   tenantInfo,
@@ -1285,10 +1303,12 @@ async function sendBookingConfirmations({
   normalizedPhone,
   serviceName,
   startAt,
+  endAt,
   cancelUrl,
   petName,
   petSpecies,
   branchAddress,
+  branchName,
   customerInstructions,
 }) {
   const start = startAt instanceof Date ? startAt : new Date(startAt);
@@ -1300,6 +1320,7 @@ async function sendBookingConfirmations({
       businessName: tenantInfo?.name || "Tu negocio",
       serviceName: serviceName || "Reserva",
       startAt: start.toISOString(),
+      endAt: endAt ? new Date(endAt).toISOString() : null,
       cancelUrl,
       address: branchAddress || tenantInfo?.address || null,
       phone: tenantInfo?.phone || null,
@@ -1307,6 +1328,9 @@ async function sendBookingConfirmations({
       petName: petName || null,
       petSpecies: petSpecies || null,
       customerInstructions: customerInstructions || null,
+      logoUrl: tenantInfo?.logo_url || null,
+      brandColor: tenantInfo?.brand_color || null,
+      branchName: await getBranchNameForBookingEmail(tenantId, branchName),
     });
   }
 
@@ -6728,13 +6752,13 @@ if (customerData && typeof customerData === "object" && Object.keys(customerData
 
 const { data: tenantInfo, error: tenantInfoError } = await supabase
   .from("tenants")
-  .select("name, address, phone, business_category, wa_confirmation_enabled")
+  .select("name, address, phone, business_category, wa_confirmation_enabled, logo_url, brand_color")
   .eq("id", cal.tenant_id)
   .single();
 
 const { data: branchInfoForEmail } = await supabase
   .from("branches")
-  .select("address")
+  .select("name, address")
   .eq("id", resolvedBranchId)
   .maybeSingle();
 
@@ -6761,10 +6785,12 @@ if (!appointmentRequiresDeposit) {
     normalizedPhone,
     serviceName,
     startAt: start,
+    endAt: apptUpdated?.end_at || null,
     cancelUrl,
     petName,
     petSpecies,
     branchAddress: branchInfoForEmail?.address || null,
+    branchName: branchInfoForEmail?.name || null,
     customerInstructions,
   });
 
@@ -11465,14 +11491,14 @@ app.post(
 
       const { data: tenantInfo } = await supabase
         .from("tenants")
-        .select("name, slug, address, phone, business_category, wa_confirmation_enabled")
+        .select("name, slug, address, phone, business_category, wa_confirmation_enabled, logo_url, brand_color")
         .eq("id", appt.tenant_id)
         .single();
 
       const { data: branchInfoForEmail } = appt.branch_id
         ? await supabase
             .from("branches")
-            .select("address")
+            .select("name, address")
             .eq("id", appt.branch_id)
             .maybeSingle()
         : { data: null };
@@ -11500,8 +11526,10 @@ app.post(
         normalizedPhone: appt.customer_phone,
         serviceName: appt.service_name_snapshot,
         startAt: appt.start_at,
+        endAt: appt.end_at || null,
         cancelUrl,
         branchAddress: branchInfoForEmail?.address || null,
+        branchName: branchInfoForEmail?.name || null,
         customerInstructions: serviceInfoForEmail?.customer_instructions || null,
       });
 
