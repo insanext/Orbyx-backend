@@ -13317,9 +13317,12 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
      (urlReturn) y se redirige al dashboard con ?addon_payment=...
    Ambos confirman con /payment/getStatus y activan vía
    processAddonPaymentToken (idempotente: el que llegue primero activa).
-   Regla de negocio (aprobada 2026-09-28): se paga la CANTIDAD TOTAL nueva
-   de cada add-on y expires_at = pago + 30 días (una sola fecha por fila).
-   Los packs de mensajes también vencen a los 30 días.
+   Reglas de negocio (2026-09-28):
+   - Capacidad (staff, sucursal, group_capacity): se paga la CANTIDAD TOTAL
+     nueva y expires_at = pago + 30 días (una sola fecha por fila).
+   - Packs de mensajes (resets_monthly: wa_confirmacion, campanas_wa,
+     emails_campana): NO vencen — se cobra solo lo que se agrega, se suma
+     al saldo (balance) y se usa hasta agotarse (expires_at = null).
 ====================================================== */
 const ONE_TIME_ADDON_DAYS = 30;
 const ADDON_PAYMENT_BACKEND_BASE = "https://orbyx-backend.onrender.com";
@@ -13381,17 +13384,26 @@ app.post("/billing/addons/checkout", tenantAuthWrite, async (req, res) => {
           code: "addon_has_card_billing",
         });
       }
-      if (current && quantity < Number(current.quantity || 0)) {
+      const currentQty = current ? Number(current.quantity || 0) : 0;
+      const isPack = Boolean(ADDON_CATALOG[addonKey]?.resets_monthly);
+
+      if (isPack ? quantity <= currentQty : quantity < currentQty) {
         return res.status(400).json({
-          error: "El pago único es por la cantidad total nueva; para reducir unidades usa el selector sin pagar.",
+          error: "El pago único solo sirve para agregar; para reducir unidades usa el selector sin pagar.",
         });
       }
 
-      // Cantidad TOTAL nueva, con tramos desde la primera unidad.
-      const netAmount = tieredAddonChargeAmount(addonKey, 0, quantity);
+      // Packs: se cobran solo los packs nuevos (tramos desde los que ya
+      // tiene). Capacidad: la cantidad TOTAL nueva, tramos desde la 1ª.
+      const added = isPack ? quantity - currentQty : quantity;
+      const netAmount = isPack
+        ? tieredAddonChargeAmount(addonKey, currentQty, added)
+        : tieredAddonChargeAmount(addonKey, 0, quantity);
       lines.push({
         addon_key: addonKey,
+        kind: isPack ? "pack" : "capacity",
         quantity,
+        added,
         net_amount: netAmount,
         unit_price: addonUnitTierPrice(addonKey, quantity - 1),
       });
@@ -13438,7 +13450,7 @@ app.post("/billing/addons/checkout", tenantAuthWrite, async (req, res) => {
     try {
       payment = await flowApiRequest("/payment/create", {
         commerceOrder,
-        subject: `Orbyx add-ons (pago único 30 días): ${subjectItems}`.slice(0, 250),
+        subject: `Orbyx add-ons (pago único): ${subjectItems}`.slice(0, 250),
         currency: "CLP",
         amount,
         email: payerEmail,
@@ -13485,7 +13497,10 @@ async function grantOneTimeAddonItems(intent, paidAtIso) {
 
   for (const line of intent.items || []) {
     const addonDef = ADDON_CATALOG[line.addon_key];
-    const balanceGrant = addonDef?.resets_monthly ? line.quantity * (addonDef.pack_size || 0) : 0;
+    const isPack = Boolean(addonDef?.resets_monthly);
+    // Packs: solo los packs agregados en este pago se suman al saldo.
+    const packsAdded = Number(line.added ?? line.quantity) || 0;
+    const balanceGrant = isPack ? packsAdded * (addonDef.pack_size || 0) : 0;
 
     const { data: existing, error: existingErr } = await supabase
       .from("tenant_addons")
@@ -13511,7 +13526,8 @@ async function grantOneTimeAddonItems(intent, paidAtIso) {
       renewal_mode: "pago_unico",
       billing_cycle: "mensual",
       last_charged_at: paidAtIso,
-      expires_at: expiresAt,
+      // Packs de mensajes no vencen (saldo hasta agotarse).
+      expires_at: isPack ? null : expiresAt,
       last_expiry_reminder_sent_at: null,
       updated_at: paidAtIso,
     };
