@@ -13844,10 +13844,15 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
     // esta app para ningún otro flujo tampoco.
     let balanceIncrement = 0;
 
-    if (qty > existing.quantity && existing.renewal_mode === "pago_unico") {
+    // Pago único: no se modifica por acá. No hay "bajar cantidad" (no hay
+    // nada que reembolsar: la capacidad vence sola a los 30 días y los
+    // mensajes se consumen) y agregar es otra compra por pago único.
+    if (existing.renewal_mode === "pago_unico" && qty !== existing.quantity) {
       return res.status(409).json({
         error:
-          "Este add-on está activo con pago único. Para agregar unidades, paga de nuevo una sola vez o activa el cobro automático.",
+          qty > existing.quantity
+            ? "Este add-on está activo con pago único. Para agregar, haz otra compra por pago único o activa el cobro automático."
+            : "Un add-on de pago único no se puede reducir: la capacidad vence sola a los 30 días y los mensajes se consumen.",
         code: "use_one_time_checkout",
       });
     }
