@@ -1868,6 +1868,88 @@ ${loginUrl}
   }
 }
 
+// Aviso de vencimiento de add-ons comprados con PAGO ÚNICO (sin
+// renovación automática): se envía hasta 3 días antes de expires_at, máx.
+// 1 vez por día (ver sendOneTimeAddonExpiryReminders en server.js). Mismo
+// patrón { ok, reason } que sendTrialEndingReminderEmail.
+async function sendAddonExpiryReminderEmail({ to, businessName, items, billingUrl }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Aviso de vencimiento de add-ons omitido.");
+      return { ok: false, reason: "resend_not_configured" };
+    }
+
+    const formatExpiry = (iso) =>
+      new Date(iso).toLocaleDateString("es-CL", {
+        timeZone: "America/Santiago",
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+      });
+
+    const rowsHtml = (items || [])
+      .map(
+        (item) => `
+          <tr>
+            <td style="padding:10px 0; border-top:1px solid #eef2f7; font:600 14px/1.4 Arial,Helvetica,sans-serif; color:#0f172a;">${escapeHtml(item.name)} <span style="color:#64748b; font-weight:400;">× ${escapeHtml(item.quantity)}</span></td>
+            <td style="padding:10px 0; border-top:1px solid #eef2f7; font:400 13px/1.4 Arial,Helvetica,sans-serif; color:#64748b; text-align:right;">vence el ${escapeHtml(formatExpiry(item.expiresAt))}</td>
+          </tr>`
+      )
+      .join("");
+
+    const { data, error } = await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: `Tus add-ons de Orbyx están por vencer — ${businessName || "tu negocio"}`,
+      html: `
+<div style="margin:0; padding:30px 16px; background:#f1f5f9; font-family:Arial, Helvetica, sans-serif;">
+  <div style="max-width:560px; margin:0 auto;">
+    <div style="background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.1);">
+      <div style="background:linear-gradient(135deg,#0f172a,#312e81); padding:28px; text-align:center;">
+        <div style="color:#cbd5e1; font-size:12px; letter-spacing:0.2em;">ADD-ONS POR VENCER</div>
+        <h1 style="color:#ffffff; margin:10px 0 0; font-size:24px;">${escapeHtml(businessName || "Tu negocio")}</h1>
+      </div>
+      <div style="padding:24px;">
+        <h2 style="margin:0 0 10px;">Tus add-ons de pago único están por vencer</h2>
+        <p style="color:#475569; font-size:15px;">
+          Los pagaste una sola vez, así que no se renuevan solos. Para seguir usándolos,
+          renuévalos con otro pago único o inscribe tu tarjeta para que se renueven automáticamente.
+        </p>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:12px;">${rowsHtml}
+        </table>
+        <div style="text-align:center; margin-top:24px;">
+          <a href="${billingUrl}" style="background:#0f172a; color:white; padding:12px 24px; border-radius:12px; text-decoration:none; font-weight:bold; font-size:15px;">
+            Renovar add-ons
+          </a>
+        </div>
+        <p style="margin-top:20px; font-size:12px; color:#94a3b8; text-align:center;">
+          O copia este enlace en tu navegador:<br/>
+          <a href="${billingUrl}" style="color:#6366f1;">${billingUrl}</a>
+        </p>
+      </div>
+      <div style="padding:16px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
+        <a href="https://www.orbyx.cl" style="color:#64748b; font-size:12px; text-decoration:none;" target="_blank">
+          Orbyx · Sistema de reservas inteligentes
+        </a>
+      </div>
+    </div>
+  </div>
+</div>`,
+    });
+
+    if (error) {
+      console.error("Error enviando aviso de vencimiento de add-ons:", error);
+      return { ok: false, reason: error.message || "resend_error" };
+    }
+
+    console.log("[ADDON EXPIRY EMAIL] Enviado:", JSON.stringify(data));
+    return { ok: true };
+  } catch (error) {
+    console.error("Error enviando aviso de vencimiento de add-ons:", error);
+    return { ok: false, reason: error?.message || "unknown_error" };
+  }
+}
+
 module.exports = {
   sendBookingEmail,
   sendInvitationEmail,
@@ -1880,4 +1962,5 @@ module.exports = {
   sendTrialEndingReminderEmail,
   sendPasswordResetEmail,
   sendWelcomeAccessEmail,
+  sendAddonExpiryReminderEmail,
 };

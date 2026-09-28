@@ -25,6 +25,7 @@ const {
   sendTrialEndingReminderEmail,
   sendPasswordResetEmail,
   sendWelcomeAccessEmail,
+  sendAddonExpiryReminderEmail,
 } = require("./email");
 const {
   sendWhatsAppTemplate,
@@ -513,16 +514,54 @@ function getAddonsForPlan(plan) {
 
 // Add-ons activos contratados por un tenant (tabla tenant_addons)
 async function getActiveAddons(tenant_id) {
-  const { data, error } = await supabase
+  const baseColumns =
+    "id, addon_key, quantity, billing_cycle, status, activated_at, unit_price, last_reset_at, renewal_mode, last_charged_at, low_balance_recharge_enabled, low_balance_recharge_consented_at";
+
+  let { data, error } = await supabase
     .from("tenant_addons")
-    .select("id, addon_key, quantity, billing_cycle, status, activated_at, unit_price, last_reset_at, renewal_mode, last_charged_at, low_balance_recharge_enabled, low_balance_recharge_consented_at")
+    .select(`${baseColumns}, expires_at`)
     .eq("tenant_id", tenant_id)
     .eq("status", "active");
+
+  // expires_at llega con 2026-09-28-addon-one-time-payments.sql; si la
+  // migración aún no corrió, se lista igual sin esa columna.
+  if (error && isMissingSchemaError(error)) {
+    ({ data, error } = await supabase
+      .from("tenant_addons")
+      .select(baseColumns)
+      .eq("tenant_id", tenant_id)
+      .eq("status", "active"));
+  }
 
   if (error) throw error;
 
   return data || [];
 }
+
+// ¿El tenant tiene un medio de pago inscrito en Flow? Mismo criterio que el
+// resto del código (active / card_registered / trialing = tarjeta Oneclick
+// registrada). Tener flow_customer_id solo NO basta: el customer puede
+// existir sin tarjeta (ej. registro pagado a medias o tarjeta eliminada).
+async function getTenantPaymentMethod(tenant_id) {
+  const { data, error } = await supabase
+    .from("subscriptions")
+    .select("id, flow_customer_id, status")
+    .eq("tenant_id", tenant_id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  const hasPaymentMethod =
+    Boolean(data?.flow_customer_id) &&
+    ["active", "card_registered", "trialing"].includes(String(data?.status || ""));
+
+  return { subscription: data || null, hasPaymentMethod };
+}
+
+const PAYMENT_METHOD_REQUIRED_MESSAGE =
+  "No tienes un medio de pago inscrito. Inscribe tu tarjeta en Facturación y pago o paga este add-on una sola vez.";
 
 // Capacidad grupal efectiva = base del plan + (packs activos × 25).
 // Tolerante a la ausencia de tenant_addons: retorna la base del plan.
@@ -1606,6 +1645,8 @@ const FLOW_INBOUND_PATHS = new Set([
   "/billing/flow/register-card-callback",
   "/billing/flow/webhook",
   "/signup/register-card-callback",
+  "/billing/addons/flow-confirmation",
+  "/billing/addons/flow-return",
 ]);
 
 const corsMiddleware = cors(corsOptions);
@@ -3253,9 +3294,26 @@ function signFlowParams(params, secretKey) {
   return crypto.createHmac("sha256", secretKey).update(toSign).digest("hex");
 }
 
+// Ambiente de Flow derivado SOLO de variables de entorno: pasar de sandbox
+// a producción es cambiar FLOW_API_URL (https://www.flow.cl/api) y las
+// credenciales (FLOW_API_KEY / FLOW_SECRET_KEY), sin tocar código.
+// FLOW_SANDBOX_API_KEY / FLOW_SANDBOX_SECRET_KEY se siguen leyendo como
+// respaldo para no romper el despliegue actual (que usa esos nombres).
+// FLOW_ENV separa los datos cacheados que viven dentro de una cuenta de
+// Flow (flow_plans, addon_purchase_intents), que no existen en la otra.
+const FLOW_ENV = /sandbox/i.test(process.env.FLOW_API_URL || "") ? "sandbox" : "live";
+
+// Error de PostgREST por columna/tabla que todavía no existe (migración
+// pendiente): 42703 = columna inexistente, PGRST204 = columna fuera del
+// schema cache, 42P01 = tabla inexistente.
+function isMissingSchemaError(err) {
+  const code = String(err?.code || "");
+  return code === "42703" || code === "PGRST204" || code === "42P01" || code === "PGRST205";
+}
+
 async function flowApiRequest(endpoint, params, method = "POST") {
-  const apiKey = process.env.FLOW_SANDBOX_API_KEY;
-  const secretKey = process.env.FLOW_SANDBOX_SECRET_KEY;
+  const apiKey = process.env.FLOW_API_KEY || process.env.FLOW_SANDBOX_API_KEY;
+  const secretKey = process.env.FLOW_SECRET_KEY || process.env.FLOW_SANDBOX_SECRET_KEY;
   const baseUrl = process.env.FLOW_API_URL;
 
   const fullParams = { ...params, apiKey };
@@ -3324,14 +3382,30 @@ const PERIODICIDAD_TO_FLOW_INTERVAL = {
 // flowPlanId por monto también evita colisionar en Flow mismo con un plan
 // ya creado ahí bajo un precio distinto para el mismo plan_id+periodicidad.
 async function getOrCreateFlowPlan(plan_id, periodicidad, monto) {
-  const { data: existing, error: existingErr } = await supabase
+  // flow_plans cachea IDs que existen dentro de UNA cuenta de Flow: se
+  // separan por FLOW_ENV (migración 2026-09-28-addon-one-time-payments.sql)
+  // para que al pasar a producción no se reutilicen planes del sandbox.
+  // Si la columna flow_env todavía no existe, se usa el cache sin ambiente
+  // (comportamiento anterior).
+  let flowEnvColumnAvailable = true;
+  let { data: existing, error: existingErr } = await supabase
     .from("flow_plans")
     .select("flow_plan_id")
     .eq("plan_id", plan_id)
     .eq("periodicidad", periodicidad)
     .eq("monto", monto)
+    .eq("flow_env", FLOW_ENV)
     .maybeSingle();
-
+  if (existingErr && isMissingSchemaError(existingErr)) {
+    flowEnvColumnAvailable = false;
+    ({ data: existing, error: existingErr } = await supabase
+      .from("flow_plans")
+      .select("flow_plan_id")
+      .eq("plan_id", plan_id)
+      .eq("periodicidad", periodicidad)
+      .eq("monto", monto)
+      .maybeSingle());
+  }
   if (existingErr) throw existingErr;
   if (existing?.flow_plan_id) return existing.flow_plan_id;
 
@@ -3360,12 +3434,19 @@ async function getOrCreateFlowPlan(plan_id, periodicidad, monto) {
     flowPlan = await flowApiRequest("/plans/get", { planId: flowPlanId }, "GET");
   }
 
-  const { error: upsertErr } = await supabase
-    .from("flow_plans")
-    .upsert(
-      { plan_id, periodicidad, monto, flow_plan_id: flowPlan.planId },
-      { onConflict: "plan_id,periodicidad,monto" }
-    );
+  const { error: upsertErr } = flowEnvColumnAvailable
+    ? await supabase
+        .from("flow_plans")
+        .upsert(
+          { plan_id, periodicidad, monto, flow_env: FLOW_ENV, flow_plan_id: flowPlan.planId },
+          { onConflict: "plan_id,periodicidad,monto,flow_env" }
+        )
+    : await supabase
+        .from("flow_plans")
+        .upsert(
+          { plan_id, periodicidad, monto, flow_plan_id: flowPlan.planId },
+          { onConflict: "plan_id,periodicidad,monto" }
+        );
   if (upsertErr) throw upsertErr;
 
   return flowPlan.planId;
@@ -12867,12 +12948,22 @@ app.get("/billing/addons", tenantAuth, async (req, res) => {
       }
     }
 
+    let hasPaymentMethod = null;
+    if (tenant_id) {
+      try {
+        ({ hasPaymentMethod } = await getTenantPaymentMethod(tenant_id));
+      } catch (pmErr) {
+        console.warn("GET /billing/addons payment method error:", pmErr.message);
+      }
+    }
+
     return res.json({
       ok: true,
       ...(normalizedPlan ? { plan: normalizedPlan } : {}),
       ...(limits ? { limits } : {}),
       addons,
       ...(active !== null ? { active_addons: active } : {}),
+      ...(hasPaymentMethod !== null ? { has_payment_method: hasPaymentMethod } : {}),
     });
   } catch (err) {
     console.error("GET /billing/addons error:", err.message);
@@ -13099,13 +13190,21 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
 
     const { data: existing, error: existingError } = await supabase
       .from("tenant_addons")
-      .select("id, quantity, balance")
+      .select("id, quantity, balance, renewal_mode")
       .eq("tenant_id", tenant_id)
       .eq("addon_key", addon_key)
       .eq("status", "active")
       .maybeSingle();
 
     if (existingError) throw existingError;
+
+    if (existing?.renewal_mode === "pago_unico") {
+      return res.status(409).json({
+        error:
+          "Este add-on está activo con pago único. Para agregar unidades, paga de nuevo una sola vez o activa el cobro automático.",
+        code: "use_one_time_checkout",
+      });
+    }
 
     // Cobra el tier real de CADA unidad nueva (ver tieredAddonChargeAmount),
     // no un solo tier aplicado a todo el lote.
@@ -13122,20 +13221,15 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
     // renovar toda la quantity a esa tarifa plana.
     const unitPrice = addonUnitTierPrice(addon_key, currentQty + qty - 1);
 
-    const { data: addonSubscription, error: addonSubErr } = await supabase
-      .from("subscriptions")
-      .select("id, flow_customer_id")
-      .eq("tenant_id", tenant_id)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    // Antes solo se revisaba flow_customer_id: con customer pero SIN
+    // tarjeta, el cobro fallaba en Flow y se devolvía su error crudo (500).
+    const { subscription: addonSubscription, hasPaymentMethod } =
+      await getTenantPaymentMethod(tenant_id);
 
-    if (addonSubErr) throw addonSubErr;
-
-    if (!addonSubscription || !addonSubscription.flow_customer_id) {
-      return res.status(400).json({
-        error:
-          "Necesitas tener un medio de pago registrado para activar add-ons. Ve a Facturación y pago para agregar tu tarjeta.",
+    if (!hasPaymentMethod) {
+      return res.status(402).json({
+        error: PAYMENT_METHOD_REQUIRED_MESSAGE,
+        code: "payment_method_required",
       });
     }
 
@@ -13212,6 +13306,469 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
 });
 
 /* ======================================================
+   💳 Add-ons con PAGO ÚNICO (Flow /payment/create)
+   Alternativa al cobro automático con tarjeta inscrita, para tenants sin
+   tarjeta (ej. en trial) o que prefieren no dejar un cobro recurrente.
+   - POST /billing/addons/checkout: valida igual que activate, crea una
+     intención pendiente (addon_purchase_intents) y devuelve la URL del
+     checkout de Flow.
+   - POST /billing/addons/flow-confirmation: webhook de Flow (urlConfirmation).
+   - POST|GET /billing/addons/flow-return: Flow devuelve al usuario acá
+     (urlReturn) y se redirige al dashboard con ?addon_payment=...
+   Ambos confirman con /payment/getStatus y activan vía
+   processAddonPaymentToken (idempotente: el que llegue primero activa).
+   Regla de negocio (aprobada 2026-09-28): se paga la CANTIDAD TOTAL nueva
+   de cada add-on y expires_at = pago + 30 días (una sola fecha por fila).
+   Los packs de mensajes también vencen a los 30 días.
+====================================================== */
+const ONE_TIME_ADDON_DAYS = 30;
+const ADDON_PAYMENT_BACKEND_BASE = "https://orbyx-backend.onrender.com";
+
+app.post("/billing/addons/checkout", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id, items } = req.body || {};
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: "tenant_id es obligatorio" });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "items es obligatorio" });
+    }
+
+    let tenantPlan;
+    try {
+      tenantPlan = await getPlan(tenant_id);
+    } catch {
+      return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    const { data: activeRows, error: activeErr } = await supabase
+      .from("tenant_addons")
+      .select("addon_key, quantity, renewal_mode")
+      .eq("tenant_id", tenant_id)
+      .eq("status", "active");
+    if (activeErr) throw activeErr;
+    const activeByKey = {};
+    for (const row of activeRows || []) activeByKey[row.addon_key] = row;
+
+    const seen = new Set();
+    const lines = [];
+    for (const item of items) {
+      const addonKey = item?.addon_key;
+      const quantity = Number(item?.quantity);
+
+      if (!addonKey || !ADDON_CATALOG[addonKey] || seen.has(addonKey)) {
+        return res.status(400).json({ error: `addon_key inválido o repetido: ${addonKey}` });
+      }
+      seen.add(addonKey);
+
+      if (!Number.isInteger(quantity) || quantity < 1 || quantity > 50) {
+        return res.status(400).json({ error: "quantity debe ser un entero entre 1 y 50" });
+      }
+
+      if (!isAddonAvailableForPlan(addonKey, tenantPlan)) {
+        return res.status(403).json({
+          error: `El plan ${tenantPlan} no permite contratar este add-on`,
+          upgrade_required: true,
+        });
+      }
+
+      const current = activeByKey[addonKey];
+      if (current && current.renewal_mode !== "pago_unico") {
+        return res.status(409).json({
+          error: `${ADDON_CATALOG[addonKey].name} ya tiene cobro con tarjeta; agrega unidades con tu tarjeta registrada.`,
+          code: "addon_has_card_billing",
+        });
+      }
+      if (current && quantity < Number(current.quantity || 0)) {
+        return res.status(400).json({
+          error: "El pago único es por la cantidad total nueva; para reducir unidades usa el selector sin pagar.",
+        });
+      }
+
+      // Cantidad TOTAL nueva, con tramos desde la primera unidad.
+      const netAmount = tieredAddonChargeAmount(addonKey, 0, quantity);
+      lines.push({
+        addon_key: addonKey,
+        quantity,
+        net_amount: netAmount,
+        unit_price: addonUnitTierPrice(addonKey, quantity - 1),
+      });
+    }
+
+    // Misma suma que muestra el modal: IVA redondeado por línea.
+    const netTotal = lines.reduce((sum, line) => sum + line.net_amount, 0);
+    const amount = lines.reduce((sum, line) => sum + applyIva(line.net_amount), 0);
+
+    const { ownerEmail } = await getActiveOwnerEmail(tenant_id);
+    const payerEmail = ownerEmail || null;
+    if (!payerEmail) {
+      return res.status(400).json({ error: "No se encontró un correo para el pago" });
+    }
+
+    const intentId = crypto.randomUUID();
+    const commerceOrder = `adp_${intentId}`; // Flow: máx. 45 caracteres
+
+    const { error: intentErr } = await supabase.from("addon_purchase_intents").insert({
+      id: intentId,
+      tenant_id,
+      items: lines,
+      net_amount: netTotal,
+      amount,
+      commerce_order: commerceOrder,
+      status: "pending",
+      flow_env: FLOW_ENV,
+      created_by: req.authenticatedUser?.user_id || null,
+    });
+    if (intentErr) {
+      if (isMissingSchemaError(intentErr)) {
+        return res.status(503).json({
+          error: "Falta correr la migración 2026-09-28-addon-one-time-payments.sql en Supabase.",
+        });
+      }
+      throw intentErr;
+    }
+
+    const subjectItems = lines
+      .map((line) => `${ADDON_CATALOG[line.addon_key].name} x${line.quantity}`)
+      .join(", ");
+
+    let payment;
+    try {
+      payment = await flowApiRequest("/payment/create", {
+        commerceOrder,
+        subject: `Orbyx add-ons (pago único 30 días): ${subjectItems}`.slice(0, 250),
+        currency: "CLP",
+        amount,
+        email: payerEmail,
+        paymentMethod: 9, // todos los medios habilitados en la cuenta
+        urlConfirmation: `${ADDON_PAYMENT_BACKEND_BASE}/billing/addons/flow-confirmation`,
+        urlReturn: `${ADDON_PAYMENT_BACKEND_BASE}/billing/addons/flow-return`,
+      });
+    } catch (flowErr) {
+      console.error("POST /billing/addons/checkout: Flow /payment/create falló", flowErr.message, flowErr.flowResponse || "");
+      await supabase
+        .from("addon_purchase_intents")
+        .update({ status: "error", error_message: String(flowErr.message || "").slice(0, 500), updated_at: new Date().toISOString() })
+        .eq("id", intentId);
+      return res.status(502).json({ error: "No se pudo iniciar el pago en Flow. Intenta de nuevo en unos minutos." });
+    }
+
+    await supabase
+      .from("addon_purchase_intents")
+      .update({
+        flow_token: payment.token,
+        flow_order: payment.flowOrder || null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", intentId);
+
+    return res.json({
+      ok: true,
+      checkout_url: `${payment.url}?token=${payment.token}`,
+      intent_id: intentId,
+      amount,
+    });
+  } catch (err) {
+    console.error("POST /billing/addons/checkout error:", err.message);
+    return res.status(500).json({ error: err.message || "Error iniciando el pago" });
+  }
+});
+
+// Activa (o renueva) las filas de un pago único ya confirmado por Flow.
+async function grantOneTimeAddonItems(intent, paidAtIso) {
+  const expiresAt = new Date(
+    new Date(paidAtIso).getTime() + ONE_TIME_ADDON_DAYS * 24 * 60 * 60 * 1000
+  ).toISOString();
+  const problems = [];
+
+  for (const line of intent.items || []) {
+    const addonDef = ADDON_CATALOG[line.addon_key];
+    const balanceGrant = addonDef?.resets_monthly ? line.quantity * (addonDef.pack_size || 0) : 0;
+
+    const { data: existing, error: existingErr } = await supabase
+      .from("tenant_addons")
+      .select("id, balance, renewal_mode")
+      .eq("tenant_id", intent.tenant_id)
+      .eq("addon_key", line.addon_key)
+      .eq("status", "active")
+      .maybeSingle();
+    if (existingErr) {
+      problems.push(`${line.addon_key}: ${existingErr.message}`);
+      continue;
+    }
+
+    if (existing && existing.renewal_mode !== "pago_unico") {
+      // Se activó con tarjeta entre el checkout y el pago: no se pisa.
+      problems.push(`${line.addon_key}: ya activo con renewal_mode=${existing.renewal_mode}`);
+      continue;
+    }
+
+    const patch = {
+      quantity: line.quantity,
+      unit_price: line.unit_price,
+      renewal_mode: "pago_unico",
+      billing_cycle: "mensual",
+      last_charged_at: paidAtIso,
+      expires_at: expiresAt,
+      last_expiry_reminder_sent_at: null,
+      updated_at: paidAtIso,
+    };
+
+    const { error: writeErr } = existing
+      ? await supabase
+          .from("tenant_addons")
+          .update({ ...patch, balance: Number(existing.balance || 0) + balanceGrant })
+          .eq("id", existing.id)
+      : await supabase.from("tenant_addons").insert({
+          ...patch,
+          tenant_id: intent.tenant_id,
+          addon_key: line.addon_key,
+          balance: balanceGrant,
+          status: "active",
+        });
+
+    if (writeErr) problems.push(`${line.addon_key}: ${writeErr.message}`);
+  }
+
+  return problems;
+}
+
+// Confirma un token de Flow y, si está pagado, activa los add-ons.
+// Idempotente: el webhook y el retorno del usuario pueden llegar en
+// cualquier orden; solo quien "reclama" la intención pendiente la procesa.
+async function processAddonPaymentToken(token) {
+  const payment = await flowApiRequest("/payment/getStatus", { token }, "GET");
+  const commerceOrder = payment?.commerceOrder;
+
+  const { data: intent, error: intentErr } = await supabase
+    .from("addon_purchase_intents")
+    .select("*")
+    .eq("commerce_order", commerceOrder)
+    .maybeSingle();
+  if (intentErr) throw intentErr;
+  if (!intent) {
+    console.error("addon payment: no hay intención para commerceOrder", commerceOrder);
+    return { outcome: "failed", intent: null };
+  }
+
+  if (intent.status === "paid") return { outcome: "ok", intent };
+  if (intent.status === "needs_review") return { outcome: "review", intent };
+
+  const flowStatus = Number(payment.status); // 1 pendiente, 2 pagada, 3 rechazada, 4 anulada
+  const nowIso = new Date().toISOString();
+
+  if (flowStatus === 1) return { outcome: "pending", intent };
+
+  if (flowStatus === 3 || flowStatus === 4) {
+    await supabase
+      .from("addon_purchase_intents")
+      .update({ status: flowStatus === 3 ? "rejected" : "canceled", updated_at: nowIso })
+      .eq("id", intent.id)
+      .eq("status", "pending");
+    return { outcome: "failed", intent };
+  }
+
+  if (flowStatus !== 2) return { outcome: "pending", intent };
+
+  if (Math.round(Number(payment.amount)) !== Number(intent.amount)) {
+    console.error(
+      `addon payment: monto no coincide (intent ${intent.id}: esperado ${intent.amount}, Flow ${payment.amount})`
+    );
+    await supabase
+      .from("addon_purchase_intents")
+      .update({ status: "needs_review", error_message: `monto Flow ${payment.amount}`, updated_at: nowIso })
+      .eq("id", intent.id)
+      .eq("status", "pending");
+    return { outcome: "review", intent };
+  }
+
+  // Reclamo atómico de la intención (evita activar dos veces).
+  const { data: claimed, error: claimErr } = await supabase
+    .from("addon_purchase_intents")
+    .update({ status: "processing", updated_at: nowIso })
+    .eq("id", intent.id)
+    .eq("status", "pending")
+    .select("*")
+    .maybeSingle();
+  if (claimErr) throw claimErr;
+  if (!claimed) {
+    const { data: fresh } = await supabase
+      .from("addon_purchase_intents")
+      .select("*")
+      .eq("id", intent.id)
+      .maybeSingle();
+    return { outcome: fresh?.status === "paid" ? "ok" : "pending", intent: fresh || intent };
+  }
+
+  // Fecha de pago = momento en que se confirma acá (segundos después del
+  // pago real): la zona horaria de paymentData.date de Flow no está
+  // documentada, no vale la pena arriesgar un desfase de horas.
+  const effectivePaidAt = nowIso;
+
+  const problems = await grantOneTimeAddonItems(claimed, effectivePaidAt);
+
+  await supabase
+    .from("addon_purchase_intents")
+    .update({
+      status: problems.length ? "needs_review" : "paid",
+      paid_at: effectivePaidAt,
+      error_message: problems.length ? problems.join(" | ").slice(0, 500) : null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", claimed.id);
+
+  if (problems.length) {
+    console.error(`addon payment: intent ${claimed.id} pagado pero con problemas al activar:`, problems);
+    return { outcome: "review", intent: claimed };
+  }
+
+  return { outcome: "ok", intent: claimed };
+}
+
+app.post(
+  "/billing/addons/flow-confirmation",
+  publicLimiter,
+  express.urlencoded({ extended: true }),
+  async (req, res) => {
+    const token = req.body?.token;
+    if (!token) {
+      console.error("POST /billing/addons/flow-confirmation: falta token");
+      return res.sendStatus(200);
+    }
+    try {
+      const result = await processAddonPaymentToken(token);
+      console.log(`[ADDON PAYMENT] confirmación token -> ${result.outcome}`);
+    } catch (err) {
+      console.error("POST /billing/addons/flow-confirmation error:", err.message);
+    }
+    return res.sendStatus(200);
+  }
+);
+
+async function handleAddonPaymentReturn(req, res) {
+  const token = req.body?.token || req.query?.token;
+  let outcome = "failed";
+  let slug = null;
+  try {
+    if (token) {
+      const result = await processAddonPaymentToken(token);
+      outcome = result.outcome;
+      if (result.intent?.tenant_id) {
+        const { data: tenant } = await supabase
+          .from("tenants")
+          .select("slug")
+          .eq("id", result.intent.tenant_id)
+          .maybeSingle();
+        slug = tenant?.slug || null;
+      }
+    }
+  } catch (err) {
+    console.error("addon payment return error:", err.message);
+  }
+  const target = slug
+    ? `${PUBLIC_SITE_URL}/dashboard/${slug}/billing?addon_payment=${encodeURIComponent(outcome)}`
+    : `${PUBLIC_SITE_URL}/login`;
+  return res.redirect(303, target);
+}
+
+app.post(
+  "/billing/addons/flow-return",
+  publicLimiter,
+  express.urlencoded({ extended: true }),
+  handleAddonPaymentReturn
+);
+app.get("/billing/addons/flow-return", publicLimiter, handleAddonPaymentReturn);
+
+// Vence los add-ons de pago único (status -> canceled, igual que una
+// cancelación: libera capacidad/saldo en todas las lecturas existentes).
+// Solo toca renewal_mode = 'pago_unico': los "manual" y los créditos del
+// admin no se tocan (bug de "manual" que no vence, documentado aparte).
+async function expireOneTimeAddons() {
+  const nowIso = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("tenant_addons")
+    .update({ status: "canceled", canceled_at: nowIso, updated_at: nowIso })
+    .eq("status", "active")
+    .eq("renewal_mode", "pago_unico")
+    .lte("expires_at", nowIso)
+    .select("id, tenant_id, addon_key");
+  if (error) {
+    if (isMissingSchemaError(error)) return { expired: 0 };
+    throw error;
+  }
+  return { expired: (data || []).length };
+}
+
+// Aviso por correo antes del vencimiento (mismo patrón que
+// sendTrialEndingReminders: <= 3 días, máx. 1 por día por add-on).
+async function sendOneTimeAddonExpiryReminders() {
+  const now = new Date();
+  const todayKey = getSantiagoDayKey(now);
+  const threshold = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000).toISOString();
+
+  const { data: rows, error } = await supabase
+    .from("tenant_addons")
+    .select("id, tenant_id, addon_key, quantity, expires_at, last_expiry_reminder_sent_at")
+    .eq("status", "active")
+    .eq("renewal_mode", "pago_unico")
+    .lte("expires_at", threshold);
+  if (error) {
+    if (isMissingSchemaError(error)) return { sent: 0, skipped: 0 };
+    throw error;
+  }
+
+  const due = (rows || []).filter(
+    (row) =>
+      !row.last_expiry_reminder_sent_at ||
+      getSantiagoDayKey(new Date(row.last_expiry_reminder_sent_at)) !== todayKey
+  );
+  if (!due.length) return { sent: 0, skipped: 0 };
+
+  const byTenant = {};
+  for (const row of due) (byTenant[row.tenant_id] = byTenant[row.tenant_id] || []).push(row);
+
+  let sent = 0;
+  let skipped = 0;
+  for (const [tenantId, tenantRows] of Object.entries(byTenant)) {
+    const { data: tenant } = await supabase
+      .from("tenants")
+      .select("name, slug, is_active")
+      .eq("id", tenantId)
+      .maybeSingle();
+    const { ownerEmail } = await getActiveOwnerEmail(tenantId);
+    if (!tenant?.is_active || !ownerEmail) {
+      skipped += tenantRows.length;
+      continue;
+    }
+
+    const result = await sendAddonExpiryReminderEmail({
+      to: ownerEmail,
+      businessName: tenant.name,
+      items: tenantRows.map((row) => ({
+        name: ADDON_CATALOG[row.addon_key]?.name || row.addon_key,
+        quantity: row.quantity,
+        expiresAt: row.expires_at,
+      })),
+      billingUrl: `${PUBLIC_SITE_URL}/dashboard/${tenant.slug}/billing`,
+    });
+
+    if (result.ok) {
+      await supabase
+        .from("tenant_addons")
+        .update({ last_expiry_reminder_sent_at: now.toISOString() })
+        .in("id", tenantRows.map((row) => row.id));
+      sent += tenantRows.length;
+    } else {
+      skipped += tenantRows.length;
+    }
+  }
+
+  return { sent, skipped };
+}
+
+/* ======================================================
    ✅ PATCH /billing/addons/quantity
    body: { tenant_id, addon_key, quantity }
    quantity > 0 → actualiza cantidad; quantity = 0 → cancela.
@@ -13247,7 +13804,7 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
 
     const { data: existing, error: existingError } = await supabase
       .from("tenant_addons")
-      .select("id, quantity, unit_price, balance")
+      .select("id, quantity, unit_price, balance, renewal_mode")
       .eq("tenant_id", tenant_id)
       .eq("addon_key", addon_key)
       .eq("status", "active")
@@ -13271,6 +13828,14 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
     // esta app para ningún otro flujo tampoco.
     let balanceIncrement = 0;
 
+    if (qty > existing.quantity && existing.renewal_mode === "pago_unico") {
+      return res.status(409).json({
+        error:
+          "Este add-on está activo con pago único. Para agregar unidades, paga de nuevo una sola vez o activa el cobro automático.",
+        code: "use_one_time_checkout",
+      });
+    }
+
     if (qty > existing.quantity) {
       // Cobra el tier real de CADA unidad nueva (ver tieredAddonChargeAmount),
       // no un solo tier (el de la última compra) aplicado a todo el
@@ -13287,20 +13852,13 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
       // quantity completa a esa tarifa, igual que ya hacía antes.
       updatedUnitPrice = addonUnitTierPrice(addon_key, currentQty + increment - 1);
 
-      const { data: addonSubscription, error: addonSubErr } = await supabase
-        .from("subscriptions")
-        .select("id, flow_customer_id")
-        .eq("tenant_id", tenant_id)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      const { subscription: addonSubscription, hasPaymentMethod } =
+        await getTenantPaymentMethod(tenant_id);
 
-      if (addonSubErr) throw addonSubErr;
-
-      if (!addonSubscription || !addonSubscription.flow_customer_id) {
-        return res.status(400).json({
-          error:
-            "Necesitas tener un medio de pago registrado para activar add-ons. Ve a Facturación y pago para agregar tu tarjeta.",
+      if (!hasPaymentMethod) {
+        return res.status(402).json({
+          error: PAYMENT_METHOD_REQUIRED_MESSAGE,
+          code: "payment_method_required",
         });
       }
 
@@ -13494,6 +14052,27 @@ app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
       });
     }
 
+    // Pago único: nunca pasa a "manual" (un add-on manual no vence nunca —
+    // bug conocido, documentado aparte — y el pago único debe vencer en su
+    // expires_at). Pasar a "automatico" exige tarjeta inscrita y limpia
+    // expires_at: el siguiente cobro recurrente cae a los ~30 días del pago
+    // único (last_charged_at), sin cobrar dos veces el mismo período.
+    const isOneTime = existing.renewal_mode === "pago_unico";
+
+    if (isOneTime && renewal_mode === "manual") {
+      return res.json({ ok: true, renewal_mode: "pago_unico" });
+    }
+
+    if (isOneTime && renewal_mode === "automatico") {
+      const { hasPaymentMethod } = await getTenantPaymentMethod(tenant_id);
+      if (!hasPaymentMethod) {
+        return res.status(402).json({
+          error: "Para activar el cobro automático necesitas inscribir una tarjeta en Facturación y pago.",
+          code: "payment_method_required",
+        });
+      }
+    }
+
     // Solo exige consentimiento al ACTIVAR (manual -> automatico) — no al
     // desactivar, ni si ya estaba en automatico (no-op).
     const isActivating = renewal_mode === "automatico" && existing.renewal_mode !== "automatico";
@@ -13511,7 +14090,11 @@ app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
 
     const { data, error } = await supabase
       .from("tenant_addons")
-      .update({ renewal_mode, updated_at: new Date().toISOString() })
+      .update({
+        renewal_mode,
+        updated_at: new Date().toISOString(),
+        ...(isOneTime ? { expires_at: null } : {}),
+      })
       .eq("id", existing.id)
       .select()
       .single();
@@ -19565,7 +20148,7 @@ app.get("/admin/estadisticas", requireAdminAuth, async (req, res) => {
       visits: {
         total: Number(visitRow?.total) || 0,
       },
-      flow_mode: (process.env.FLOW_API_URL || "").includes("sandbox") ? "sandbox" : "live",
+      flow_mode: FLOW_ENV,
     });
   } catch (err) {
     console.error("GET /admin/estadisticas error:", err.message);
@@ -20769,6 +21352,30 @@ cron.schedule("0 6 * * *", async () => {
     );
   } catch (err) {
     console.error("[CRON] trial/maintenance/send-reminders: falló —", err.message);
+  }
+});
+
+// Add-ons de pago único: vencimiento cada hora (para que la capacidad se
+// libere cerca de expires_at) y aviso diario antes de vencer.
+cron.schedule("17 * * * *", async () => {
+  try {
+    const result = await expireOneTimeAddons();
+    if (result.expired) {
+      console.log(`[CRON] addons/expire-one-time: terminado — expired=${result.expired}`);
+    }
+  } catch (err) {
+    console.error("[CRON] addons/expire-one-time: falló —", err.message);
+  }
+});
+
+cron.schedule("15 6 * * *", async () => {
+  try {
+    const result = await sendOneTimeAddonExpiryReminders();
+    console.log(
+      `[CRON] addons/expiry-reminders: terminado — sent=${result.sent} skipped=${result.skipped}`
+    );
+  } catch (err) {
+    console.error("[CRON] addons/expiry-reminders: falló —", err.message);
   }
 });
 
