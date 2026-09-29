@@ -14032,7 +14032,7 @@ app.post("/billing/addons/cancel", tenantAuthWrite, async (req, res) => {
 ====================================================== */
 app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
   try {
-    const { tenant_id, addon_key, renewal_mode, consent_accepted, text_shown } = req.body;
+    const { tenant_id, addon_key, renewal_mode, consent_accepted, text_shown, renewal_quantity } = req.body;
 
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id es obligatorio" });
@@ -14109,12 +14109,29 @@ app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
       }
     }
 
+    // Packs de mensajes: al ACTIVAR se puede elegir cuántos packs renovar
+    // cada mes (no queda obligado a renovar los packs sueltos acumulados).
+    // Solo cambia la renovación futura: el saldo (balance) no se toca.
+    // Capacidad: no aplica (su quantity es la capacidad real del negocio).
+    let renewalPatch = {};
+    let consentAmount = Number(existing.unit_price || 0) * Number(existing.quantity || 0);
+    if (isActivating && ADDON_CATALOG[addon_key]?.resets_monthly && renewal_quantity !== undefined) {
+      const q = Number(renewal_quantity);
+      if (!Number.isInteger(q) || q < 1 || q > 50) {
+        return res.status(400).json({ error: "renewal_quantity debe ser un entero entre 1 y 50" });
+      }
+      const unitPrice = addonUnitTierPrice(addon_key, q - 1);
+      renewalPatch = { quantity: q, unit_price: unitPrice };
+      consentAmount = unitPrice * q;
+    }
+
     const { data, error } = await supabase
       .from("tenant_addons")
       .update({
         renewal_mode,
         updated_at: new Date().toISOString(),
         ...(isOneTime ? { expires_at: null } : {}),
+        ...renewalPatch,
       })
       .eq("id", existing.id)
       .select()
@@ -14128,12 +14145,17 @@ app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
         addon_key,
         consent_type: "renewal_mode",
         req,
-        amount_shown: Number(existing.unit_price || 0) * Number(existing.quantity || 0),
+        amount_shown: consentAmount,
         text_shown,
       });
     }
 
-    return res.json({ ok: true, renewal_mode: data.renewal_mode });
+    return res.json({
+      ok: true,
+      renewal_mode: data.renewal_mode,
+      quantity: data.quantity,
+      unit_price: data.unit_price,
+    });
   } catch (err) {
     console.error("PATCH /billing/addons/renewal-mode error:", err.message);
 
