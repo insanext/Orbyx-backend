@@ -4236,50 +4236,141 @@ async function deleteCalendarEventForAppointment(appt) {
   }
 }
 
-async function getGoogleCalendarClientFixed() {
-  const { data: tokenRow, error: tokErr } = await supabase
-    .from("calendar_tokens")
-    .select("*")
-    .eq("client_id", CLIENTE_FIJO)
-    .eq("calendar_name", CAL_FIJO)
-    .single();
+/* ======================================================
+   🔐 Inicio del flujo OAuth de calendario (auditoría 2026-09-30 sesión 4, C1)
+   Antes GET /auth y GET /auth/microsoft armaban el `state` con los
+   tenant_id/staff_id/calendar_id recibidos por query, sin sesión ni firma,
+   y los callbacks confiaban en ellos. Ahora el dashboard pide la URL de
+   autorización con su sesión (apiFetch); acá se valida membresía + permiso
+   y se guarda un nonce de un solo uso, que es lo único que viaja en
+   `state`. Los callbacks solo aceptan nonces emitidos por este endpoint.
+   Nonce en memoria (TTL 10 min, mismo criterio que authGetUserCache): un
+   reinicio del servicio en medio del flujo obliga a reintentar la
+   conexión — aceptable a cambio de no necesitar tabla ni env var nueva.
+====================================================== */
+const CALENDAR_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const calendarOAuthStates = new Map(); // nonce -> { provider, user_id, tenant_id, branch_id, staff_id, calendar_id, scope_level, expiresAt }
 
-  if (tokErr) throw tokErr;
-
-  if (!tokenRow?.refresh_token) {
-    throw new Error("⚠️ No hay refresh_token en Supabase. Entra a /auth primero.");
+function createCalendarOAuthState(payload) {
+  const now = Date.now();
+  for (const [key, value] of calendarOAuthStates) {
+    if (value.expiresAt <= now) calendarOAuthStates.delete(key);
   }
-
-  oAuth2Client.setCredentials({ refresh_token: tokenRow.refresh_token });
-
-  const calendar = google.calendar({ version: "v3", auth: oAuth2Client });
-  const googleCalendarId = tokenRow.google_calendar_id || "primary";
-
-  return { calendar, googleCalendarId };
+  const nonce = crypto.randomBytes(32).toString("hex");
+  calendarOAuthStates.set(nonce, { ...payload, expiresAt: now + CALENDAR_OAUTH_STATE_TTL_MS });
+  return nonce;
 }
 
-/* ======================================================
-   🔹 ENDPOINT: /auth
-====================================================== */
-app.get("/auth", async (req, res) => {
+// Un solo uso: el nonce se borra al leerlo, sea válido o no.
+function consumeCalendarOAuthState(rawState, provider) {
+  const nonce = typeof rawState === "string" ? rawState : "";
+  if (!nonce) return null;
+  const entry = calendarOAuthStates.get(nonce);
+  calendarOAuthStates.delete(nonce);
+  if (!entry || entry.expiresAt <= Date.now() || entry.provider !== provider) return null;
+  return entry;
+}
+
+const CALENDAR_OAUTH_INVALID_STATE_MESSAGE =
+  "La solicitud de conexión expiró o no es válida. Vuelve a conectar el calendario desde el panel de Orbyx.";
+
+app.post("/calendar-connections/oauth-start", [dashboardLimiter, requireTenantAuth], async (req, res) => {
   try {
-    const { calendar_id, tenant_id, branch_id, staff_id, scope_level } = req.query;
+    const provider = req.body?.provider === "microsoft" ? "microsoft" : "google";
+    const scopeLevel = req.body?.scope_level === "staff" ? "staff" : "calendar";
+    const branchId = req.body?.branch_id ? String(req.body.branch_id) : null;
 
-    const stateObj =
-      scope_level === "staff"
-        ? {
-            provider: "google",
-            calendar_id: calendar_id ? String(calendar_id) : null,
-            tenant_id: tenant_id ? String(tenant_id) : null,
-            branch_id: branch_id ? String(branch_id) : null,
-            staff_id: staff_id ? String(staff_id) : null,
-            scope_level: "staff",
-          }
-        : calendar_id
-        ? { calendar_id: String(calendar_id) }
-        : { calendar_id: null, fixed: true };
+    let tenantId = null;
+    let staffId = null;
+    let calendarId = null;
+    let moduleKey = null;
 
-    const state = Buffer.from(JSON.stringify(stateObj)).toString("base64url");
+    if (scopeLevel === "staff") {
+      staffId = req.body?.staff_id ? String(req.body.staff_id) : "";
+      if (!staffId) {
+        return res.status(400).json({ error: "staff_id es obligatorio" });
+      }
+
+      const { data: staffRow } = await supabase
+        .from("staff")
+        .select("id, tenant_id, branch_id")
+        .eq("id", staffId)
+        .maybeSingle();
+
+      if (!staffRow) {
+        return res.status(404).json({ error: "Staff no encontrado" });
+      }
+
+      if (req.body?.tenant_id && String(req.body.tenant_id) !== String(staffRow.tenant_id)) {
+        return res.status(403).json({ error: "No tienes acceso a este negocio" });
+      }
+
+      if (branchId && String(staffRow.branch_id || "") !== branchId) {
+        return res.status(400).json({ error: "El staff no pertenece a la sucursal indicada." });
+      }
+
+      tenantId = staffRow.tenant_id;
+      moduleKey = "staff";
+    } else {
+      // Conexión legacy por calendar_id (calendar_tokens): solo Google.
+      if (provider !== "google") {
+        return res.status(400).json({ error: "Microsoft solo se puede conectar por profesional." });
+      }
+
+      calendarId = req.body?.calendar_id ? String(req.body.calendar_id) : "";
+      if (!calendarId) {
+        return res.status(400).json({ error: "calendar_id es obligatorio" });
+      }
+
+      const { data: calendarRow } = await supabase
+        .from("calendars")
+        .select("id, tenant_id")
+        .eq("id", calendarId)
+        .maybeSingle();
+
+      if (!calendarRow) {
+        return res.status(404).json({ error: "Calendario no encontrado" });
+      }
+
+      tenantId = calendarRow.tenant_id;
+      moduleKey = "negocio";
+    }
+
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, tenantId, moduleKey);
+    if (!hasWriteAccess) return;
+
+    if (
+      provider === "microsoft" &&
+      (!MICROSOFT_CLIENT_ID || !MICROSOFT_CLIENT_SECRET || !MICROSOFT_REDIRECT_URI)
+    ) {
+      return res.status(500).json({ error: "Faltan variables ENV Microsoft OAuth." });
+    }
+
+    const state = createCalendarOAuthState({
+      provider,
+      user_id: req.authenticatedUser.user_id,
+      tenant_id: String(tenantId),
+      branch_id: branchId,
+      staff_id: staffId,
+      calendar_id: calendarId,
+      scope_level: scopeLevel,
+    });
+
+    if (provider === "microsoft") {
+      const authParams = new URLSearchParams({
+        client_id: MICROSOFT_CLIENT_ID,
+        response_type: "code",
+        redirect_uri: MICROSOFT_REDIRECT_URI,
+        response_mode: "query",
+        scope: MICROSOFT_SCOPES.join(" "),
+        state,
+        prompt: "consent",
+      });
+
+      return res.json({
+        url: `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${authParams.toString()}`,
+      });
+    }
 
     const url = oAuth2Client.generateAuthUrl({
       access_type: "offline",
@@ -4287,11 +4378,21 @@ app.get("/auth", async (req, res) => {
       scope: SCOPES,
       state,
     });
-return res.redirect(url);
-   
-  } catch (e) {
-    res.status(500).send("Error en /auth: " + e.message);
+
+    return res.json({ url });
+  } catch (err) {
+    console.error("POST /calendar-connections/oauth-start error:", err.message);
+    return res.status(500).json({ error: "No se pudo iniciar la conexión del calendario" });
   }
+});
+
+// Reemplazados por POST /calendar-connections/oauth-start (C1): iniciaban el
+// flujo sin sesión. Responden 410 con un mensaje claro para un panel que
+// todavía tenga cargada la versión anterior del frontend.
+app.get(["/auth", "/auth/microsoft"], (req, res) => {
+  res
+    .status(410)
+    .send("Este enlace ya no es válido. Recarga el panel de Orbyx e intenta conectar el calendario de nuevo.");
 });
 
 async function getMicrosoftAccessTokenFromCode(code) {
@@ -4350,60 +4451,14 @@ async function getMicrosoftUserProfile(accessToken) {
   return data;
 }
 
-app.get("/auth/microsoft", async (req, res) => {
-  try {
-    if (!MICROSOFT_CLIENT_ID || !MICROSOFT_CLIENT_SECRET || !MICROSOFT_REDIRECT_URI) {
-      return res.status(500).send("Faltan variables ENV Microsoft OAuth.");
-    }
-
-    const { calendar_id, tenant_id, branch_id, staff_id, scope_level } = req.query;
-
-    const stateObj = {
-      provider: "microsoft",
-      calendar_id: calendar_id ? String(calendar_id) : null,
-      tenant_id: tenant_id ? String(tenant_id) : null,
-      branch_id: branch_id ? String(branch_id) : null,
-      staff_id: staff_id ? String(staff_id) : null,
-      scope_level: scope_level ? String(scope_level) : null,
-    };
-
-    const state = Buffer.from(JSON.stringify(stateObj)).toString("base64url");
-    const authParams = new URLSearchParams({
-      client_id: MICROSOFT_CLIENT_ID,
-      response_type: "code",
-      redirect_uri: MICROSOFT_REDIRECT_URI,
-      response_mode: "query",
-      scope: MICROSOFT_SCOPES.join(" "),
-      state,
-      prompt: "consent",
-    });
-
-    return res.redirect(
-      `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${authParams.toString()}`
-    );
-  } catch (e) {
-    res.status(500).send("Error en /auth/microsoft: " + e.message);
-  }
-});
-
 app.get("/oauth2callback/microsoft", async (req, res) => {
   try {
     const code = req.query.code;
-    const stateRaw = req.query.state;
 
-    let state = {};
-    try {
-      if (stateRaw) {
-        state = JSON.parse(
-          Buffer.from(String(stateRaw), "base64url").toString("utf8")
-        );
-      }
-    } catch (_) {
-      state = {};
-    }
-
-    if (state?.provider !== "microsoft") {
-      return res.status(400).send("State Microsoft inválido.");
+    // Solo nonces emitidos por POST /calendar-connections/oauth-start (C1).
+    const state = consumeCalendarOAuthState(req.query.state, "microsoft");
+    if (!state || state.scope_level !== "staff") {
+      return res.status(400).send(CALENDAR_OAUTH_INVALID_STATE_MESSAGE);
     }
 
     const tenant_id = state.tenant_id ? String(state.tenant_id) : "";
@@ -4502,17 +4557,12 @@ app.get("/oauth2callback/microsoft", async (req, res) => {
 app.get("/oauth2callback", async (req, res) => {
   try {
     const code = req.query.code;
-    const stateRaw = req.query.state;
 
-    let state = {};
-    try {
-      if (stateRaw) {
-        state = JSON.parse(
-          Buffer.from(String(stateRaw), "base64url").toString("utf8")
-        );
-      }
-    } catch (_) {
-      state = {};
+    // Solo nonces emitidos por POST /calendar-connections/oauth-start (C1),
+    // validado antes de canjear el code.
+    const state = consumeCalendarOAuthState(req.query.state, "google");
+    if (!state) {
+      return res.status(400).send(CALENDAR_OAUTH_INVALID_STATE_MESSAGE);
     }
 
     const { tokens } = await oAuth2Client.getToken(code);
@@ -4663,24 +4713,10 @@ const { data: cal, error: calErr } = await supabase
       );
     }
 
-    // ✅ Compatibilidad: modo fijo
-    const { error } = await supabase.from("calendar_tokens").upsert(
-      {
-        client_id: CLIENTE_FIJO,
-        calendar_name: CAL_FIJO,
-        google_calendar_id: "primary",
-        refresh_token: tokens.refresh_token,
-        access_token: tokens.access_token ?? null,
-        token_type: tokens.token_type ?? null,
-        scope: tokens.scope ?? null,
-        expiry_date: tokens.expiry_date ?? null,
-      },
-      { onConflict: "client_id,calendar_name" }
-    );
-
-    if (error) throw error;
-
-    res.send("✅ Autorizado y guardado en Supabase (modo fijo). Ahora entra a /test-event");
+    // El "modo fijo" (calendar_tokens de cliente_demo) se retiró junto con
+    // GET /test-event (auditoría 2026-09-30 sesión 4, I3): oauth-start ya
+    // no emite states sin staff ni calendar_id.
+    return res.status(400).send(CALENDAR_OAUTH_INVALID_STATE_MESSAGE);
   } catch (error) {
     console.error(error);
     res.status(500).send("Error en OAuth callback: " + error.message);
@@ -4720,40 +4756,9 @@ app.get("/calendar-connections", tenantAuth, async (req, res) => {
   }
 });
 
-/* ======================================================
-   🔹 ENDPOINT: /test-event
-====================================================== */
-app.get("/test-event", async (req, res) => {
-  try {
-    const { calendar_id } = req.query;
-
-    const { calendar, googleCalendarId } = calendar_id
-      ? await getGoogleCalendarClientByCalendarId(calendar_id)
-      : await getGoogleCalendarClientFixed();
-
-    const start = new Date(Date.now() + 5 * 60 * 1000);
-    const end = new Date(start.getTime() + 30 * 60 * 1000);
-
-    const event = {
-      summary: "Prueba Proyecto Independizar (Supabase)",
-      description: calendar_id
-        ? `Evento de prueba (SaaS) calendar_id=${calendar_id}`
-        : "Evento de prueba (modo fijo)",
-      start: { dateTime: start.toISOString() },
-      end: { dateTime: end.toISOString() },
-    };
-
-    const response = await calendar.events.insert({
-      calendarId: googleCalendarId,
-      requestBody: event,
-    });
-
-    res.send(`✅ Evento creado: <a href="${response.data.htmlLink}" target="_blank">Ver evento</a>`);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send("Error creando evento: " + error.message);
-  }
-});
+// GET /test-event retirado (auditoría 2026-09-30 sesión 4, I3): ruta de
+// prueba de los inicios del proyecto, sin auth, que creaba eventos en el
+// calendario conectado de cualquier calendar_id.
 
 /* ======================================================
    ✅ GET /business-hours
@@ -5724,10 +5729,13 @@ app.delete("/staff-services/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
 
+    // Filtro por el tenant validado en tenantAuthWrite (auditoría 2026-09-30
+    // sesión 4, I2): antes borraba por id sin revisar a qué negocio pertenecía.
     const { error } = await supabase
       .from("staff_services")
       .delete()
-      .eq("id", id);
+      .eq("id", id)
+      .eq("tenant_id", req.authenticatedUser.tenant_id);
 
     if (error) throw error;
 
@@ -18551,8 +18559,10 @@ app.patch('/service-groups/:id', tenantAuthWrite, async (req, res) => {
 app.delete('/service-groups/:id', tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params
-    const { tenant_id } = req.query
-    if (!tenant_id) return res.status(400).json({ error: 'tenant_id requerido' })
+    // tenant_id validado por enforceTenantId (auditoría 2026-09-30 sesión 4,
+    // I1): antes se leía de la query mientras el middleware validaba el del
+    // body primero, y con ambos presentes y distintos se borraba en otro negocio.
+    const tenant_id = req.authenticatedUser.tenant_id
     const { data: existing } = await supabase
       .from('service_groups')
       .select('id')
