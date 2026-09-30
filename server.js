@@ -14285,7 +14285,7 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
      al saldo (balance) y se usa hasta agotarse (expires_at = null).
 ====================================================== */
 const ONE_TIME_ADDON_DAYS = 30;
-const ADDON_PAYMENT_BACKEND_BASE = "https://orbyx-backend.onrender.com";
+const ADDON_PAYMENT_BACKEND_BASE = "https://api.orbyx.cl";
 
 app.post("/billing/addons/checkout", tenantAuthWrite, async (req, res) => {
   try {
@@ -15628,7 +15628,7 @@ app.post("/billing/flow/register-card", tenantAuthWrite, async (req, res) => {
 
     const registerResult = await flowApiRequest("/customer/register", {
       customerId: subscription.flow_customer_id,
-      url_return: "https://orbyx-backend.onrender.com/billing/flow/register-card-callback",
+      url_return: "https://api.orbyx.cl/billing/flow/register-card-callback",
     });
 
     return res.json({
@@ -16656,7 +16656,7 @@ app.post("/signup/register-card", publicLimiter, async (req, res) => {
 
     const registerResult = await flowApiRequest("/customer/register", {
       customerId: intent.flow_customer_id,
-      url_return: "https://orbyx-backend.onrender.com/signup/register-card-callback",
+      url_return: "https://api.orbyx.cl/signup/register-card-callback",
     });
 
     return res.json({
