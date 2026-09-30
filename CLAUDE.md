@@ -212,6 +212,41 @@ Every image upload to Supabase Storage goes through a server-side resize/compres
 - **`upload-staff-photo` has a one-time best-effort orphan cleanup**: since its filename is deterministic (`staff/${staffId}.${ext}`, `upsert: true`, no UUID), switching the extension to `.webp` would otherwise leave a stale `.jpg`/`.png` behind from before this change. It removes the other candidate extensions (same `["jpg","png","webp"]` list already used in `DELETE /admin/tenants/:id`'s cleanup) before uploading. `upload-business-logo` doesn't need this — its filename is already versioned with `crypto.randomUUID()`, so old logos were never cleaned up regardless of extension (pre-existing gap, unrelated to this change).
 - **Filenames unchanged otherwise**: none of the `crypto.randomUUID()`-based naming or the membership/ownership validation in any of the 5 endpoints was touched — only the buffer, `contentType`, and (where the format changed) the extension.
 
+## Billing Access, Flow Webhook and Plan Changes (audit round 3, 2026-09-30)
+
+Report: `ORBYX_AUDIT_SESION3_DINERO_PLAN_ADMIN.md` (untracked, repo root).
+
+- **Single source of truth for blocking**: `computeBillingAccessState` in `server.js` (used by `GET /billing/account-status`, `getPublicBookingStatus`, `deriveTenantBucket`). `orbyx-web/middleware.ts` copies the same formula by hand — keep them in sync.
+  - `trialing` in Flow no longer counts as `trial_active`.
+  - Trial end only blocks tenants that never paid. `tenants.is_trial === false` now means "has paid at least once": the webhook sets it on the first payment, `POST /billing/flow/subscribe` sets it on an immediate charge, and paid signups are born with it false. A tenant who paid and then cancels keeps access until `billing_cycle_end`.
+  - A declined charge (`subscriptions.status='error'`) gets `PAYMENT_FAILED_GRACE_DAYS = 3` before blocking. The owner gets `sendPaymentFailedEmail` once, when the status first becomes `error`.
+- **Flow webhook (`POST /billing/flow/webhook`)**: Flow's PaymentStatus has NO `customerId`/`subscriptionId` (verified in sandbox).
+  - The subscription is identified from `commerceOrder` = `sus_<flow_subscription_id>_<invoice>_<date>`. Fallback: `subscription/get` → `customerId` → lookup by `flow_customer_id`.
+  - A payment of a signup still in progress → 503 (retry).
+  - A charge of a *different* subscription of the same customer → ignored and logged.
+  - Responses: DB failure → 500. Flow status 1 (pending) → no change. Status 3/4 → `error`.
+  - The cycle is only extended if `billing_cycle_end` is ≤ 7 days away (avoids a double month on retries/duplicates).
+- **Plan targets**: only `starter`/`business`/`premium` (`isSellablePlanSlug`). Legacy `plan_config` rows are read-only for caps.
+  - `POST /billing/flow/subscribe` computes `monto` server-side (`computePlanNetAmount`).
+  - It also cancels any still-live previous Flow subscription before creating a new one.
+- **Card change**: `register-card-callback` never touches an `active`/`trialing` subscription (the card lives on the Flow customer).
+- **Card charges**: all `/customer/charge` calls go through `chargeFlowCustomer`, which fails unless Flow `status === 2`.
+- **Cancel plan / admin pause**: `stopTenantAddonCharges` moves `automatico` add-ons to `pago_unico`.
+  - Capacity add-ons expire at `last_charged_at + 30d`; message packs keep their balance with no expiry.
+  - It also turns off low-balance recharge.
+  - `chargeRecurringAddons` additionally skips canceled, paused or inactive tenants.
+- **Admin delete tenant**: `cancelTenantFlowBilling` runs first (cancels live Flow subs, unregisters cards). On Flow failure nothing is deleted unless `force_without_flow_cancel: true`.
+  - Migration `2026-09-30-tenant-deletion-keep-legal-records.sql` keeps `legal_acceptances`/`addon_auto_charge_consents` and adds the review tables to `delete_tenant_cascade`.
+  - **Before running it**, compare with the live `pg_get_functiondef('delete_tenant_cascade'::regproc)`.
+- **Plan changes**:
+  - Choosing the current plan while a downgrade is scheduled cancels it (`change_type: "cancel_scheduled"`).
+  - An upgrade during a never-paid trial is free until trial end; a `trialing` Flow sub is replaced by one on the new plan with the remaining trial days.
+- **Limits (I11)**: reactivating staff is checked against the active limit. Editing a group service keeps an over-limit capacity but can't raise it.
+- **Other**:
+  - Terms of Service are now v1.1 (`LEGAL_TERMS_VERSION`, `app/terminos`, `email.js`): net prices + IVA, 3 current plans, accumulating packs / one-time payment.
+  - Trial reminder emails stop 14 days after expiry.
+  - `/admin/planes` warns that plan price edits don't affect charges.
+
 ## Business Categories
 
 Known categories:

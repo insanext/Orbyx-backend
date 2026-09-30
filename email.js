@@ -784,23 +784,30 @@ const LEGAL_TERMS_BLOCKS = [
   { t: "h3", text: "6.1 Planes vigentes" },
   {
     t: "table",
-    headers: ["Plan", "Precio mensual"],
+    headers: ["Plan", "Precio mensual neto", "Total mensual con IVA (19%)"],
     rows: [
-      ["Pro", "$12.990"],
-      ["Premium", "$29.990"],
-      ["VIP", "$54.990"],
-      ["Platinum", "$149.990"],
+      ["Starter", "$14.990", "$17.838"],
+      ["Business", "$29.990", "$35.688"],
+      ["Premium", "$54.990", "$65.438"],
     ],
   },
   {
     t: "p",
-    text: "Los precios se expresan en pesos chilenos e incluyen los impuestos aplicables, salvo indicación distinta al momento de contratar.",
+    text: "Los precios se expresan en pesos chilenos y son **netos**: a cada cobro se le suma el IVA (19%), como se indica en la tabla y al momento de contratar.",
   },
-  { t: "p", text: "Se aplican descuentos por pago semestral (10%) y anual (15%)." },
+  { t: "p", text: "Se aplican descuentos por pago semestral (10%) y anual (15%), calculados sobre el precio neto." },
   { t: "h3", text: "6.2 Complementos" },
   {
     t: "p",
-    text: "Determinados Planes permiten contratar complementos (paquetes de mensajes, usuarios o sucursales adicionales). Los complementos se facturan mensualmente con independencia del ciclo del Plan base y **no son acumulables**: las cuotas no utilizadas se reinician cada mes y no se traspasan al mes siguiente.",
+    text: "Determinados Planes permiten contratar complementos: paquetes de mensajes (WhatsApp de confirmación y recordatorio, campañas por WhatsApp o por correo) y capacidad adicional (profesionales, sucursales o cupos grupales). Sus precios también son netos, más IVA. Se pueden contratar con cobro automático mensual a la tarjeta registrada o con pago único:",
+  },
+  {
+    t: "ul",
+    items: [
+      "Paquetes de mensajes: **son acumulables**. Los mensajes comprados que no se usan en el mes se mantienen como saldo y se consumen después del cupo incluido en el Plan, que sí se reinicia cada mes. Con cobro automático, cada renovación mensual suma un nuevo paquete al saldo; con pago único, el saldo se usa hasta agotarse, sin fecha de vencimiento.",
+      "Capacidad adicional: con cobro automático se renueva cada mes; con pago único queda activa durante 30 días desde el pago.",
+      "Al cancelar el Plan, los complementos dejan de renovarse: lo ya pagado se mantiene hasta el término de su período o, en los paquetes de mensajes, hasta agotar el saldo.",
+    ],
   },
   { t: "h3", text: "6.3 Medio de pago" },
   {
@@ -1651,8 +1658,9 @@ async function sendDepositReceiptUploadedEmail({
 // Recordatorio diario de vencimiento de prueba gratis -- arranca el mismo
 // día en que el banner del dashboard se pone parpadeante (3 días o menos
 // para trial_ends_at) y se repite mientras el tenant siga sin suscripción
-// de pago activa, incluidos los días posteriores al vencimiento (sin tope
-// fijo) -- ver sendTrialEndingReminders() en server.js. Mismo patrón que
+// de pago activa, incluidos los días posteriores al vencimiento (hasta 14
+// días después, decisión 2026-09-30) -- ver sendTrialEndingReminders() en
+// server.js. Mismo patrón que
 // sendDepositReceiptUploadedEmail: retorna { ok, reason } en vez de
 // lanzar, para que el llamador decida si marca last_trial_reminder_sent_at.
 async function sendTrialEndingReminderEmail({ to, businessName, diasRestantes, billingUrl }) {
@@ -1719,6 +1727,72 @@ async function sendTrialEndingReminderEmail({ to, businessName, diasRestantes, b
     return { ok: true };
   } catch (error) {
     console.error("Error enviando email de recordatorio de prueba:", error);
+    return { ok: false, reason: error?.message || "unknown_error" };
+  }
+}
+
+// Aviso de cobro rechazado de la suscripción (auditoría 2026-09-30,
+// sesión 3, I7): se envía el mismo día en que Flow informa el rechazo,
+// con la fecha límite de la gracia de 3 días antes de que la cuenta se
+// limite. Mismo patrón { ok, reason } que sendTrialEndingReminderEmail.
+async function sendPaymentFailedEmail({ to, businessName, deadlineLabel, billingUrl }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Email de pago rechazado omitido.");
+      return { ok: false, reason: "resend_not_configured" };
+    }
+
+    const { data, error } = await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: `No pudimos cobrar tu suscripción de Orbyx — ${businessName || "tu negocio"}`,
+      html: `
+<div style="margin:0; padding:30px 16px; background:#f1f5f9; font-family:Arial, Helvetica, sans-serif;">
+  <div style="max-width:560px; margin:0 auto;">
+    <div style="background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.1);">
+      <div style="background:linear-gradient(135deg,#0f172a,#312e81); padding:28px; text-align:center;">
+        <div style="color:#cbd5e1; font-size:12px; letter-spacing:0.2em;">SUSCRIPCIÓN</div>
+        <h1 style="color:#ffffff; margin:10px 0 0; font-size:24px;">${businessName || "Tu negocio"}</h1>
+      </div>
+      <div style="padding:24px;">
+        <div style="background:#fee2e2; color:#991b1b; display:inline-block; padding:6px 12px; border-radius:999px; font-size:12px; margin-bottom:12px;">
+          ⚠️ Pago rechazado
+        </div>
+        <h2 style="margin:0 0 10px;">No pudimos cobrar tu suscripción</h2>
+        <p style="color:#475569; font-size:15px;">
+          Tu tarjeta registrada rechazó el último cobro de Orbyx. Tu cuenta sigue funcionando normalmente
+          ${deadlineLabel ? `hasta el <strong>${deadlineLabel}</strong>` : "durante los próximos 3 días"}.
+          Actualiza tu tarjeta antes de esa fecha para no perder acceso a tu agenda.
+        </p>
+        <div style="text-align:center; margin-top:24px;">
+          <a href="${billingUrl}" style="background:#0f172a; color:white; padding:12px 24px; border-radius:12px; text-decoration:none; font-weight:bold; font-size:15px;">
+            Actualizar tarjeta
+          </a>
+        </div>
+        <p style="margin-top:20px; font-size:12px; color:#94a3b8; text-align:center;">
+          O copia este enlace en tu navegador:<br/>
+          <a href="${billingUrl}" style="color:#6366f1;">${billingUrl}</a>
+        </p>
+      </div>
+      <div style="padding:16px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
+        <a href="https://orbyx.cl" style="color:#64748b; font-size:12px; text-decoration:none;" target="_blank">
+          Orbyx · Sistema de reservas inteligentes
+        </a>
+      </div>
+    </div>
+  </div>
+</div>`,
+    });
+
+    if (error) {
+      console.error("Error enviando email de pago rechazado:", error);
+      return { ok: false, reason: error.message || "resend_error" };
+    }
+
+    console.log("[PAYMENT FAILED EMAIL] Enviado:", JSON.stringify(data));
+    return { ok: true };
+  } catch (error) {
+    console.error("Error enviando email de pago rechazado:", error);
     return { ok: false, reason: error?.message || "unknown_error" };
   }
 }
@@ -1969,6 +2043,7 @@ module.exports = {
   sendLegalAcceptanceConfirmationEmail,
   sendDepositReceiptUploadedEmail,
   sendTrialEndingReminderEmail,
+  sendPaymentFailedEmail,
   sendPasswordResetEmail,
   sendWelcomeAccessEmail,
   sendAddonExpiryReminderEmail,

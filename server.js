@@ -23,6 +23,7 @@ const {
   sendLegalAcceptanceConfirmationEmail,
   sendDepositReceiptUploadedEmail,
   sendTrialEndingReminderEmail,
+  sendPaymentFailedEmail,
   sendPasswordResetEmail,
   sendWelcomeAccessEmail,
   sendAddonExpiryReminderEmail,
@@ -106,9 +107,10 @@ const DEFAULT_PLAN_CAPS = {
     max_services: 999999,
     max_branches: 1,
     // 100/mes desde la decisión de producto 2026-09-20 (Parte E/F) --
-    // antes 0 ("sin campañas email" era la regla vieja). Igual que
-    // max_wa_confirmacion, arranca en 0 mientras el tenant esté en trial
-    // sin suscripción activa (ver checkMonthlyUsage/isStarterTenantInTrial).
+    // antes 0 ("sin campañas email" era la regla vieja). A diferencia de
+    // max_wa_confirmacion, los 100 emails SÍ están disponibles durante el
+    // trial (decisión 2026-09-30): getPlanCapabilities con is_trial solo
+    // pone en 0 WhatsApp.
     max_campaign_emails_per_send: 100,
     max_group_capacity: 5,
     max_wa_confirmacion: 100,
@@ -670,19 +672,44 @@ function isMissingAddonsTableError(err) {
 // Cancela los add-ons activos que el plan destino no soporta.
 // Tolerante a que la tabla tenant_addons aún no exista: en ese caso
 // solo deja un warning y no interrumpe el cambio de plan.
+// Excepción (auditoría 2026-09-29 sesión 2, M16): los packs de mensajes
+// (resets_monthly, p.ej. WhatsApp Marketing al bajar a Starter) con saldo
+// ya pagado NO se cancelan — el saldo sigue usable hasta agotarse. Se les
+// apaga la renovación automática ("automatico" -> "manual", que no cobra ni
+// vence) y no se pueden recargar mientras el plan no lo permita
+// (isAddonAvailableForPlan en activate/checkout/quantity/renewal-mode).
+// Al llegar a 0, decrementAddonBalance los cancela.
 async function cancelUnsupportedAddons(tenant_id, newPlan) {
   try {
     const { data, error } = await supabase
       .from("tenant_addons")
-      .select("id, addon_key")
+      .select("id, addon_key, balance, renewal_mode")
       .eq("tenant_id", tenant_id)
       .eq("status", "active");
 
     if (error) throw error;
 
-    const toCancel = (data || []).filter(
+    const unsupported = (data || []).filter(
       (row) => !isAddonAvailableForPlan(row.addon_key, newPlan)
     );
+    const keepBalance = unsupported.filter(
+      (row) =>
+        ADDON_CATALOG[row.addon_key]?.resets_monthly &&
+        Number(row.balance || 0) > 0
+    );
+    const toCancel = unsupported.filter((row) => !keepBalance.includes(row));
+
+    const toStopRenewal = keepBalance.filter((row) => row.renewal_mode === "automatico");
+    if (toStopRenewal.length > 0) {
+      const { error: renewalError } = await supabase
+        .from("tenant_addons")
+        .update({ renewal_mode: "manual", updated_at: new Date().toISOString() })
+        .in(
+          "id",
+          toStopRenewal.map((row) => row.id)
+        );
+      if (renewalError) throw renewalError;
+    }
 
     if (toCancel.length === 0) return [];
 
@@ -708,6 +735,55 @@ async function cancelUnsupportedAddons(tenant_id, newPlan) {
     );
     return [];
   }
+}
+
+// Al cancelar el plan o pausar el tenant (decisión 2026-09-30, auditoría
+// sesión 3, C5): los add-ons dejan de cobrarse junto con el plan. Antes
+// chargeRecurringAddons seguía cobrando cada mes a una cuenta cancelada o
+// pausada. Lo ya pagado no se pierde a mitad de mes: los de renovación
+// automática pasan a 'pago_unico' (mismo mecanismo de vencimiento que la
+// compra por pago único, lo cierra expireOneTimeAddons):
+//   - capacidad (staff/sucursal/group_capacity): vence al terminar el mes
+//     ya pagado (last_charged_at + 30 días);
+//   - packs de mensajes: el saldo pagado se usa hasta agotarse, sin
+//     vencimiento (misma regla que los packs de pago único).
+// También se apaga la recarga automática por saldo bajo (cobra tarjeta).
+// Devuelve las addon_key afectadas; lanza si falla (el caller decide).
+async function stopTenantAddonCharges(tenant_id) {
+  const { data, error } = await supabase
+    .from("tenant_addons")
+    .select("id, addon_key, renewal_mode, last_charged_at, low_balance_recharge_enabled")
+    .eq("tenant_id", tenant_id)
+    .eq("status", "active");
+  if (error) throw error;
+
+  const nowIso = new Date().toISOString();
+  const affected = [];
+
+  for (const row of data || []) {
+    const patch = {};
+    if (row.renewal_mode === "automatico") {
+      const isPack = Boolean(ADDON_CATALOG[row.addon_key]?.resets_monthly);
+      const paidUntil = row.last_charged_at
+        ? new Date(new Date(row.last_charged_at).getTime() + ONE_TIME_ADDON_DAYS * 24 * 60 * 60 * 1000)
+        : new Date();
+      patch.renewal_mode = "pago_unico";
+      patch.expires_at = isPack ? null : new Date(Math.max(paidUntil.getTime(), Date.now())).toISOString();
+    }
+    if (row.low_balance_recharge_enabled) {
+      patch.low_balance_recharge_enabled = false;
+    }
+    if (Object.keys(patch).length === 0) continue;
+
+    const { error: updateErr } = await supabase
+      .from("tenant_addons")
+      .update({ ...patch, updated_at: nowIso })
+      .eq("id", row.id);
+    if (updateErr) throw updateErr;
+    affected.push(row.addon_key);
+  }
+
+  return affected;
 }
 
 // Valida que un downgrade a targetPlan no deje al tenant con más staff o
@@ -1029,8 +1105,9 @@ const MONTHLY_RESOURCE_CAP_KEY = {
 // suma de ambos — es el número real que determina si todavía se puede
 // enviar/usar el recurso.
 // Bug real encontrado en la auditoría 2026-09-20: getPlanCapabilities ya
-// soportaba opts.is_trial (cupo de plan en 0 para wa_confirmacion/
-// campanas_wa/emails_campana durante el trial de Starter), pero
+// soportaba opts.is_trial (cupo de plan en 0 SOLO para wa_confirmacion
+// durante el trial de Starter; campanas_wa ya es 0 en Starter y los 100
+// emails de campaña sí se incluyen en el trial, decisión 2026-09-30), pero
 // checkMonthlyUsage -- el único punto real de enforcement antes de cada
 // envío/uso -- nunca se lo pasaba. En la práctica, el cupo de trial nunca
 // se aplicaba: un Starter en trial tenía acceso al cupo completo del plan
@@ -1160,9 +1237,24 @@ async function decrementAddonBalance(tenant_id, resource, amount) {
     if (!row) return;
 
     const newBalance = Math.max(0, Number(row.balance || 0) - amount);
+    // Saldo conservado tras un downgrade (ver cancelUnsupportedAddons, M16):
+    // al agotarse, el add-on se cierra si el plan actual no lo permite.
+    // Si no se puede leer el plan, solo se descuenta (nunca se pierde el
+    // descuento por esto).
+    let closeExhausted = false;
+    if (newBalance === 0) {
+      try {
+        closeExhausted = !isAddonAvailableForPlan(resource, await getPlan(tenant_id));
+      } catch (_) {}
+    }
+    const nowIso = new Date().toISOString();
     await supabase
       .from("tenant_addons")
-      .update({ balance: newBalance, updated_at: new Date().toISOString() })
+      .update({
+        balance: newBalance,
+        updated_at: nowIso,
+        ...(closeExhausted ? { status: "canceled", canceled_at: nowIso } : {}),
+      })
       .eq("id", row.id);
   } catch (err) {
     console.warn(`decrementAddonBalance(${resource}) tenant ${tenant_id}:`, err.message);
@@ -1981,6 +2073,34 @@ function requireWriteAccess(req, res, next) {
   return next();
 }
 
+// Permiso de LECTURA por módulo (auditoría 2026-09-29 sesión 2, I8): antes
+// los permisos granulares solo protegían escrituras (requireWriteAccess) y
+// "Sin acceso" a un módulo solo escondía el menú — entrando por URL o API se
+// leían igual clientes, ingresos, etc. Mismo criterio que requireWriteAccess:
+// owner/admin siempre; módulo sin entrada en permissions (cuentas legacy) no
+// se restringe; solo `false` bloquea ("view" sí puede leer). Con varios
+// módulos basta acceso a cualquiera (p.ej. Campañas necesita la lista de
+// clientes para armar la audiencia). Requiere que antes se haya resuelto la
+// membresía (tenantAuth / tenantAuthSlug / requireTenantMembership).
+function hasModuleReadAccess(authUser, moduleKeys) {
+  if (!authUser?.role) return false;
+  if (authUser.role === "owner" || authUser.role === "admin") return true;
+  const permissions = authUser.permissions;
+  return moduleKeys.some((key) => {
+    const access = permissions ? permissions[key] : undefined;
+    return access !== false;
+  });
+}
+
+function requireModuleReadAccess(...moduleKeys) {
+  return (req, res, next) => {
+    if (!hasModuleReadAccess(req.authenticatedUser, moduleKeys)) {
+      return res.status(403).json({ error: "Sin acceso a este módulo" });
+    }
+    next();
+  };
+}
+
 async function enforceTenantId(req, res, next) {
   const requestedTid = (req.body && req.body.tenant_id) || (req.query && req.query.tenant_id);
   if (!requestedTid) {
@@ -1995,7 +2115,11 @@ async function enforceTenantId(req, res, next) {
 
 async function enforceSlugOwnership(req, res, next) {
   const slug = req.params.slug || req.body?.slug || req.query?.slug;
-  if (!slug) return next();
+  // Antes: sin slug se hacía next() sin validar membresía, y rutas como
+  // PATCH /appointments/:id/clinical quedaban abiertas a cualquier usuario
+  // con sesión (auditoría 2026-09-29 sesión 2, C2). Todas las rutas
+  // tenantAuthSlug* ya reciben slug (en la URL o en el body).
+  if (!slug) return res.status(400).json({ error: "slug es obligatorio" });
   const __perfSlugLookupStart = Date.now(); // instrumentación temporal, ver arriba
   const { data: tenant } = await supabase
     .from("tenants")
@@ -3396,6 +3520,46 @@ async function flowApiRequest(endpoint, params, method = "POST") {
   return data;
 }
 
+// Flow /customer/charge responde un PaymentStatus (mismo objeto que
+// payment/getStatus: flowOrder, commerceOrder, status, amount, ...,
+// verificado en sandbox 2026-09-30 vía customer/getCharges). status:
+// 1 pendiente, 2 pagado, 3 rechazado, 4 anulado. Antes ningún call site
+// miraba el status: un cargo no aprobado que Flow devolviera con HTTP 200
+// activaba igual el add-on (auditoría sesión 3, I1). Cualquier resultado
+// distinto de 2 (incluido un status ausente) se trata como fallo.
+async function chargeFlowCustomer(params) {
+  const result = await flowApiRequest("/customer/charge", params);
+  const status = Number(result?.status);
+  if (status !== 2) {
+    console.error(
+      "Flow /customer/charge no aprobado:",
+      JSON.stringify({
+        commerceOrder: params.commerceOrder,
+        status: result?.status ?? null,
+        flowOrder: result?.flowOrder ?? null,
+      })
+    );
+    const err = new Error(
+      status === 1
+        ? "El pago quedó pendiente de confirmación en Flow y no se activó nada. Revisa tu historial de pagos antes de reintentar."
+        : "Flow no aprobó el cargo a tu tarjeta. Verifica tu tarjeta e intenta de nuevo."
+    );
+    err.flowResponse = result;
+    err.flowChargeStatus = Number.isNaN(status) ? null : status;
+    throw err;
+  }
+  return result;
+}
+
+// Planes que se pueden contratar hoy (destino de subscribe/change-plan).
+// Los slugs legacy (LEGACY_PLAN_SLUGS) siguen en plan_config solo para
+// leer capacidades, nunca como destino: antes se podía "bajar" a
+// platinum/vip y quedarse con sus límites a precio Starter (auditoría
+// sesión 3, C2).
+function isSellablePlanSlug(plan) {
+  return Boolean(PLAN_ORDER[String(plan || "").toLowerCase()]);
+}
+
 // /customer/create no es idempotente: si el externalId ya tiene un customer
 // en Flow, responde error en vez de devolverlo. /customer/list no soporta
 // filtrar por externalId, así que se pagina y se busca client-side.
@@ -3514,6 +3678,7 @@ async function sendCampaignEmail({
   subject,
   html,
   text,
+  headers = null,
 }) {
   const resendApiKey = process.env.RESEND_API_KEY;
   const fromEmail =
@@ -3537,6 +3702,7 @@ async function sendCampaignEmail({
       subject,
       html,
       text,
+      ...(headers ? { headers } : {}),
     }),
   });
 
@@ -3547,6 +3713,61 @@ async function sendCampaignEmail({
   }
 
   return data;
+}
+
+// Desuscripción de correos de campaña (Ley 19.496 art. 28 B, auditoría
+// 2026-09-29 sesión 2, I13). Ver 2026-09-29-marketing-email-unsubscribe.sql.
+// Página de baja (un clic, sin login) y endpoint de baja con un clic desde
+// el cliente de correo (encabezado List-Unsubscribe, RFC 8058).
+const MARKETING_UNSUBSCRIBE_PAGE_URL = "https://www.orbyx.cl/desuscribir";
+const MARKETING_UNSUBSCRIBE_ONE_CLICK_URL =
+  "https://orbyx-backend.onrender.com/public/marketing/unsubscribe";
+
+// Devuelve Map(email -> { token, unsubscribed }) para los emails dados de
+// un negocio, creando la fila (y su token) la primera vez que un email
+// entra a una campaña. Lanza si la tabla no está disponible: sin token no
+// hay enlace de baja, y no se debe enviar publicidad sin él.
+async function getMarketingEmailPreferences(tenantId, emails) {
+  const unique = [
+    ...new Set(
+      (emails || []).map((email) => String(email || "").trim().toLowerCase()).filter(Boolean)
+    ),
+  ];
+  const prefs = new Map();
+  for (let i = 0; i < unique.length; i += 200) {
+    const chunk = unique.slice(i, i + 200);
+    const { error: upsertError } = await supabase
+      .from("marketing_email_preferences")
+      .upsert(
+        chunk.map((email) => ({ tenant_id: tenantId, email })),
+        { onConflict: "tenant_id,email", ignoreDuplicates: true }
+      );
+    if (upsertError) throw upsertError;
+
+    const { data, error } = await supabase
+      .from("marketing_email_preferences")
+      .select("email, token, unsubscribed_at")
+      .eq("tenant_id", tenantId)
+      .in("email", chunk);
+    if (error) throw error;
+
+    for (const row of data || []) {
+      prefs.set(row.email, { token: row.token, unsubscribed: Boolean(row.unsubscribed_at) });
+    }
+  }
+  return prefs;
+}
+
+// Enlace de baja + encabezados List-Unsubscribe para un destinatario.
+function buildMarketingUnsubscribeParts(pref) {
+  if (!pref?.token) return { unsubscribeUrl: "", headers: null };
+  return {
+    unsubscribeUrl: `${MARKETING_UNSUBSCRIBE_PAGE_URL}/${pref.token}`,
+    headers: {
+      "List-Unsubscribe": `<${MARKETING_UNSUBSCRIBE_ONE_CLICK_URL}/${pref.token}>`,
+      "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    },
+  };
 }
 
 function escapeHtml(value) {
@@ -3596,9 +3817,21 @@ function buildCampaignEmailTemplate({
   showCta = true,
   footerNote = "",
   footerNoteHtml = "",
+  unsubscribeUrl = "",
 }) {
 
   const safeBusinessName = escapeHtml(businessName || "Orbyx");
+  // Enlace de baja obligatorio en correos promocionales (Ley 19.496 art.
+  // 28 B, auditoría 2026-09-29 sesión 2, I13). Ver
+  // getMarketingEmailPreferences.
+  const safeUnsubscribeUrl = escapeHtml(String(unsubscribeUrl || "").trim());
+  const unsubscribeBlock = safeUnsubscribeUrl
+    ? `
+                  <div style="margin-top:12px;">
+                    ¿No quieres recibir más correos de ${safeBusinessName}?
+                    <a href="${safeUnsubscribeUrl}" style="color:#64748b;text-decoration:underline;">Date de baja aquí</a>.
+                  </div>`
+    : "";
   const safeSubject = escapeHtml(subject || "Campaña");
   const safeMessage = escapeHtml(message || "").replace(/\n/g, "<br />");
   const safeBrandColor = String(brandColor || "#0f766e").trim();
@@ -3721,6 +3954,7 @@ function buildCampaignEmailTemplate({
                   "
                 >
                   ${safeFooterNote}
+                  ${unsubscribeBlock}
                 </div>
               </td>
             </tr>
@@ -3741,6 +3975,9 @@ function buildCampaignEmailTemplate({
     showCta && safeCtaUrl ? `${ctaText || "Agendar visita"}: ${safeCtaUrl}` : "",
     "",
     footerNote || `Este correo fue enviado por ${businessName || "Orbyx"} a través de Orbyx.`,
+    unsubscribeUrl
+      ? `¿No quieres recibir más correos de ${businessName || "Orbyx"}? Date de baja aquí: ${unsubscribeUrl}`
+      : "",
   ].filter(Boolean);
 
   return {
@@ -5182,6 +5419,25 @@ photo_url: photo_url || null,
    ✅ PUT /staff/:id
 ====================================================== */
 
+// Citas futuras todavía agendadas de un profesional o sucursal. Usado al
+// desactivarlos (auditoría 2026-09-29 sesión 2, I3/I9): si hay alguna, el
+// endpoint responde 409 con la cantidad y el dashboard pide confirmación
+// explícita (confirm_future_appointments: true) antes de aplicar. Las citas
+// no se tocan — siguen agendadas.
+async function countFutureBookedAppointments({ tenant_id, staff_id, branch_id }) {
+  let query = supabase
+    .from("appointments")
+    .select("id", { count: "exact", head: true })
+    .eq("tenant_id", tenant_id)
+    .eq("status", "booked")
+    .gte("start_at", new Date().toISOString());
+  if (staff_id) query = query.eq("staff_id", staff_id);
+  if (branch_id) query = query.eq("branch_id", branch_id);
+  const { count, error } = await query;
+  if (error) throw error;
+  return count || 0;
+}
+
 app.put("/staff/:id", tenantAuthWrite, async (req, res) => {
   try {
     const { id } = req.params;
@@ -5204,7 +5460,7 @@ app.put("/staff/:id", tenantAuthWrite, async (req, res) => {
 
     const { data: existingStaff, error: existingError } = await supabase
       .from("staff")
-      .select("id, tenant_id, branch_id")
+      .select("id, tenant_id, branch_id, is_active")
       .eq("id", id)
       .eq("tenant_id", req.authenticatedUser.tenant_id)
       .single();
@@ -5213,7 +5469,50 @@ app.put("/staff/:id", tenantAuthWrite, async (req, res) => {
       return res.status(404).json({ error: "Staff no encontrado" });
     }
 
+    // Desactivar con citas futuras exige confirmación explícita (I3).
+    if (
+      is_active !== undefined &&
+      !Boolean(is_active) &&
+      existingStaff.is_active !== false &&
+      req.body.confirm_future_appointments !== true
+    ) {
+      const futureAppointments = await countFutureBookedAppointments({
+        tenant_id: existingStaff.tenant_id,
+        staff_id: existingStaff.id,
+      });
+      if (futureAppointments > 0) {
+        return res.status(409).json({
+          error: `Este profesional tiene ${futureAppointments} cita(s) futura(s) agendada(s).`,
+          requires_confirmation: true,
+          future_appointments: futureAppointments,
+        });
+      }
+    }
+
     const effectiveTenantId = existingStaff.tenant_id;
+
+    // Reactivar un profesional cuenta como agregar uno (I11, auditoría
+    // 2026-09-30): si ya hay tantos activos como permite el plan + add-ons
+    // vigentes, se bloquea — mismo criterio que PATCH /branches/:id al
+    // reactivar una sucursal. Sin esto, lo que desactivó un downgrade o
+    // quedó fuera al vencer un add-on "+1 Profesional" se podía volver a
+    // activar sin pagar. No desactiva nada de lo que ya está activo.
+    if (
+      is_active !== undefined &&
+      Boolean(is_active) === true &&
+      existingStaff.is_active === false
+    ) {
+      const plan = await getPlan(effectiveTenantId);
+      const activeStaffCount = await getActiveStaffCount(effectiveTenantId);
+      const maxStaff = await getEffectiveLimit(effectiveTenantId, plan, "max_staff", "staff");
+
+      if (activeStaffCount >= maxStaff) {
+        return res.status(403).json({
+          error: "Límite de staff alcanzado",
+          upgrade_required: true,
+        });
+      }
+    }
 
     const updateData = {};
 
@@ -6144,6 +6443,33 @@ app.get("/slots", publicLimiter, async (req, res) => {
    ✅ POST /appointments/slot
 ====================================================== */
 
+// Reserva (y horarios) pedidos desde la Agenda del dashboard (auditoría
+// 2026-09-29 sesión 2, I1): depósito, anticipación mínima y máximo de días
+// son reglas solo de la reserva pública. No basta con que el request diga
+// venir del dashboard — se exige además la sesión de un miembro del negocio
+// con permiso de escritura en Agenda. Devuelve false si no viene del
+// dashboard, true si viene y la sesión alcanza, y null si dice venir del
+// dashboard pero no alcanza (en ese caso ya respondió 401/403).
+async function resolveDashboardBookingAccess(req, res, origin, tenantId) {
+  if (origin !== "dashboard") return false;
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    res.status(401).json({ error: "Token requerido" });
+    return null;
+  }
+  const {
+    data: { user },
+    error: authError,
+  } = await getUserCached(authHeader.split(" ")[1]);
+  if (authError || !user) {
+    res.status(401).json({ error: "Token inválido o sesión expirada" });
+    return null;
+  }
+  req.authenticatedUser = { user_id: user.id };
+  const allowed = await requireTenantWriteAccessForResource(req, res, tenantId, "agenda");
+  return allowed ? true : null;
+}
+
 app.post("/appointments/slot", publicLimiter, async (req, res) => {
   let apptCreated = null;
 
@@ -6243,7 +6569,7 @@ const {
     const { data: tenantConfig, error: tenantConfigError } = await supabase
       .from("tenants")
       .select(
-        "id, is_active, paused_at, trial_ends_at, billing_cycle_end, min_booking_notice_minutes, max_booking_days_ahead, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name"
+        "id, is_active, paused_at, is_trial, trial_ends_at, billing_cycle_end, min_booking_notice_minutes, max_booking_days_ahead, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name"
       )
       .eq("id", cal.tenant_id)
       .single();
@@ -6275,8 +6601,21 @@ const {
         String(tenantConfig.deposit_holder_name || "").trim()
     );
 
+    // Reserva manual desde Agenda (auditoría 2026-09-29 sesión 2, I1):
+    // sin depósito, anticipación mínima ni máximo de días. Todas las demás
+    // validaciones (disponibilidad, solapamientos, cupos) siguen igual.
+    const isDashboardBooking = await resolveDashboardBookingAccess(
+      req,
+      res,
+      req.body?.booking_origin,
+      cal.tenant_id
+    );
+    if (isDashboardBooking === null) return;
+
     const tenantRequiresDeposit =
-      Boolean(tenantConfig.deposit_required) && tenantDepositBankFieldsComplete;
+      !isDashboardBooking &&
+      Boolean(tenantConfig.deposit_required) &&
+      tenantDepositBankFieldsComplete;
 
     const minBookingNoticeMinutes = Number(
       tenantConfig.min_booking_notice_minutes || 0
@@ -6292,7 +6631,13 @@ const {
       Date.now() + minBookingNoticeMinutes * 60 * 1000
     );
 
-    if (start.getTime() < minAllowedStart.getTime()) {
+    // Desde Agenda no aplica la anticipación mínima, pero tampoco se puede
+    // reservar un horario que ya pasó (mismo criterio que filterPastSlots).
+    if (isDashboardBooking && start.getTime() < Date.now()) {
+      return res.status(409).json({ error: "Ese horario ya pasó." });
+    }
+
+    if (!isDashboardBooking && start.getTime() < minAllowedStart.getTime()) {
       return res.status(409).json({
         error: `Este negocio permite reservas con al menos ${minBookingNoticeMinutes} minutos de anticipación.`,
       });
@@ -6304,7 +6649,7 @@ const {
       maxAllowedBookingStart.getDate() + maxBookingDaysAhead
     );
 
-    if (start.getTime() > maxAllowedBookingStart.getTime()) {
+    if (!isDashboardBooking && start.getTime() > maxAllowedBookingStart.getTime()) {
       return res.status(409).json({
         error: `Este negocio permite reservas con hasta ${maxBookingDaysAhead} días de anticipación.`,
       });
@@ -6362,7 +6707,10 @@ const appointmentRequiresDeposit = tenantRequiresDeposit && serviceRequiresDepos
     .eq("tenant_id", cal.tenant_id)
     .eq("branch_id", resolvedBranchId)
     .eq("start_at", startIso)
-  .in("status", isGroup ? ["booked", "completed", "no_show", "rescheduled"] : ["booked"]);
+  // "rescheduled" no ocupa cupo grupal: la persona se movió a otra clase
+  // (auditoría 2026-09-29 sesión 2, I4; mismo criterio en /public/slots y
+  // en el trigger appointments_booking_guard).
+  .in("status", isGroup ? ["booked", "completed", "no_show"] : ["booked"]);
 
 if (staff_id) {
   bookingQuery = bookingQuery.eq("staff_id", staff_id);
@@ -6987,7 +7335,11 @@ if (!appointmentRequiresDeposit) {
       if (apptCreated?.id) {
         await supabase
           .from("appointments")
-          .update({ status: "canceled", canceled_at: new Date().toISOString() })
+          .update({
+            status: "canceled",
+            canceled_at: new Date().toISOString(),
+            ...getDepositFieldsOnCancel(apptCreated),
+          })
           .eq("id", apptCreated.id);
       }
     } catch (_) {}
@@ -7028,6 +7380,7 @@ app.patch("/appointments/:id/clinical", tenantAuthSlugWrite, async (req, res) =>
       .from("appointments")
       .select("id, tenant_id, branch_id, customer_id, pet_id, staff_id, start_at")
       .eq("id", id)
+      .eq("tenant_id", req.authenticatedUser.tenant_id)
       .single();
 
     if (appointmentError || !appointment) {
@@ -7163,7 +7516,7 @@ app.patch("/appointments/:id/clinical", tenantAuthSlugWrite, async (req, res) =>
 /* ======================================================
    ✅ GET /appointments/by-day/:slug/:date
 ====================================================== */
-app.get("/appointments/by-day/:slug/:date", tenantAuthSlug, async (req, res) => {
+app.get("/appointments/by-day/:slug/:date", tenantAuthSlug, requireModuleReadAccess("agenda"), async (req, res) => {
   try {
     const { slug, date } = req.params;
 
@@ -7205,7 +7558,7 @@ const { data: tenant, error: tenantError } = await supabase
 /* ======================================================
    ✅ GET /appointments/by-range/:slug
 ====================================================== */
-app.get("/appointments/by-range/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/appointments/by-range/:slug", tenantAuthSlug, requireModuleReadAccess("agenda"), async (req, res) => {
   try {
     const { from, to, branch_id, staff_id } = req.query;
 
@@ -7339,7 +7692,7 @@ function formatDateForServer(date) {
    ✅ GET /appointments/pending-close/:slug
    Pendientes de cierre globales
 ====================================================== */
-app.get("/appointments/pending-close/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/appointments/pending-close/:slug", tenantAuthSlug, requireModuleReadAccess("agenda"), async (req, res) => {
   try {
     const { branch_id, staff_id } = req.query;
 
@@ -7376,7 +7729,7 @@ app.get("/appointments/pending-close/:slug", tenantAuthSlug, async (req, res) =>
 /* ======================================================
    ✅ GET /dashboard/metrics/:slug
 ====================================================== */
-app.get("/dashboard/metrics/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/dashboard/metrics/:slug", tenantAuthSlug, requireModuleReadAccess("indicadores"), async (req, res) => {
   try {
     const { slug } = req.params;
     const { branch_id } = req.query;
@@ -7735,7 +8088,7 @@ function classifyCustomerActivity(totalVisits, lastVisitAt, inactiveCutoff) {
    ingresos estimados, desempeño por profesional/sucursal y entrega real de
    WhatsApp Marketing.
 ====================================================== */
-app.get("/stats/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/stats/:slug", tenantAuthSlug, requireModuleReadAccess("indicadores"), async (req, res) => {
   try {
     const { slug } = req.params;
     const { from, to, branch_id, inactive_days } = req.query;
@@ -8342,7 +8695,7 @@ app.get("/stats/:slug", tenantAuthSlug, async (req, res) => {
    ✅ GET /appointments/customer-history/:slug
    Historial por cliente para ficha veterinaria
 ====================================================== */
-app.get("/appointments/customer-history/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/appointments/customer-history/:slug", tenantAuthSlug, requireModuleReadAccess("clientes"), async (req, res) => {
   try {
     const { slug } = req.params;
     const { customer_id, branch_id } = req.query;
@@ -8432,6 +8785,10 @@ app.get("/pets/:id/clinical-pdf", [dashboardLimiter, requireTenantAuth], async (
 
     const isMember = await requireTenantMembership(req, res, tenant.id);
     if (!isMember) return;
+    // Permiso de lectura por módulo (auditoría 2026-09-29 sesión 2, I8).
+    if (!hasModuleReadAccess(req.authenticatedUser, ["clientes"])) {
+      return res.status(403).json({ error: "Sin acceso a este módulo" });
+    }
 
     const category = String(tenant.business_category || "").toLowerCase();
 
@@ -8741,6 +9098,10 @@ app.get("/appointments", [dashboardLimiter, requireTenantAuth], async (req, res)
 
     const isMember = await requireTenantMembership(req, res, cal.tenant_id);
     if (!isMember) return;
+    // Permiso de lectura por módulo (auditoría 2026-09-29 sesión 2, I8).
+    if (!hasModuleReadAccess(req.authenticatedUser, ["agenda"])) {
+      return res.status(403).json({ error: "Sin acceso a este módulo" });
+    }
 
     let query = supabase
       .from("appointments")
@@ -8811,7 +9172,7 @@ function normalizeCampaignError(error) {
    ✅ GET /customers/:slug
    Soporta búsqueda + segmentación + inactivos
 ====================================================== */
-app.get("/customers/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/customers/:slug", tenantAuthSlug, requireModuleReadAccess("clientes", "campanas"), async (req, res) => {
   try {
     const { slug } = req.params;
     const { q, segment, inactive_days, branch_id } = req.query;
@@ -8976,6 +9337,23 @@ const isInactive =
       return "new";
     }
 
+    // Emails dados de baja de los correos de campaña de este negocio (I13):
+    // Campañas los excluye de la audiencia de email. Best-effort: si la
+    // tabla aún no existe, el listado sigue funcionando sin el dato (el
+    // envío igual se bloquea en POST /campaigns/send-email).
+    const optedOutEmails = new Set();
+    try {
+      const { data: optOutRows, error: optOutError } = await supabase
+        .from("marketing_email_preferences")
+        .select("email")
+        .eq("tenant_id", tenant.id)
+        .not("unsubscribed_at", "is", null);
+      if (optOutError) throw optOutError;
+      for (const row of optOutRows || []) optedOutEmails.add(row.email);
+    } catch (optOutErr) {
+      console.warn("GET /customers/:slug: marketing_email_preferences", optOutErr.message);
+    }
+
     const enrichedCustomers = rows.map((customer) => {
       const activity = activityByCustomer.get(customer.id);
       const activityTotalVisits = resolvedBranchId
@@ -8994,6 +9372,9 @@ const isInactive =
         is_inactive: customerSegment === "inactive",
         has_completed_visit: completedVisitByCustomer.has(customer.id),
         has_review: reviewedCustomerIds.has(customer.id),
+        marketing_opt_out: customer.email
+          ? optedOutEmails.has(String(customer.email).trim().toLowerCase())
+          : false,
       };
     });
 
@@ -9285,7 +9666,7 @@ app.patch("/customers/:id/extra-data", tenantAuthSlugWrite, async (req, res) => 
    Dashboard: todas las reseñas del tenant, incluyendo ocultas y
    private_feedback. Nunca usado desde la página pública.
 ====================================================== */
-app.get("/reviews/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/reviews/:slug", tenantAuthSlug, requireModuleReadAccess("resenas"), async (req, res) => {
   try {
     const { slug } = req.params;
 
@@ -9729,7 +10110,7 @@ app.get("/pets/:slug", publicLimiter, async (req, res) => {
    🐾 GET /pet-followups/:slug
    Lista de próximos controles por cliente o mascota
 ====================================================== */
-app.get("/pet-followups/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/pet-followups/:slug", tenantAuthSlug, requireModuleReadAccess("clientes"), async (req, res) => {
   try {
     const { slug } = req.params;
     const { customer_id, pet_id } = req.query;
@@ -9898,7 +10279,7 @@ app.post("/clinical-notes/:slug", tenantAuthSlugWrite, async (req, res) => {
    ✅ GET /clinical-notes/:slug
    Notas clínicas veterinarias por mascota o appointment
 ====================================================== */
-app.get("/clinical-notes/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/clinical-notes/:slug", tenantAuthSlug, requireModuleReadAccess("clientes"), async (req, res) => {
   try {
     const { slug } = req.params;
     const { pet_id, appointment_id, customer_id, appointment_ids, from, to, limit = 50 } = req.query;
@@ -10413,6 +10794,10 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
     let emailAudience = [];
     let sent = 0;
     const errors = [];
+    // Destinatarios que se dieron de baja de los correos de este negocio
+    // (I13): se excluyen siempre, antes de aplicar el límite de envío.
+    let skippedUnsubscribed = 0;
+    let marketingPrefs = new Map();
 
     if (hasCuratedAudience) {
       const excludedIds = new Set(
@@ -10448,11 +10833,26 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
       audienceTotal = Array.isArray(final_recipients) ? final_recipients.length : 0;
 
       const appliedLimit = Math.min(requestedLimit, planLimit);
-      emailAudience = Array.from(dedupeMap.values()).slice(0, appliedLimit);
+      try {
+        marketingPrefs = await getMarketingEmailPreferences(tenant.id, Array.from(dedupeMap.keys()));
+      } catch (prefsError) {
+        console.error("POST /campaigns/send-email: marketing_email_preferences", prefsError.message);
+        return res.status(500).json({
+          error: "No se pudo preparar el enlace de desuscripción. No se envió ningún correo.",
+        });
+      }
+      const subscribedRecipients = Array.from(dedupeMap.values()).filter(
+        (recipient) => !marketingPrefs.get(recipient.email)?.unsubscribed
+      );
+      skippedUnsubscribed = dedupeMap.size - subscribedRecipients.length;
+      emailAudience = subscribedRecipients.slice(0, appliedLimit);
 
       if (emailAudience.length === 0) {
         return res.status(400).json({
-          error: "No hay destinatarios con email válido en la audiencia curada",
+          error:
+            skippedUnsubscribed > 0
+              ? "Todos los destinatarios con email válido se dieron de baja de tus correos."
+              : "No hay destinatarios con email válido en la audiencia curada",
         });
       }
 
@@ -10504,6 +10904,10 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
           const personalizedFooterHtml = String(footer_note_html || "")
             .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
+          const unsubscribeParts = buildMarketingUnsubscribeParts(
+            marketingPrefs.get(normalizeEmail(customer.email))
+          );
+
           const template = buildCampaignEmailTemplate({
             businessName: tenant.name || "Orbyx",
             subject: String(subject).trim(),
@@ -10519,6 +10923,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
             showCta: Boolean(show_cta),
             footerNote: personalizedFooter,
             footerNoteHtml: personalizedFooterHtml,
+            unsubscribeUrl: unsubscribeParts.unsubscribeUrl,
           });
 
           await sendCampaignEmail({
@@ -10526,6 +10931,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
             subject: String(subject).trim(),
             html: template.html,
             text: template.text,
+            headers: unsubscribeParts.headers,
           });
 
           sent++;
@@ -10593,6 +10999,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
         recipients_with_email: emailAudience.length,
         sent,
         failed: errors.length,
+        skipped_unsubscribed: skippedUnsubscribed,
         errors,
         used_curated_audience: true,
       });
@@ -10621,13 +11028,33 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
     const sortedAudience = sortCustomers([...audience]);
     const limitedAudience = sortedAudience.slice(0, appliedLimit);
 
-    emailAudience = limitedAudience.filter(
+    const audienceWithEmail = limitedAudience.filter(
       (customer) => customer.email && isValidEmail(customer.email)
     );
 
+    try {
+      marketingPrefs = await getMarketingEmailPreferences(
+        tenant.id,
+        audienceWithEmail.map((customer) => customer.email)
+      );
+    } catch (prefsError) {
+      console.error("POST /campaigns/send-email: marketing_email_preferences", prefsError.message);
+      return res.status(500).json({
+        error: "No se pudo preparar el enlace de desuscripción. No se envió ningún correo.",
+      });
+    }
+
+    emailAudience = audienceWithEmail.filter(
+      (customer) => !marketingPrefs.get(normalizeEmail(customer.email))?.unsubscribed
+    );
+    skippedUnsubscribed = audienceWithEmail.length - emailAudience.length;
+
     if (emailAudience.length === 0) {
       return res.status(400).json({
-        error: "No hay clientes con email disponible para este segmento",
+        error:
+          skippedUnsubscribed > 0
+            ? "Todos los clientes con email de este segmento se dieron de baja de tus correos."
+            : "No hay clientes con email disponible para este segmento",
       });
     }
 
@@ -10679,6 +11106,10 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
         const personalizedFooterHtml = String(footer_note_html || "")
           .replace(/\{\{\s*nombre\s*\}\}/gi, customerName);
 
+        const unsubscribeParts = buildMarketingUnsubscribeParts(
+          marketingPrefs.get(normalizeEmail(customer.email))
+        );
+
         const template = buildCampaignEmailTemplate({
           businessName: tenant.name || "Orbyx",
           subject: String(subject).trim(),
@@ -10694,6 +11125,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
           showCta: Boolean(show_cta),
           footerNote: personalizedFooter,
           footerNoteHtml: personalizedFooterHtml,
+          unsubscribeUrl: unsubscribeParts.unsubscribeUrl,
         });
 
         await sendCampaignEmail({
@@ -10701,6 +11133,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
           subject: String(subject).trim(),
           html: template.html,
           text: template.text,
+          headers: unsubscribeParts.headers,
         });
 
         sent++;
@@ -10766,6 +11199,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
       recipients_with_email: emailAudience.length,
       sent,
       failed: errors.length,
+      skipped_unsubscribed: skippedUnsubscribed,
       errors,
       used_curated_audience: false,
     });
@@ -11029,7 +11463,7 @@ app.post("/campaigns/send-whatsapp", tenantAuthSlugWrite, async (req, res) => {
 /* ======================================================
    📊 GET /campaigns/history/:slug
 ====================================================== */
-app.get("/campaigns/history/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/campaigns/history/:slug", tenantAuthSlug, requireModuleReadAccess("campanas"), async (req, res) => {
   try {
     const { slug } = req.params;
 
@@ -11086,6 +11520,10 @@ app.get("/campaigns/logs/:campaignId", [dashboardLimiter, requireTenantAuth], as
 
     const isMember = await requireTenantMembership(req, res, campaign.tenant_id);
     if (!isMember) return;
+    // Permiso de lectura por módulo (auditoría 2026-09-29 sesión 2, I8).
+    if (!hasModuleReadAccess(req.authenticatedUser, ["campanas"])) {
+      return res.status(403).json({ error: "Sin acceso a este módulo" });
+    }
 
     const { data, error } = await supabase
       .from("campaign_delivery_logs")
@@ -11282,7 +11720,7 @@ const nextControl = resolveNextControlDate({
 /* ======================================================
    ✅ GET /appointments/clinical-pending/:slug
 ====================================================== */
-app.get("/appointments/clinical-pending/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/appointments/clinical-pending/:slug", tenantAuthSlug, requireModuleReadAccess("agenda"), async (req, res) => {
   try {
     const { branch_id, staff_id } = req.query;
 
@@ -11391,7 +11829,9 @@ app.patch("/appointments/:id/status", [dashboardLimiter, requireTenantAuth, requ
 
     const updatePayload = {
       status,
-      ...(status === "canceled" ? { canceled_at: new Date().toISOString() } : {}),
+      ...(status === "canceled"
+        ? { canceled_at: new Date().toISOString(), ...getDepositFieldsOnCancel(appt) }
+        : {}),
     };
     if (notes !== undefined) updatePayload.notes = String(notes).trim() || null;
 
@@ -11551,11 +11991,11 @@ app.post("/appointments/:id/deposit-receipt", publicLimiter, async (req, res) =>
 // Lista para el panel "Depósitos pendientes" de Agenda y para calcular el
 // badge numérico (el frontend hace COUNT en el cliente sobre este mismo
 // array — es una lista corta por diseño, ya que un hold dura 10 minutos).
-app.get("/appointments/pending-deposits", tenantAuth, async (req, res) => {
+app.get("/appointments/pending-deposits", tenantAuth, requireModuleReadAccess("agenda"), async (req, res) => {
   try {
-    const { tenant_id } = req.query;
+    const { tenant_id, branch_id } = req.query;
 
-    const { data, error } = await supabase
+    let query = supabase
       .from("appointments")
       .select(
         "id, customer_name, service_name_snapshot, start_at, deposit_receipt_path, deposit_receipt_uploaded_at, deposit_hold_expires_at, branch_id, staff_id"
@@ -11563,6 +12003,12 @@ app.get("/appointments/pending-deposits", tenantAuth, async (req, res) => {
       .eq("tenant_id", tenant_id)
       .eq("deposit_status", "pending")
       .order("deposit_hold_expires_at", { ascending: true });
+
+    // Sucursal activa de la Agenda (auditoría 2026-09-29 sesión 2, M5).
+    // Sin branch_id se mantiene el comportamiento anterior (todas).
+    if (branch_id) query = query.eq("branch_id", branch_id);
+
+    const { data, error } = await query;
 
     if (error) return res.status(500).json({ error: error.message });
 
@@ -11639,6 +12085,13 @@ app.post(
 
       if (appt.deposit_status !== "pending") {
         return res.status(409).json({ error: "Este depósito ya no está pendiente de revisión." });
+      }
+
+      // Una cita cancelada no se puede "confirmar": mandaría al cliente la
+      // confirmación de una reserva que ya no existe (auditoría 2026-09-29
+      // sesión 2, I2).
+      if (appt.status !== "booked") {
+        return res.status(409).json({ error: "Esta reserva ya no está activa (fue cancelada o cerrada)." });
       }
 
       const { data: updated, error: updErr } = await supabase
@@ -11835,6 +12288,17 @@ app.post(
   }
 );
 
+// Campos extra al cancelar una cita que esperaba revisión de depósito: sin
+// esto quedaba deposit_status='pending' y seguía apareciendo en "Depósitos
+// pendientes" aunque la cita ya estuviera cancelada (auditoría 2026-09-29
+// sesión 2, I2). 'canceled' distingue este caso de 'rejected' (el tenant
+// rechazó el comprobante) y 'expired' (venció el plazo, ver cron).
+function getDepositFieldsOnCancel(appt) {
+  return appt?.deposit_status === "pending"
+    ? { deposit_status: "canceled", deposit_hold_expires_at: null }
+    : {};
+}
+
 /* ======================================================
    ✅ CANCEL (DELETE y POST compat)
 ====================================================== */
@@ -11872,6 +12336,7 @@ const { data: updated, error: updErr } = await supabase
   .update({
     status: "canceled",
     canceled_at: new Date().toISOString(),
+    ...getDepositFieldsOnCancel(appt),
   })
   .eq("id", id)
   .select("*")
@@ -11939,7 +12404,7 @@ app.get("/appointments/:id", publicLimiter, async (req, res) => {
    🔎 SEARCH APPOINTMENTS (nuevo)
 ====================================================== */
 
-app.get("/appointments/search/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/appointments/search/:slug", tenantAuthSlug, requireModuleReadAccess("agenda"), async (req, res) => {
   try {
     const { slug } = req.params;
     const { q, branch_id, staff_id } = req.query;
@@ -12200,6 +12665,7 @@ const RESERVED_PUBLIC_SLUGS = new Set([
   "checkout-premium",
   "completar-registro",
   "dashboard",
+  "desuscribir",
   "invite",
   "login",
   "nosotros",
@@ -12376,7 +12842,7 @@ async function linkTenantOwner({ tenant_id, user_id, phone = null, full_name = n
 // Versiones/URLs de los documentos legales vigentes. Deben coincidir con lo
 // publicado en orbyx-web (app/terminos, app/privacidad) — si se publica una
 // nueva versión de cualquiera de los dos, actualizar acá también.
-const LEGAL_TERMS_VERSION = "1.0";
+const LEGAL_TERMS_VERSION = "1.1"; // 1.1 (2026-09-30): precios netos + IVA, planes Starter/Business/Premium, add-ons acumulables/pago único
 const LEGAL_TERMS_URL = "https://www.orbyx.cl/terminos";
 const LEGAL_PRIVACY_VERSION = "2.0";
 const LEGAL_PRIVACY_URL = "https://www.orbyx.cl/privacidad";
@@ -12678,6 +13144,40 @@ app.post("/tenants/provision", [publicLimiter, requireTenantAuth], async (req, r
 /* ======================================================
    ✅ GET /billing/preview-change
 ====================================================== */
+// Upgrade durante el trial (decisión 2026-09-30, auditoría sesión 3, P6):
+// sin cobro inmediato, el plan nuevo queda gratis hasta que termine la
+// prueba. Aplica a un tenant con trial vigente que nunca pagó
+// (is_trial !== false) y sin suscripción 'active'. Devuelve la última fila
+// de subscriptions para decidir si hay que mover una suscripción 'trialing'
+// de Flow al plan nuevo.
+async function getTrialUpgradeContext(tenant_id) {
+  const { data: tenant, error: tenantErr } = await supabase
+    .from("tenants")
+    .select("is_trial, trial_ends_at")
+    .eq("id", tenant_id)
+    .maybeSingle();
+  if (tenantErr) throw tenantErr;
+
+  const { data: latestSub, error: subErr } = await supabase
+    .from("subscriptions")
+    .select("id, status, flow_customer_id, flow_subscription_id, periodicidad")
+    .eq("tenant_id", tenant_id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (subErr) throw subErr;
+
+  const trialEndsAt = tenant?.trial_ends_at ? new Date(tenant.trial_ends_at) : null;
+  const inTrial = Boolean(
+    trialEndsAt &&
+      trialEndsAt > new Date() &&
+      tenant?.is_trial !== false &&
+      latestSub?.status !== "active"
+  );
+
+  return { inTrial, trialEndsAt, latestSub: latestSub || null };
+}
+
 app.get("/billing/preview-change", tenantAuth, async (req, res) => {
   try {
     const { tenant_id, new_plan } = req.query;
@@ -12688,6 +13188,11 @@ app.get("/billing/preview-change", tenantAuth, async (req, res) => {
 
     if (!new_plan) {
       return res.status(400).json({ error: "new_plan es obligatorio" });
+    }
+
+    // Solo planes vigentes como destino (C2, auditoría 2026-09-30).
+    if (!isSellablePlanSlug(new_plan)) {
+      return res.status(400).json({ error: "Plan no disponible para contratar" });
     }
 
     const subscription = await getTenantSubscriptionRow(tenant_id);
@@ -12705,12 +13210,32 @@ app.get("/billing/preview-change", tenantAuth, async (req, res) => {
         new_plan: targetPlan,
         billing_cycle: tenantCycle,
         amount_today: 0,
-        message: "Ya estás en este plan",
+        message: subscription.scheduled_plan_slug
+          ? "Tienes un cambio de plan programado: puedes cancelarlo y mantener este plan"
+          : "Ya estás en este plan",
+        // Aditivo (M3): permite ofrecer "cancelar el downgrade programado".
+        scheduled_plan_slug: subscription.scheduled_plan_slug || null,
+        scheduled_change_at: subscription.scheduled_change_at || null,
         billing_cycle_end: subscription.billingEnd.toISOString(),
       });
     }
 
     if (isUpgradePlanChange(subscription.currentPlan, targetPlan)) {
+      const trialContext = await getTrialUpgradeContext(tenant_id);
+      if (trialContext.inTrial) {
+        return res.json({
+          ok: true,
+          change_type: "upgrade",
+          trial_upgrade: true,
+          current_plan: subscription.currentPlan,
+          new_plan: targetPlan,
+          billing_cycle: tenantCycle,
+          amount_today: 0,
+          trial_ends_at: trialContext.trialEndsAt.toISOString(),
+          message: "Sin cobro ahora: el plan nuevo queda gratis hasta que termine tu prueba",
+        });
+      }
+
       const { data: flowSub, error: flowSubErr } = await supabase
         .from("subscriptions")
         .select("flow_customer_id, flow_subscription_id")
@@ -12794,6 +13319,10 @@ app.get("/billing/downgrade-resources", tenantAuth, async (req, res) => {
       return res.status(400).json({ error: "tenant_id y new_plan son obligatorios" });
     }
 
+    if (!isSellablePlanSlug(new_plan)) {
+      return res.status(400).json({ error: "Plan no disponible para contratar" });
+    }
+
     const targetPlan = normalizePlanSlug(new_plan);
     const snapshot = await getDowngradeResourceSnapshot(tenant_id, targetPlan);
 
@@ -12831,6 +13360,13 @@ app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
       return res.status(400).json({ error: "new_plan es obligatorio" });
     }
 
+    // Solo planes vigentes como destino (C2, auditoría 2026-09-30): antes
+    // "platinum"/"vip"/"pro" (legacy, nivel 1) pasaban como downgrade y el
+    // tenant quedaba con sus límites a precio Starter.
+    if (!isSellablePlanSlug(new_plan)) {
+      return res.status(400).json({ error: "Plan no disponible para contratar" });
+    }
+
     const subscription = await getTenantSubscriptionRow(tenant_id);
     const targetPlan = normalizePlanSlug(new_plan);
     const tenantCycle = inferBillingCycle(
@@ -12839,12 +13375,152 @@ app.post("/billing/change-plan", tenantAuthWrite, async (req, res) => {
     );
 
     if (subscription.currentPlan === targetPlan) {
+      // Elegir el plan actual con un downgrade programado = cancelarlo
+      // (M3, auditoría 2026-09-30). Nada se desactivó todavía: la
+      // selección de qué mantener solo se aplica el día del cambio.
+      if (subscription.scheduled_plan_slug) {
+        const { data: cleared, error: clearErr } = await supabase
+          .from("tenants")
+          .update({
+            scheduled_plan_slug: null,
+            scheduled_change_at: null,
+            pending_change_type: null,
+            scheduled_keep_staff_ids: null,
+            scheduled_keep_branch_ids: null,
+          })
+          .eq("id", tenant_id)
+          .select("id, plan_slug, scheduled_plan_slug, scheduled_change_at, pending_change_type")
+          .single();
+
+        if (clearErr) throw clearErr;
+
+        return res.json({
+          ok: true,
+          applied: true,
+          change_type: "cancel_scheduled",
+          amount_today: 0,
+          tenant: cleared,
+          message: "Cambio de plan programado cancelado",
+        });
+      }
+
       return res.status(400).json({
         error: "El negocio ya está en ese plan",
       });
     }
 
     if (isUpgradePlanChange(subscription.currentPlan, targetPlan)) {
+      // Upgrade durante el trial (P6): sin cobro, gratis hasta que termine
+      // la prueba. Si ya hay una suscripción 'trialing' en Flow (tarjeta
+      // inscrita), se reemplaza por una del plan nuevo con los días de
+      // trial restantes (sin cobro hoy); nunca quedan dos vivas.
+      const trialContext = await getTrialUpgradeContext(tenant_id);
+      if (trialContext.inTrial) {
+        const latestSub = trialContext.latestSub;
+        const trialCycle = normalizeBillingCycle(latestSub?.periodicidad);
+        const trialMonto = computePlanNetAmount(targetPlan, trialCycle);
+        let subPatch = null;
+
+        if (latestSub?.status === "trialing" && latestSub.flow_subscription_id && latestSub.flow_customer_id) {
+          try {
+            await flowApiRequest("/subscription/cancel", {
+              subscriptionId: latestSub.flow_subscription_id,
+            });
+          } catch (cancelErr) {
+            console.error(
+              `POST /billing/change-plan: upgrade en trial, no se pudo cancelar la suscripción trialing de tenant ${tenant_id}:`,
+              cancelErr.message
+            );
+            return res.status(502).json({
+              error: "No pudimos actualizar tu suscripción en Flow. Intenta de nuevo en unos minutos.",
+            });
+          }
+
+          const trialDaysLeft = Math.max(
+            1,
+            Math.ceil((trialContext.trialEndsAt.getTime() - Date.now()) / (24 * 60 * 60 * 1000))
+          );
+
+          try {
+            const trialFlowPlanId = await getOrCreateFlowPlan(targetPlan, trialCycle, trialMonto);
+            const newFlowSub = await flowApiRequest("/subscription/create", {
+              planId: trialFlowPlanId,
+              customerId: latestSub.flow_customer_id,
+              trial_period_days: trialDaysLeft,
+            });
+            subPatch = {
+              plan_id: targetPlan,
+              monto: trialMonto,
+              flow_subscription_id: newFlowSub.subscriptionId,
+              status: Number(newFlowSub.status) === 2 ? "trialing" : Number(newFlowSub.status) === 1 ? "active" : "error",
+            };
+          } catch (createErr) {
+            // La anterior ya quedó cancelada: la tarjeta sigue inscrita,
+            // así que se deja en 'card_registered' para que pueda volver a
+            // activar la suscripción desde Facturación. El plan no cambia.
+            console.error(
+              `POST /billing/change-plan: upgrade en trial, falló subscription/create para tenant ${tenant_id}:`,
+              createErr.message
+            );
+            await supabase
+              .from("subscriptions")
+              .update({ status: "card_registered", updated_at: new Date().toISOString() })
+              .eq("id", latestSub.id);
+            return res.status(502).json({
+              error:
+                "No pudimos mover tu suscripción al plan nuevo. Tu tarjeta sigue inscrita: vuelve a activar tu suscripción en Facturación y pago.",
+            });
+          }
+        } else if (latestSub && ["pending", "card_registered"].includes(latestSub.status)) {
+          // Sin suscripción viva en Flow: solo se deja el plan y monto
+          // correctos para cuando se active.
+          subPatch = { plan_id: targetPlan, monto: trialMonto };
+        }
+
+        const { data: trialTenant, error: trialTenantErr } = await supabase
+          .from("tenants")
+          .update({
+            plan_slug: targetPlan,
+            scheduled_plan_slug: null,
+            scheduled_change_at: null,
+            pending_change_type: null,
+            scheduled_keep_staff_ids: null,
+            scheduled_keep_branch_ids: null,
+            proration_credit: 0,
+            proration_charge: 0,
+          })
+          .eq("id", tenant_id)
+          .select("id, plan_slug, billing_cycle_start, billing_cycle_end, scheduled_plan_slug, scheduled_change_at, pending_change_type")
+          .single();
+
+        if (trialTenantErr) throw trialTenantErr;
+
+        if (subPatch && latestSub) {
+          const { error: trialSubErr } = await supabase
+            .from("subscriptions")
+            .update({ ...subPatch, updated_at: new Date().toISOString() })
+            .eq("id", latestSub.id);
+          if (trialSubErr) {
+            console.error(
+              `POST /billing/change-plan: upgrade en trial aplicado a tenant ${tenant_id} pero subscriptions no pudo actualizarse:`,
+              trialSubErr.message
+            );
+          }
+        }
+
+        return res.json({
+          ok: true,
+          applied: true,
+          change_type: "upgrade",
+          trial_upgrade: true,
+          billing_cycle: tenantCycle,
+          amount_today: 0,
+          trial_ends_at: trialContext.trialEndsAt.toISOString(),
+          tenant: trialTenant,
+          message: "Upgrade aplicado sin cobro: gratis hasta que termine tu prueba",
+        });
+      }
+
       const { data: flowSub, error: flowSubErr } = await supabase
         .from("subscriptions")
         .select("id, flow_customer_id, flow_subscription_id")
@@ -13166,6 +13842,71 @@ app.get("/billing/addons", tenantAuth, async (req, res) => {
   }
 });
 
+// Días de gracia tras un cobro rechazado (decisión 2026-09-30, auditoría
+// sesión 3, I7): el dashboard y la página pública se limitan recién 3
+// días después de la fecha en que se habría bloqueado.
+const PAYMENT_FAILED_GRACE_DAYS = 3;
+
+// Estado de acceso por facturación — fuente única para
+// GET /billing/account-status, getPublicBookingStatus y deriveTenantBucket
+// (middleware.ts replica la misma fórmula, no puede importar este archivo).
+// Reglas (auditoría 2026-09-30, sesión 3):
+//   - trialing (tarjeta inscrita en Flow, primer cobro programado) ya NO
+//     cuenta como trial_active: el aviso de trial desaparece al pagar (I8).
+//   - El fin de trial solo bloquea a quien nunca pagó (hasPaidBefore =
+//     tenants.is_trial === false, que el webhook apaga en el primer pago
+//     y que nace en false en el signup pagado). Quien ya pagó y cancela
+//     conserva acceso hasta billing_cycle_end, como prometen el modal de
+//     cancelación y los Términos 8.1 (I6).
+//   - status 'error' (cobro rechazado) suma PAYMENT_FAILED_GRACE_DAYS a
+//     la fecha de corte (I7).
+function computeBillingAccessState({
+  subscriptionStatus,
+  trialEndsAt,
+  billingCycleEnd,
+  isPaused,
+  hasPaidBefore,
+  now,
+}) {
+  const hasActiveSubscription = subscriptionStatus === "active";
+  const isTrialingInFlow = subscriptionStatus === "trialing";
+  const paymentFailed = subscriptionStatus === "error";
+
+  const trialActive = Boolean(
+    !isPaused && trialEndsAt && now < trialEndsAt && !hasActiveSubscription && !isTrialingInFlow
+  );
+  const awaitingPayment = !hasActiveSubscription && !trialActive && !isTrialingInFlow;
+
+  const graceMs = paymentFailed ? PAYMENT_FAILED_GRACE_DAYS * 24 * 60 * 60 * 1000 : 0;
+  const trialCutoff =
+    trialEndsAt && !hasPaidBefore ? new Date(trialEndsAt.getTime() + graceMs) : null;
+  // Quien nunca pagó y tiene trial se rige solo por el fin del trial: su
+  // billing_cycle_end es el del alta y puede quedar antes (trial extendido
+  // desde el admin), lo que lo bloquearía antes de tiempo o sin gracia.
+  const cycleCutoff =
+    billingCycleEnd && !trialCutoff ? new Date(billingCycleEnd.getTime() + graceMs) : null;
+
+  const trialExpired = Boolean(!isPaused && awaitingPayment && trialCutoff && now >= trialCutoff);
+  const cycleExpired = Boolean(awaitingPayment && cycleCutoff && now >= cycleCutoff);
+  const blocked = Boolean(isPaused || trialExpired || cycleExpired);
+
+  // Momento en que se limita (o se limitó) el acceso: el primero de los
+  // cortes que aplican. null si no está esperando pago.
+  const cutoffs = [trialCutoff, cycleCutoff].filter(Boolean).map((d) => d.getTime());
+  const accessEndsAt = awaitingPayment && cutoffs.length ? new Date(Math.min(...cutoffs)) : null;
+
+  return {
+    hasActiveSubscription,
+    isTrialingInFlow,
+    paymentFailed,
+    trialActive,
+    awaitingPayment,
+    trialExpired,
+    blocked,
+    accessEndsAt,
+  };
+}
+
 /* ======================================================
    ✅ GET /billing/account-status
    Estado de cuenta para el widget del dashboard: trial, pago y
@@ -13202,7 +13943,7 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     const { data: tenant, error: tenantErr } = await supabase
       .from("tenants")
       .select(
-        "id, plan_slug, trial_ends_at, billing_cycle_end, paused_at, wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name, dashboard_welcome_seen_at"
+        "id, plan_slug, is_trial, trial_ends_at, billing_cycle_end, paused_at, wa_confirmation_enabled, wa_reminder_enabled, wa_reminder_hours_before, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name, dashboard_welcome_seen_at"
       )
       .eq("id", tenant_id)
       .single();
@@ -13219,8 +13960,6 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       .limit(1)
       .maybeSingle();
 
-    const hasActiveSubscription = subscription?.status === "active";
-    const isTrialingInFlow = subscription?.status === "trialing";
     const subscriptionStatus = subscription?.status || "none";
 
     const now = new Date();
@@ -13229,9 +13968,23 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
 
     const isPaused = Boolean(tenant.paused_at);
 
-    const trialActive = Boolean(!isPaused && trialEndsAt && now < trialEndsAt && !hasActiveSubscription);
-    const awaitingPayment = !hasActiveSubscription && !trialActive && !isTrialingInFlow;
-    const trialExpired = Boolean(!isPaused && awaitingPayment && trialEndsAt && now >= trialEndsAt);
+    // Cálculo compartido con getPublicBookingStatus/deriveTenantBucket
+    // (y replicado en middleware.ts) — ver computeBillingAccessState.
+    const {
+      trialActive,
+      awaitingPayment,
+      trialExpired,
+      paymentFailed,
+      accessEndsAt,
+      blocked,
+    } = computeBillingAccessState({
+      subscriptionStatus,
+      trialEndsAt,
+      billingCycleEnd,
+      isPaused,
+      hasPaidBefore: tenant.is_trial === false,
+      now,
+    });
     // Pausado por Super Admin bloquea el dashboard igual que un tenant
     // vencido (mismo mecanismo, ver middleware.ts), independiente del
     // ciclo de facturación o trial — el admin canceló la suscripción en
@@ -13248,15 +14001,15 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     // que billing_cycle_end también pasara -- inconsistente con el aviso
     // de vencimiento (banner/email/directorio admin), que sí usa
     // trial_ends_at directamente.
-    const blocked =
-      isPaused || trialExpired || Boolean(awaitingPayment && billingCycleEnd && now >= billingCycleEnd);
 
     const msPerDay = 24 * 60 * 60 * 1000;
     const diasRestantesTrial = trialActive
       ? Math.max(0, Math.ceil((trialEndsAt.getTime() - now.getTime()) / msPerDay))
       : null;
-    const diasRestantesPago = awaitingPayment && billingCycleEnd
-      ? Math.max(0, Math.ceil((billingCycleEnd.getTime() - now.getTime()) / msPerDay))
+    // Cuenta contra el momento real del bloqueo (fin de ciclo, fin de
+    // trial nunca pagado, o esas fechas + gracia si el último cobro falló).
+    const diasRestantesPago = awaitingPayment && accessEndsAt
+      ? Math.max(0, Math.ceil((accessEndsAt.getTime() - now.getTime()) / msPerDay))
       : null;
 
     // Contador WA confirmación — misma fuente y forma que
@@ -13322,6 +14075,9 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       subscription_status: subscriptionStatus,
       awaiting_payment: awaitingPayment,
       dias_restantes_pago: diasRestantesPago,
+      // Aditivo (auditoría sesión 3, I7): último cobro rechazado, en
+      // período de gracia de PAYMENT_FAILED_GRACE_DAYS mientras !blocked.
+      payment_failed: paymentFailed,
       blocked,
       blocked_reason: !blocked ? null : isPaused ? "paused" : trialExpired ? "trial_expired" : "payment_overdue",
       wa_confirmacion: usageEntry(caps.max_wa_confirmacion, "wa_confirmacion"),
@@ -13429,7 +14185,7 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
     }
 
     try {
-      await flowApiRequest("/customer/charge", {
+      await chargeFlowCustomer({
         customerId: addonSubscription.flow_customer_id,
         amount: applyIva(chargeAmount),
         subject: `Add-on: ${addon_key} x${qty}`,
@@ -13437,7 +14193,7 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
       });
     } catch (chargeErr) {
       console.error("POST /billing/addons/activate: fallo el cargo Flow", chargeErr.message);
-      return res.status(500).json({ error: chargeErr.message });
+      return res.status(chargeErr.flowResponse ? 402 : 500).json({ error: chargeErr.message });
     }
 
     let row;
@@ -14007,8 +14763,9 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
     }
 
     // Ownership: el tenant debe existir; la mutación filtra por tenant_id.
+    let tenantPlan;
     try {
-      await getPlan(tenant_id);
+      tenantPlan = await getPlan(tenant_id);
     } catch {
       return res.status(404).json({ error: "Tenant no encontrado" });
     }
@@ -14052,6 +14809,14 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
       });
     }
 
+    // Saldo conservado tras bajar de plan (M16): se puede usar, no recargar.
+    if (qty > existing.quantity && !isAddonAvailableForPlan(addon_key, tenantPlan)) {
+      return res.status(403).json({
+        error: `El plan ${tenantPlan} no permite contratar este add-on`,
+        upgrade_required: true,
+      });
+    }
+
     if (qty > existing.quantity) {
       // Cobra el tier real de CADA unidad nueva (ver tieredAddonChargeAmount),
       // no un solo tier (el de la última compra) aplicado a todo el
@@ -14079,7 +14844,7 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
       }
 
       try {
-        await flowApiRequest("/customer/charge", {
+        await chargeFlowCustomer({
           customerId: addonSubscription.flow_customer_id,
           amount: applyIva(chargeAmount),
           subject: `Add-on: ${addon_key} x${increment}`,
@@ -14088,7 +14853,7 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
         justCharged = true;
       } catch (chargeErr) {
         console.error("PATCH /billing/addons/quantity: fallo el cargo Flow", chargeErr.message);
-        return res.status(500).json({ error: chargeErr.message });
+        return res.status(chargeErr.flowResponse ? 402 : 500).json({ error: chargeErr.message });
       }
     }
 
@@ -14246,10 +15011,21 @@ app.patch("/billing/addons/renewal-mode", tenantAuthWrite, async (req, res) => {
     }
 
     // Ownership: el tenant debe existir; la mutación filtra por tenant_id.
+    let tenantPlan;
     try {
-      await getPlan(tenant_id);
+      tenantPlan = await getPlan(tenant_id);
     } catch {
       return res.status(404).json({ error: "Tenant no encontrado" });
+    }
+
+    // Saldo conservado tras bajar de plan (auditoría 2026-09-29 sesión 2,
+    // M16): se puede seguir usando, pero no reactivar la renovación
+    // automática (sería recargar) mientras el plan no incluya el add-on.
+    if (renewal_mode === "automatico" && !isAddonAvailableForPlan(addon_key, tenantPlan)) {
+      return res.status(403).json({
+        error: `El plan ${tenantPlan} no permite contratar este add-on`,
+        upgrade_required: true,
+      });
     }
 
     const { data: existing, error: existingError } = await supabase
@@ -14927,7 +15703,7 @@ app.post(
 
       const { data: subscription } = await supabase
         .from("subscriptions")
-        .select("id, tenant_id")
+        .select("id, tenant_id, status")
         .eq("flow_customer_id", status.customerId)
         .order("created_at", { ascending: false })
         .limit(1)
@@ -14941,13 +15717,23 @@ app.post(
         return res.redirect(`${frontendBase}/dashboard?card_status=error`);
       }
 
-      const { error: updateErr } = await supabase
-        .from("subscriptions")
-        .update({
-          status: cardRegistered ? "card_registered" : "error",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", subscription.id);
+      // Cambio de tarjeta con suscripción viva (C3, auditoría 2026-09-30):
+      // la tarjeta vive en el customer de Flow, así que la suscripción
+      // existente ya cobra a la tarjeta nueva — no hay que tocar su estado.
+      // Antes se pisaba a 'card_registered' (y la página de facturación
+      // creaba una SEGUNDA suscripción) o, si el cambio fallaba, a 'error'
+      // (bloqueando a un tenant que sí estaba pagando).
+      const isCardChangeOnLiveSubscription = ["active", "trialing"].includes(subscription.status);
+
+      const { error: updateErr } = isCardChangeOnLiveSubscription
+        ? { error: null }
+        : await supabase
+            .from("subscriptions")
+            .update({
+              status: cardRegistered ? "card_registered" : "error",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", subscription.id);
 
       if (updateErr) {
         console.error(
@@ -14976,6 +15762,52 @@ app.post(
   }
 );
 
+// Correo al dueño cuando Flow rechaza el cobro de la suscripción (I7):
+// informa la fecha límite de la gracia (mismo corte que
+// computeBillingAccessState con status 'error'). Nunca lanza.
+async function notifySubscriptionPaymentFailed(tenant_id) {
+  try {
+    const { data: tenant } = await supabase
+      .from("tenants")
+      .select("name, slug, is_trial, trial_ends_at, billing_cycle_end")
+      .eq("id", tenant_id)
+      .maybeSingle();
+    if (!tenant) return;
+
+    const { ownerEmail } = await getActiveOwnerEmail(tenant_id);
+    if (!ownerEmail) {
+      console.warn(`notifySubscriptionPaymentFailed: tenant ${tenant_id} sin owner con email`);
+      return;
+    }
+
+    const { accessEndsAt } = computeBillingAccessState({
+      subscriptionStatus: "error",
+      trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
+      billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
+      isPaused: false,
+      hasPaidBefore: tenant.is_trial === false,
+      now: new Date(),
+    });
+    // Si el corte ya quedó en el pasado (ciclo desfasado), se informa
+    // "hoy + gracia" para no mandar una fecha vencida.
+    const minDeadline = new Date(Date.now() + PAYMENT_FAILED_GRACE_DAYS * 24 * 60 * 60 * 1000);
+    const deadline =
+      accessEndsAt && accessEndsAt.getTime() > Date.now() ? accessEndsAt : minDeadline;
+
+    const result = await sendPaymentFailedEmail({
+      to: ownerEmail,
+      businessName: tenant.name,
+      deadlineLabel: formatDateCL(deadline),
+      billingUrl: `${PUBLIC_SITE_URL}/dashboard/${tenant.slug}/billing`,
+    });
+    if (!result.ok) {
+      console.warn(`notifySubscriptionPaymentFailed: correo no enviado (tenant ${tenant_id}):`, result.reason);
+    }
+  } catch (err) {
+    console.error(`notifySubscriptionPaymentFailed: error (tenant ${tenant_id}):`, err.message);
+  }
+}
+
 /* ======================================================
    ✅ POST /billing/flow/webhook (sandbox)
    Flow notifica cobros recurrentes (POST, x-www-form-urlencoded).
@@ -14994,22 +15826,128 @@ app.post(
       return res.sendStatus(200);
     }
 
+    // Auditoría 2026-09-30 (sesión 3, C6 parcial): si falla la lectura o
+    // escritura en Supabase (o la consulta a Flow) se responde 500 en vez
+    // de 200, para que el aviso no se pierda en silencio y Flow pueda
+    // reintentarlo. Solo se responde 200 cuando no hay nada que reintentar
+    // (sin token, pago desconocido, o ya procesado).
     try {
       const payment = await flowApiRequest("/payment/getStatus", { token }, "GET");
-      // status 2 = pagada/confirmada según la convención estándar de Flow.
-      const paymentOk = Number(payment.status) === 2;
-      const flowCustomerId = payment.customerId || payment.customer?.customerId || null;
+      // status Flow: 1 pendiente, 2 pagada, 3 rechazada, 4 anulada.
+      const flowStatus = Number(payment.status);
+      const paymentOk = flowStatus === 2;
+      // Pendiente de confirmación: todavía no es un rechazo. Antes se
+      // marcaba 'error' y bloqueaba al tenant por un pago que aún podía
+      // aprobarse. Flow vuelve a notificar cuando cambie de estado.
+      if (flowStatus === 1) {
+        console.log(`POST /billing/flow/webhook: pago pendiente en Flow (flowOrder ${payment.flowOrder || "?"}), sin cambios.`);
+        return res.sendStatus(200);
+      }
+
+      // Identificación de la suscripción (fix 2026-09-30, auditoría sesión
+      // 3): el PaymentStatus de Flow NO trae customerId ni subscriptionId
+      // (verificado en sandbox con payment/getStatusByFlowOrder), así que la
+      // búsqueda anterior por payment.customerId nunca encontraba nada y
+      // ningún cobro recurrente se registraba. Lo que sí trae es el
+      // commerceOrder que genera Flow para los cobros de suscripción:
+      // "sus_<subscriptionId>_<invoiceId>_<fecha>" (ej.
+      // "sus_b3e6c1a116_1204279_2026-09-06 02:46"). Se busca:
+      //   1) la fila de subscriptions por ese flow_subscription_id;
+      //   2) si no está (signup pagado cuya fila aún no se crea, o fila con
+      //      flow_subscription_id vacío), el customerId vía
+      //      subscription/get y la fila por flow_customer_id.
+      const commerceOrderMatch = String(payment.commerceOrder || "").match(/^(sus_[A-Za-z0-9]+)_/);
+      const flowSubscriptionId = payment.subscriptionId || commerceOrderMatch?.[1] || null;
+
+      if (!flowSubscriptionId && !payment.customerId && !payment.customer?.customerId) {
+        console.error(
+          "POST /billing/flow/webhook: el pago no es de una suscripción reconocible (commerceOrder sin prefijo sus_)",
+          { commerceOrder: payment.commerceOrder || null, flowOrder: payment.flowOrder || null }
+        );
+        return res.sendStatus(200);
+      }
 
       let subscription = null;
-      if (flowCustomerId) {
-        const { data } = await supabase
+      if (flowSubscriptionId) {
+        const { data, error: subBySubIdErr } = await supabase
           .from("subscriptions")
-          .select("id, tenant_id, plan_id")
+          .select("id, tenant_id, plan_id, status, flow_subscription_id")
+          .eq("flow_subscription_id", flowSubscriptionId)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (subBySubIdErr) {
+          console.error("POST /billing/flow/webhook: fallo leyendo subscriptions", subBySubIdErr.message);
+          return res.sendStatus(500);
+        }
+        subscription = data;
+      }
+
+      let flowCustomerId = payment.customerId || payment.customer?.customerId || null;
+      if (!subscription && !flowCustomerId && flowSubscriptionId) {
+        // Error de Flow acá → 500 (catch de abajo) para que se reintente.
+        const flowSub = await flowApiRequest("/subscription/get", { subscriptionId: flowSubscriptionId }, "GET");
+        flowCustomerId = flowSub?.customerId || null;
+      }
+
+      if (!subscription && flowCustomerId) {
+        const { data, error: subLookupErr } = await supabase
+          .from("subscriptions")
+          .select("id, tenant_id, plan_id, status, flow_subscription_id")
           .eq("flow_customer_id", flowCustomerId)
           .order("created_at", { ascending: false })
           .limit(1)
           .maybeSingle();
+        if (subLookupErr) {
+          console.error("POST /billing/flow/webhook: fallo leyendo subscriptions", subLookupErr.message);
+          return res.sendStatus(500);
+        }
         subscription = data;
+
+        // La fila del customer apunta a OTRA suscripción de Flow (p. ej.
+        // una anterior que se reemplazó al cambiar de tarjeta o de plan en
+        // trial): este cobro no es de la suscripción que Orbyx sigue, no
+        // debe activar ni bloquear al tenant. Queda en el log para revisar
+        // en Flow (una suscripción vieja que siga cobrando es un problema).
+        if (
+          subscription &&
+          flowSubscriptionId &&
+          subscription.flow_subscription_id &&
+          subscription.flow_subscription_id !== flowSubscriptionId
+        ) {
+          console.error(
+            `POST /billing/flow/webhook: cobro de la suscripción ${flowSubscriptionId}, pero tenant ${subscription.tenant_id} sigue a ${subscription.flow_subscription_id} — se ignora, revisar en Flow.`
+          );
+          return res.sendStatus(200);
+        }
+
+        // Signup pagado: Flow cobra en subscription/create ANTES de que
+        // exista el tenant y su fila en subscriptions (se crean justo
+        // después, en el mismo request del callback). El signup_intent sí
+        // existe desde /signup/start-paid con este flow_customer_id: si el
+        // pago es de un signup todavía en curso, se responde 503 para que
+        // el aviso se reintente cuando la fila ya exista, en vez de
+        // descartarlo como "desconocido".
+        if (!subscription) {
+          const { data: pendingIntent, error: intentLookupErr } = await supabase
+            .from("signup_intents")
+            .select("id, status")
+            .eq("flow_customer_id", flowCustomerId)
+            .in("status", ["started", "paid", "tenant_creation_failed"])
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (intentLookupErr) {
+            console.error("POST /billing/flow/webhook: fallo leyendo signup_intents", intentLookupErr.message);
+            return res.sendStatus(500);
+          }
+          if (pendingIntent) {
+            console.warn(
+              `POST /billing/flow/webhook: pago de signup_intent ${pendingIntent.id} (${pendingIntent.status}) antes de crear el tenant; se pide reintento.`
+            );
+            return res.sendStatus(503);
+          }
+        }
       }
 
       if (!subscription) {
@@ -15022,7 +15960,12 @@ app.post(
           .from("subscriptions")
           .update({
             status: "active",
-            flow_subscription_id: payment.subscriptionId || null,
+            // Solo si se pudo identificar (commerceOrder) y la fila no lo
+            // tenía: antes esto pisaba con null el flow_subscription_id
+            // guardado al suscribirse (PaymentStatus no trae subscriptionId).
+            ...(flowSubscriptionId && !subscription.flow_subscription_id
+              ? { flow_subscription_id: flowSubscriptionId }
+              : {}),
             updated_at: new Date().toISOString(),
           })
           .eq("id", subscription.id);
@@ -15032,6 +15975,7 @@ app.post(
             "POST /billing/flow/webhook: fallo al actualizar subscriptions.status=active",
             subUpdateErr.message
           );
+          return res.sendStatus(500);
         }
 
         // Extiende el ciclo de facturación al período recién pagado — sin
@@ -15056,6 +16000,7 @@ app.post(
             "POST /billing/flow/webhook: fallo al leer billing_cycle_start/end antes de extender el ciclo",
             tenantCycleErr.message
           );
+          return res.sendStatus(500);
         }
 
         const previousEnd = tenantForCycle?.billing_cycle_end
@@ -15066,19 +16011,31 @@ app.post(
           tenantForCycle?.billing_cycle_end || previousEnd
         );
         const cycleMonths = BILLING_CYCLES[tenantCycle]?.months || 1;
-        const newCycleEnd = addMonths(previousEnd, cycleMonths);
+        // Solo se extiende si el ciclo guardado está vencido o por vencer
+        // (≤ 7 días). Si todavía faltan más días, este pago corresponde al
+        // ciclo que ya está registrado — p. ej. el primer cobro de un
+        // signup pagado, cuyo ciclo ya fijó provisionTenantCore, cuando el
+        // aviso llega por reintento (503 de arriba) — o es un aviso
+        // repetido; extender ahí regalaría un mes.
+        const EXTEND_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+        const shouldExtendCycle = previousEnd.getTime() - Date.now() <= EXTEND_WINDOW_MS;
+        const newCycleEnd = shouldExtendCycle ? addMonths(previousEnd, cycleMonths) : previousEnd;
 
         const { error: tenantUpdateErr } = await supabase
           .from("tenants")
           // is_trial=false: un pago real confirmado por Flow saca al
-          // tenant del trial sin importar lo que diga is_trial hoy (ver
-          // getAccountStatus, que igual no confia en este campo para
-          // nada nuevo — esto es solo para dejarlo consistente).
+          // tenant del trial. Desde 2026-09-30 computeBillingAccessState
+          // lo usa como "ya pagó alguna vez" (fin de trial ya no bloquea a
+          // quien cancela después de haber pagado).
           .update({
             plan_slug: normalizePlanSlug(subscription.plan_id),
             is_trial: false,
-            billing_cycle_start: previousEnd.toISOString(),
-            billing_cycle_end: newCycleEnd.toISOString(),
+            ...(shouldExtendCycle
+              ? {
+                  billing_cycle_start: previousEnd.toISOString(),
+                  billing_cycle_end: newCycleEnd.toISOString(),
+                }
+              : {}),
           })
           .eq("id", subscription.tenant_id);
 
@@ -15087,12 +16044,13 @@ app.post(
             "POST /billing/flow/webhook: fallo al actualizar tenants.plan_slug",
             tenantUpdateErr.message
           );
+          return res.sendStatus(500);
         }
 
         console.log(
           `Flow webhook: pago confirmado para tenant ${subscription.tenant_id}, plan ${subscription.plan_id}, ciclo extendido hasta ${newCycleEnd.toISOString()}`
         );
-      } else {
+      } else if (flowStatus === 3 || flowStatus === 4) {
         const { error: subErrorUpdateErr } = await supabase
           .from("subscriptions")
           .update({ status: "error", updated_at: new Date().toISOString() })
@@ -15103,18 +16061,32 @@ app.post(
             "POST /billing/flow/webhook: fallo al actualizar subscriptions.status=error",
             subErrorUpdateErr.message
           );
+          return res.sendStatus(500);
         }
 
         console.error(
           `Flow webhook: pago no confirmado para tenant ${subscription.tenant_id}, status Flow: ${payment.status}`
+        );
+
+        // Aviso el mismo día (I7, 3 días de gracia). Solo la primera vez
+        // que pasa a 'error': los reintentos de cobro de Flow que vuelvan
+        // a fallar no repiten el correo. Best-effort: no cambia la
+        // respuesta a Flow.
+        if (subscription.status !== "error") {
+          await notifySubscriptionPaymentFailed(subscription.tenant_id);
+        }
+      } else {
+        console.warn(
+          `Flow webhook: status Flow no reconocido (${payment.status}) para tenant ${subscription.tenant_id}, sin cambios.`
         );
       }
 
       return res.sendStatus(200);
     } catch (err) {
       console.error("POST /billing/flow/webhook error:", err.message);
-      // Respondemos 200 igual para que Flow no reintente indefinidamente.
-      return res.sendStatus(200);
+      // 500 (antes 200): el aviso no se procesó y no debe perderse en
+      // silencio — Flow puede reintentarlo.
+      return res.sendStatus(500);
     }
   }
 );
@@ -15127,17 +16099,31 @@ app.post(
 ====================================================== */
 app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
   try {
-    const { tenant_id, plan_id, periodicidad, monto } = req.body;
+    const { tenant_id } = req.body;
+    const plan_id = String(req.body.plan_id || "").toLowerCase();
+    const periodicidad = normalizeBillingCycle(req.body.periodicidad);
 
-    if (!tenant_id || !plan_id || !periodicidad || !monto) {
+    if (!tenant_id || !plan_id) {
       return res.status(400).json({
-        error: "tenant_id, plan_id, periodicidad y monto son obligatorios",
+        error: "tenant_id y plan_id son obligatorios",
       });
+    }
+
+    // Solo planes vigentes (C2) y monto calculado acá, nunca el del body
+    // (C1, auditoría 2026-09-30): antes se creaba el plan de Flow con el
+    // `monto` que mandara el navegador — cualquiera podía suscribirse a
+    // Premium pagando lo que quisiera. Mismo cálculo que /signup/start-paid.
+    if (!isSellablePlanSlug(plan_id)) {
+      return res.status(400).json({ error: "Plan no disponible para contratar" });
+    }
+    const monto = computePlanNetAmount(plan_id, periodicidad);
+    if (!monto) {
+      return res.status(400).json({ error: "No se pudo calcular el monto para ese plan/periodicidad" });
     }
 
     const { data: subscription, error: subErr } = await supabase
       .from("subscriptions")
-      .select("id, tenant_id, flow_customer_id, status")
+      .select("id, tenant_id, flow_customer_id, flow_subscription_id, status")
       .eq("tenant_id", tenant_id)
       .order("created_at", { ascending: false })
       .limit(1)
@@ -15171,6 +16157,45 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
       const now = new Date();
       if (trialEndsAt > now) {
         trialPeriodDays = Math.ceil((trialEndsAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+      }
+    }
+
+    // Nunca dos suscripciones vivas en Flow para el mismo tenant (C3,
+    // auditoría 2026-09-30): si la fila todavía apunta a una suscripción
+    // que en Flow sigue activa o en trial (p. ej. quedó 'card_registered'
+    // tras un cambio de tarjeta, o 'error' → nueva tarjeta), se cancela
+    // antes de crear la nueva. Si Flow no la reconoce (id de otro
+    // ambiente), no puede estar cobrando y se sigue.
+    if (subscription.flow_subscription_id) {
+      let previousFlowSub = null;
+      try {
+        previousFlowSub = await flowApiRequest(
+          "/subscription/get",
+          { subscriptionId: subscription.flow_subscription_id },
+          "GET"
+        );
+      } catch (lookupErr) {
+        console.warn(
+          `POST /billing/flow/subscribe: no se pudo consultar la suscripción anterior ${subscription.flow_subscription_id} (se asume inexistente):`,
+          lookupErr.message
+        );
+      }
+
+      if ([1, 2].includes(Number(previousFlowSub?.status))) {
+        try {
+          await flowApiRequest("/subscription/cancel", {
+            subscriptionId: subscription.flow_subscription_id,
+          });
+        } catch (cancelErr) {
+          console.error(
+            `POST /billing/flow/subscribe: no se pudo cancelar la suscripción anterior ${subscription.flow_subscription_id} de tenant ${tenant_id}:`,
+            cancelErr.message
+          );
+          return res.status(502).json({
+            error:
+              "No pudimos reemplazar tu suscripción anterior en Flow. Intenta de nuevo en unos minutos o escríbenos a soporte@orbyx.cl.",
+          });
+        }
       }
     }
 
@@ -15216,6 +16241,29 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
       .eq("id", subscription.id);
 
     if (updateErr) throw updateErr;
+
+    // Cobro inmediato (sin trial): el período pagado empieza hoy. Sin esto
+    // un tenant que se suscribe semanas después de vencer su trial quedaba
+    // con billing_cycle_end en el pasado, y al cancelar perdía el acceso
+    // en el acto en vez de al fin del ciclo pagado (I6). is_trial=false
+    // marca que ya pagó (ver computeBillingAccessState). Best-effort.
+    if (mappedStatus === "active") {
+      const cycleStart = new Date();
+      const { error: cycleErr } = await supabase
+        .from("tenants")
+        .update({
+          is_trial: false,
+          billing_cycle_start: cycleStart.toISOString(),
+          billing_cycle_end: addMonths(cycleStart, BILLING_CYCLES[periodicidad].months).toISOString(),
+        })
+        .eq("id", tenant_id);
+      if (cycleErr) {
+        console.error(
+          `POST /billing/flow/subscribe: suscripción creada pero no se pudo fijar el ciclo de tenant ${tenant_id}:`,
+          cycleErr.message
+        );
+      }
+    }
 
     return res.json({
       subscription_id: subscription.id,
@@ -15326,7 +16374,32 @@ app.post("/billing/flow/cancel-subscription", tenantAuthWrite, async (req, res) 
 
     if (updateErr) throw updateErr;
 
-    return res.json({ ok: true, status: "canceled" });
+    // Los add-ons dejan de cobrarse junto con el plan (C5). El plan ya
+    // quedó cancelado en Flow: si esto falla no se revierte, pero se
+    // informa para que no quede cobrando en silencio.
+    let addonsStopped = [];
+    let addonsStopError = null;
+    try {
+      addonsStopped = await stopTenantAddonCharges(tenant_id);
+    } catch (addonErr) {
+      addonsStopError = addonErr.message;
+      console.error(
+        `POST /billing/flow/cancel-subscription: plan cancelado pero no se pudo detener el cobro de add-ons de tenant ${tenant_id}:`,
+        addonErr.message
+      );
+    }
+
+    return res.json({
+      ok: true,
+      status: "canceled",
+      addons_stopped: addonsStopped,
+      ...(addonsStopError
+        ? {
+            warning:
+              "Tu plan quedó cancelado, pero no pudimos detener la renovación de tus add-ons. Escríbenos a soporte@orbyx.cl.",
+          }
+        : {}),
+    });
   } catch (err) {
     console.error("POST /billing/flow/cancel-subscription error:", err.message);
     return res.status(500).json({ error: err.message });
@@ -15684,7 +16757,7 @@ async function attemptSignupIntentTenantCreation(intent, req) {
     try {
       const addonsCharge = computeSignupAddonsCharge(intent.addons, intent.plan_id);
       if (addonsCharge.valid && addonsCharge.items.length > 0 && intent.flow_customer_id) {
-        await flowApiRequest("/customer/charge", {
+        await chargeFlowCustomer({
           customerId: intent.flow_customer_id,
           amount: applyIva(addonsCharge.netTotal),
           subject: `Add-ons iniciales: ${addonsCharge.items.map((i) => `${i.addon_key} x${i.quantity}`).join(", ")}`,
@@ -16172,7 +17245,7 @@ async function chargeRecurringAddons() {
         try {
           const { data: subscription, error: subErr } = await supabase
             .from("subscriptions")
-            .select("id, flow_customer_id")
+            .select("id, flow_customer_id, status")
             .eq("tenant_id", row.tenant_id)
             .order("created_at", { ascending: false })
             .limit(1)
@@ -16188,9 +17261,32 @@ async function chargeRecurringAddons() {
             continue;
           }
 
+          // Defensa (C5, auditoría 2026-09-30): nunca cobrar add-ons de un
+          // tenant con el plan cancelado, pausado o inactivo. Normalmente
+          // stopTenantAddonCharges ya los sacó de 'automatico' al cancelar
+          // o pausar; esto cubre filas que hayan quedado atrás.
+          const { data: chargeTenant, error: chargeTenantErr } = await supabase
+            .from("tenants")
+            .select("paused_at, is_active")
+            .eq("id", row.tenant_id)
+            .maybeSingle();
+          if (chargeTenantErr) throw chargeTenantErr;
+          if (
+            subscription.status === "canceled" ||
+            !chargeTenant ||
+            chargeTenant.is_active === false ||
+            chargeTenant.paused_at
+          ) {
+            console.warn(
+              `charge-recurring: tenant ${row.tenant_id} cancelado/pausado/inactivo, no se cobra addon ${row.addon_key} (tenant_addons.id=${row.id})`
+            );
+            skipped++;
+            continue;
+          }
+
           const netAmount = Number(row.unit_price || 0) * Number(row.quantity || 0);
 
-          await flowApiRequest("/customer/charge", {
+          await chargeFlowCustomer({
             customerId: subscription.flow_customer_id,
             amount: applyIva(netAmount),
             subject: `Add-on recurrente: ${row.addon_key} x${row.quantity}`,
@@ -16322,7 +17418,7 @@ async function triggerLowBalanceRecharge(tenant_id, addonId) {
     if (currentQty >= 2) unitPrice = addon.price_pack3 ?? addon.price;
     else if (currentQty >= 1) unitPrice = addon.price_pack2 ?? addon.price;
 
-    await flowApiRequest("/customer/charge", {
+    await chargeFlowCustomer({
       customerId: subscription.flow_customer_id,
       amount: applyIva(unitPrice),
       subject: "Add-on: wa_confirmacion x1 (recarga automática por saldo bajo)",
@@ -17212,6 +18308,26 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
       }
     }
 
+    // Desactivar con citas futuras exige confirmación explícita (I9).
+    if (
+      is_active !== undefined &&
+      !Boolean(is_active) &&
+      existingBranch.is_active !== false &&
+      req.body.confirm_future_appointments !== true
+    ) {
+      const futureAppointments = await countFutureBookedAppointments({
+        tenant_id: effectiveTenantId,
+        branch_id: existingBranch.id,
+      });
+      if (futureAppointments > 0) {
+        return res.status(409).json({
+          error: `Esta sucursal tiene ${futureAppointments} cita(s) futura(s) agendada(s).`,
+          requires_confirmation: true,
+          future_appointments: futureAppointments,
+        });
+      }
+    }
+
     if (is_active !== undefined) {
       if (Boolean(is_active) === true && existingBranch.is_active === false) {
         const plan = await getPlan(effectiveTenantId);
@@ -17639,7 +18755,17 @@ const {
           ? Number(capacity)
           : Number(existingService.capacity || 1);
 
-      if (effectiveIsGroup) {
+      // Capacidad ya guardada por sobre el límite actual (p. ej. tras vencer
+      // un add-on de cupos o bajar de plan) se conserva tal cual: solo se
+      // bloquea SUBIRLA o activar un grupo nuevo por sobre el límite
+      // (decisión 2026-09-30, auditoría sesión 3, I11). Antes, guardar el
+      // formulario completo de un servicio así fallaba aunque no se
+      // cambiara la capacidad.
+      const keepsExistingCapacity =
+        Boolean(existingService.is_group) &&
+        effectiveCapacity <= Number(existingService.capacity || 1);
+
+      if (effectiveIsGroup && !keepsExistingCapacity) {
         const maxGroupCapacity =
           await getEffectiveGroupCapacity(effectiveTenantId);
 
@@ -17808,7 +18934,7 @@ const PUBLIC_BOOKING_GRACE_DAYS = 7;
 // vencido sin pago), pero con el corte corrido PUBLIC_BOOKING_GRACE_DAYS
 // hacia adelante. Pausa manual de admin (paused_at) e is_active=false
 // cierran de inmediato. `tenant` debe traer is_active, paused_at,
-// trial_ends_at y billing_cycle_end.
+// is_trial, trial_ends_at y billing_cycle_end.
 async function getPublicBookingStatus(tenant) {
   if (!tenant || tenant.is_active === false) return { open: false, reason: "inactive" };
   if (tenant.paused_at) return { open: false, reason: "paused" };
@@ -17821,24 +18947,20 @@ async function getPublicBookingStatus(tenant) {
     .limit(1)
     .maybeSingle();
 
-  const hasActiveSubscription = subscription?.status === "active";
-  const isTrialingInFlow = subscription?.status === "trialing";
   const now = new Date();
-  const trialEndsAt = tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null;
-  const billingCycleEnd = tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null;
+  const { blocked, accessEndsAt } = computeBillingAccessState({
+    subscriptionStatus: subscription?.status || "none",
+    trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
+    billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
+    isPaused: false,
+    hasPaidBefore: tenant.is_trial === false,
+    now,
+  });
+  if (!blocked || !accessEndsAt) return { open: true, reason: null };
 
-  const trialActive = Boolean(trialEndsAt && now < trialEndsAt && !hasActiveSubscription);
-  const awaitingPayment = !hasActiveSubscription && !trialActive && !isTrialingInFlow;
-  if (!awaitingPayment) return { open: true, reason: null };
-
-  // Momento en que el dashboard quedó bloqueado: el primero entre trial
-  // vencido y fin de ciclo sin pago (mismas dos condiciones que `blocked`).
-  const blockedCandidates = [];
-  if (trialEndsAt && now >= trialEndsAt) blockedCandidates.push(trialEndsAt.getTime());
-  if (billingCycleEnd && now >= billingCycleEnd) blockedCandidates.push(billingCycleEnd.getTime());
-  if (blockedCandidates.length === 0) return { open: true, reason: null };
-
-  const blockedSince = Math.min(...blockedCandidates);
+  // Momento en que el dashboard quedó bloqueado (mismo corte que
+  // `blocked`, incluida la gracia por cobro rechazado).
+  const blockedSince = accessEndsAt.getTime();
   const closesAt = blockedSince + PUBLIC_BOOKING_GRACE_DAYS * 24 * 60 * 60 * 1000;
   return now.getTime() >= closesAt
     ? { open: false, reason: "unpaid" }
@@ -17849,6 +18971,7 @@ function toPublicTenant(tenant) {
   const publicTenant = { ...tenant };
   delete publicTenant.is_active;
   delete publicTenant.paused_at;
+  delete publicTenant.is_trial;
   delete publicTenant.trial_ends_at;
   delete publicTenant.billing_cycle_end;
   if (!publicTenant.deposit_required) {
@@ -17856,6 +18979,56 @@ function toPublicTenant(tenant) {
   }
   return publicTenant;
 }
+
+/* ======================================================
+   🌐 PUBLIC: baja de correos de campaña (auditoría 2026-09-29 sesión 2,
+   I13 — Ley 19.496 art. 28 B). Sin login: el token (uuid aleatorio, uno
+   por negocio+email) es la credencial, igual que cancel_token en la
+   cancelación pública. Lo llaman la página /desuscribir/[token] de
+   orbyx-web (al abrir el enlace del correo) y los clientes de correo vía
+   List-Unsubscribe-Post (RFC 8058, cuerpo form-urlencoded). Idempotente.
+====================================================== */
+app.post(
+  "/public/marketing/unsubscribe/:token",
+  publicLimiter,
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    try {
+      const token = String(req.params.token || "").trim();
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token)) {
+        return res.status(404).json({ error: "Enlace inválido" });
+      }
+
+      const { data: pref, error: prefError } = await supabase
+        .from("marketing_email_preferences")
+        .select("id, tenant_id, unsubscribed_at")
+        .eq("token", token)
+        .maybeSingle();
+
+      if (prefError) throw prefError;
+      if (!pref) return res.status(404).json({ error: "Enlace inválido" });
+
+      if (!pref.unsubscribed_at) {
+        const { error: updateError } = await supabase
+          .from("marketing_email_preferences")
+          .update({ unsubscribed_at: new Date().toISOString() })
+          .eq("id", pref.id);
+        if (updateError) throw updateError;
+      }
+
+      const { data: tenant } = await supabase
+        .from("tenants")
+        .select("name")
+        .eq("id", pref.tenant_id)
+        .maybeSingle();
+
+      return res.json({ ok: true, business_name: tenant?.name || null });
+    } catch (err) {
+      console.error("POST /public/marketing/unsubscribe/:token error:", err.message);
+      return res.status(500).json({ error: "No se pudo procesar la baja. Intenta de nuevo." });
+    }
+  }
+);
 
 app.get("/public/services/:slug", publicLimiter, async (req, res) => {
   try {
@@ -17865,7 +19038,7 @@ app.get("/public/services/:slug", publicLimiter, async (req, res) => {
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .select(
-        `${PUBLIC_TENANT_FIELDS}, ${PUBLIC_TENANT_DEPOSIT_FIELDS.join(", ")}, is_active, paused_at, trial_ends_at, billing_cycle_end`
+        `${PUBLIC_TENANT_FIELDS}, ${PUBLIC_TENANT_DEPOSIT_FIELDS.join(", ")}, is_active, paused_at, is_trial, trial_ends_at, billing_cycle_end`
       )
       .eq("slug", slug)
       .single();
@@ -18305,7 +19478,7 @@ app.get("/public/staff/:slug/:service_id", publicLimiter, async (req, res) => {
 app.get("/public/slots/:slug/:service_id", publicLimiter, async (req, res) => {
   try {
     const { slug, service_id } = req.params;
-    const { date, staff_id, branch_id } = req.query;
+    const { date, staff_id, branch_id, origin } = req.query;
 
     if (!slug || !service_id || !date) {
       return res.status(400).json({
@@ -18342,9 +19515,19 @@ app.get("/public/slots/:slug/:service_id", publicLimiter, async (req, res) => {
       return res.status(404).json({ error: "sucursal no encontrada" });
     }
 
-    const minBookingNoticeMinutes = Number(
-      tenant.min_booking_notice_minutes || 0
+    // Modal "Nueva reserva" de Agenda: mismos horarios, sin anticipación
+    // mínima ni máximo de días (ver resolveDashboardBookingAccess, I1).
+    const isDashboardBooking = await resolveDashboardBookingAccess(
+      req,
+      res,
+      origin,
+      tenant.id
     );
+    if (isDashboardBooking === null) return;
+
+    const minBookingNoticeMinutes = isDashboardBooking
+      ? 0
+      : Number(tenant.min_booking_notice_minutes || 0);
     const maxBookingDaysAhead = Number(tenant.max_booking_days_ahead || 60);
 
     const requestedDate = new Date(`${date}T00:00:00-03:00`);
@@ -18352,7 +19535,7 @@ app.get("/public/slots/:slug/:service_id", publicLimiter, async (req, res) => {
     maxAllowedDate.setHours(0, 0, 0, 0);
     maxAllowedDate.setDate(maxAllowedDate.getDate() + maxBookingDaysAhead);
 
-    if (requestedDate.getTime() > maxAllowedDate.getTime()) {
+    if (!isDashboardBooking && requestedDate.getTime() > maxAllowedDate.getTime()) {
       return res.json({
         business: {
           name: tenant.name,
@@ -18403,7 +19586,8 @@ async function attachCapacityToSlots(slotsToCheck) {
     .eq("tenant_id", tenant.id)
     .eq("branch_id", resolvedBranchId)
     .eq("service_id", service_id)
-    .in("status", ["booked", "completed", "no_show", "rescheduled"])
+    // Sin "rescheduled": reagendar libera el cupo (auditoría 2026-09-29 sesión 2, I4).
+    .in("status", ["booked", "completed", "no_show"])
     .gte("start_at", dayStart)
     .lte("start_at", dayEnd);
 
@@ -19090,14 +20274,20 @@ async function sendTrialEndingReminders() {
   const todayKey = getSantiagoDayKey(now);
   const msPerDay = 24 * 60 * 60 * 1000;
   const threshold = new Date(now.getTime() + 3 * msPerDay);
+  // Tope de envío tras vencer (decisión 2026-09-30, auditoría sesión 3,
+  // I17): antes un trial abandonado recibía el correo "prueba vencida"
+  // todos los días, indefinidamente.
+  const STOP_AFTER_EXPIRED_DAYS = 14;
+  const oldestTrialEnd = new Date(now.getTime() - STOP_AFTER_EXPIRED_DAYS * msPerDay);
 
   const { data: candidates, error } = await supabase
     .from("tenants")
-    .select("id, name, slug, trial_ends_at, last_trial_reminder_sent_at")
+    .select("id, name, slug, is_trial, trial_ends_at, last_trial_reminder_sent_at")
     .eq("is_active", true)
     .is("paused_at", null)
     .not("trial_ends_at", "is", null)
-    .lte("trial_ends_at", threshold.toISOString());
+    .lte("trial_ends_at", threshold.toISOString())
+    .gte("trial_ends_at", oldestTrialEnd.toISOString());
   if (error) throw new Error(error.message);
   if (!candidates || candidates.length === 0) return { sent: 0, skipped: 0 };
 
@@ -19137,7 +20327,9 @@ async function sendTrialEndingReminders() {
 
   for (const tenant of candidates) {
     const subscriptionStatus = latestSubscriptionByTenant[tenant.id]?.status || "none";
-    if (subscriptionStatus === "active" || subscriptionStatus === "trialing") {
+    // Ya pagó alguna vez (is_trial=false): su acceso lo rige el ciclo
+    // pagado, no el trial — no corresponde el correo de "prueba".
+    if (subscriptionStatus === "active" || subscriptionStatus === "trialing" || tenant.is_trial === false) {
       skipped++;
       continue;
     }
@@ -19552,7 +20744,7 @@ app.post("/upload/campaign-image", [dashboardLimiter, requireTenantAuth, require
 // =======================
 // LISTAR IMÁGENES
 // =======================
-app.get("/campaign-images/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/campaign-images/:slug", tenantAuthSlug, requireModuleReadAccess("campanas"), async (req, res) => {
   try {
     const { slug } = req.params;
 
@@ -20285,18 +21477,21 @@ const ADMIN_PLAN_PRICES_ALL = {
 // vez de tocar ese endpoint (billing, alto riesgo, cambios mínimos).
 // IMPORTANTE: si la lógica de /billing/account-status cambia, replicar el
 // cambio acá también — no hay una sola fuente de verdad compartida todavía.
-function deriveTenantBucket({ subscriptionStatus, trialEndsAt, billingCycleEnd, pausedAt, now }) {
+function deriveTenantBucket({ subscriptionStatus, trialEndsAt, billingCycleEnd, pausedAt, isTrial, now }) {
   // Pausado por Super Admin es su propio bucket, independiente de todo lo
   // demás — mismo criterio que GET /billing/account-status/middleware.ts.
   if (pausedAt) return "paused";
 
-  const hasActiveSubscription = subscriptionStatus === "active";
-  const isTrialingInFlow = subscriptionStatus === "trialing";
-
-  const trialActive = Boolean(trialEndsAt && now < trialEndsAt && !hasActiveSubscription);
-  const awaitingPayment = !hasActiveSubscription && !trialActive && !isTrialingInFlow;
-  const trialExpired = Boolean(awaitingPayment && trialEndsAt && now >= trialEndsAt);
-  const blocked = Boolean(awaitingPayment && billingCycleEnd && now >= billingCycleEnd);
+  // Mismo cálculo que GET /billing/account-status (computeBillingAccessState).
+  const { hasActiveSubscription, isTrialingInFlow, trialActive, trialExpired, blocked } =
+    computeBillingAccessState({
+      subscriptionStatus,
+      trialEndsAt,
+      billingCycleEnd,
+      isPaused: false,
+      hasPaidBefore: isTrial === false,
+      now,
+    });
 
   if (hasActiveSubscription) return "active";
   if (trialActive || isTrialingInFlow) return "trial";
@@ -20319,7 +21514,7 @@ app.get("/admin/estadisticas", requireAdminAuth, async (req, res) => {
   try {
     const { data: tenants, error: tenantsError } = await supabase
       .from("tenants")
-      .select("id, plan_slug, trial_ends_at, billing_cycle_end, paused_at, is_active")
+      .select("id, plan_slug, is_trial, trial_ends_at, billing_cycle_end, paused_at, is_active")
       .eq("is_active", true);
     if (tenantsError) throw tenantsError;
 
@@ -20353,6 +21548,7 @@ app.get("/admin/estadisticas", requireAdminAuth, async (req, res) => {
         trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
         billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
         pausedAt: tenant.paused_at ? new Date(tenant.paused_at) : null,
+        isTrial: tenant.is_trial,
         now,
       });
       counts[bucket] = (counts[bucket] || 0) + 1;
@@ -20445,7 +21641,7 @@ app.get("/admin/tenants", requireAdminAuth, async (req, res) => {
     // y sí debe listarse.
     const { data: tenants, error: tenantsError } = await supabase
       .from("tenants")
-      .select("id, name, slug, plan_slug, business_category, trial_ends_at, billing_cycle_end, paused_at, created_at, is_active")
+      .select("id, name, slug, plan_slug, business_category, is_trial, trial_ends_at, billing_cycle_end, paused_at, created_at, is_active")
       .eq("is_active", true)
       .not("business_category", "is", null)
       .order("created_at", { ascending: false });
@@ -20507,6 +21703,7 @@ app.get("/admin/tenants", requireAdminAuth, async (req, res) => {
         trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
         billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
         pausedAt: tenant.paused_at ? new Date(tenant.paused_at) : null,
+        isTrial: tenant.is_trial,
         now,
       });
       const amount =
@@ -20549,7 +21746,7 @@ app.get("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
       .select(
-        "id, name, slug, business_category, business_subtype, phone, email, whatsapp, address, plan_slug, trial_ends_at, billing_cycle_start, billing_cycle_end, scheduled_plan_slug, scheduled_change_at, pending_change_type, is_active, paused_at, created_at"
+        "id, name, slug, business_category, business_subtype, phone, email, whatsapp, address, plan_slug, is_trial, trial_ends_at, billing_cycle_start, billing_cycle_end, scheduled_plan_slug, scheduled_change_at, pending_change_type, is_active, paused_at, created_at"
       )
       .eq("id", id)
       .single();
@@ -20573,6 +21770,7 @@ app.get("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
       trialEndsAt: tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null,
       billingCycleEnd: tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null,
       pausedAt: tenant.paused_at ? new Date(tenant.paused_at) : null,
+      isTrial: tenant.is_trial,
       now,
     });
     const amount =
@@ -21261,15 +22459,37 @@ app.post("/admin/tenants/:id/pause", requireAdminAuth, async (req, res) => {
     const { error: updateErr } = await supabase.from("tenants").update({ paused_at: pausedAt }).eq("id", id);
     if (updateErr) throw updateErr;
 
+    // Add-ons dejan de cobrarse junto con la pausa (C5, auditoría
+    // 2026-09-30). Si falla, la pausa queda hecha pero se informa al admin.
+    let addonsStopped = [];
+    let addonsStopError = null;
+    try {
+      addonsStopped = await stopTenantAddonCharges(id);
+    } catch (addonErr) {
+      addonsStopError = addonErr.message;
+      console.error(`POST /admin/tenants/:id/pause: no se pudo detener el cobro de add-ons de ${id}:`, addonErr.message);
+    }
+
     await logAdminTenantAction({
       tenantId: id,
       adminUserId: req.adminUser.user_id,
       adminEmail: req.adminUser.email,
       actionType: "pause",
-      details: { flow_subscription_canceled: flowCanceled },
+      details: {
+        flow_subscription_canceled: flowCanceled,
+        addons_stopped: addonsStopped,
+        ...(addonsStopError ? { addons_stop_error: addonsStopError } : {}),
+      },
     });
 
-    res.json({ ok: true, paused_at: pausedAt });
+    res.json({
+      ok: true,
+      paused_at: pausedAt,
+      addons_stopped: addonsStopped,
+      ...(addonsStopError
+        ? { warning: `Tenant pausado, pero no se pudo detener la renovación de add-ons: ${addonsStopError}` }
+        : {}),
+    });
   } catch (err) {
     console.error("POST /admin/tenants/:id/pause error:", err.message);
     res.status(500).json({ error: err.message || "Error pausando el tenant" });
@@ -21345,9 +22565,63 @@ async function removeStorageFolder(bucket, prefix) {
   return paths.length;
 }
 
+// Cancela en Flow todo lo que podría seguir cobrando a un tenant que se va
+// a borrar (auditoría 2026-09-30, C4): se encontraron 6 suscripciones
+// activas en Flow sandbox de tenants ya borrados. Las suscripciones vivas
+// (Flow status 0/1/2) se cancelan; si Flow no responde o no se puede
+// cancelar, queda en `failures` y el borrado se detiene salvo confirmación
+// explícita. Los add-ons no son objetos de Flow (los cobra
+// chargeRecurringAddons desde tenant_addons, que se borra), pero además se
+// elimina la tarjeta del customer para que nada pueda volver a cobrarle
+// (best-effort, informativo).
+async function cancelTenantFlowBilling(tenant_id) {
+  const [{ data: subRows, error: subErr }, { data: intentRows, error: intentErr }] = await Promise.all([
+    supabase.from("subscriptions").select("flow_subscription_id, flow_customer_id").eq("tenant_id", tenant_id),
+    supabase.from("signup_intents").select("flow_subscription_id, flow_customer_id").eq("tenant_id", tenant_id),
+  ]);
+  if (subErr) throw subErr;
+  if (intentErr) throw intentErr;
+
+  const rows = [...(subRows || []), ...(intentRows || [])];
+  const subscriptionIds = [...new Set(rows.map((r) => r.flow_subscription_id).filter(Boolean))];
+  const customerIds = [...new Set(rows.map((r) => r.flow_customer_id).filter(Boolean))];
+
+  const canceled = [];
+  const alreadyCanceled = [];
+  const failures = [];
+
+  for (const subscriptionId of subscriptionIds) {
+    try {
+      const flowSub = await flowApiRequest("/subscription/get", { subscriptionId }, "GET");
+      if (Number(flowSub?.status) === 4) {
+        alreadyCanceled.push(subscriptionId);
+        continue;
+      }
+      await flowApiRequest("/subscription/cancel", { subscriptionId });
+      canceled.push(subscriptionId);
+    } catch (err) {
+      failures.push({ subscription_id: subscriptionId, error: err.message || "error de Flow" });
+    }
+  }
+
+  const cardsRemoved = [];
+  const cardRemovalErrors = [];
+  for (const customerId of customerIds) {
+    try {
+      await flowApiRequest("/customer/unRegister", { customerId });
+      cardsRemoved.push(customerId);
+    } catch (err) {
+      // Normal si el customer no tenía tarjeta: solo informativo.
+      cardRemovalErrors.push({ customer_id: customerId, error: err.message || "error de Flow" });
+    }
+  }
+
+  return { canceled, alreadyCanceled, failures, cardsRemoved, cardRemovalErrors };
+}
+
 app.delete("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
   const { id } = req.params;
-  const { confirm_slug } = req.body || {};
+  const { confirm_slug, force_without_flow_cancel } = req.body || {};
 
   try {
     const { data: tenant, error: tenantError } = await supabase
@@ -21361,6 +22635,32 @@ app.delete("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
 
     if (!confirm_slug || confirm_slug !== tenant.slug) {
       return res.status(400).json({ error: "La confirmación no coincide con el slug del tenant" });
+    }
+
+    // 0) Flow — ANTES de borrar nada (C4). Si falla, no se borra salvo que
+    // el admin confirme explícitamente (force_without_flow_cancel), y queda
+    // registrado en admin_tenant_actions en ambos casos.
+    const flowBilling = await cancelTenantFlowBilling(id);
+    if (flowBilling.failures.length > 0) {
+      await logAdminTenantAction({
+        tenantId: id,
+        adminUserId: req.adminUser.user_id,
+        adminEmail: req.adminUser.email,
+        actionType: force_without_flow_cancel === true ? "delete_flow_cancel_failed_forced" : "delete_blocked_flow_cancel_failed",
+        details: { tenant_slug: tenant.slug, flow: flowBilling },
+      });
+      console.error(
+        `[admin/delete-tenant] no se pudo cancelar en Flow la(s) suscripción(es) de ${tenant.slug}:`,
+        JSON.stringify(flowBilling.failures)
+      );
+      if (force_without_flow_cancel !== true) {
+        return res.status(502).json({
+          error:
+            "No se pudo cancelar la suscripción de este tenant en Flow. No se borró nada. Revisa en el panel de Flow o confirma el borrado igual.",
+          code: "flow_cancel_failed",
+          failures: flowBilling.failures,
+        });
+      }
     }
 
     // Datos que se necesitan ANTES de borrar filas: para limpiar Storage
@@ -21444,6 +22744,7 @@ app.delete("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
     // 4) Registro de auditoría simple (no existía ninguna tabla de
     // auditoría de acciones admin hasta ahora).
     const deletionDetails = {
+      flow: flowBilling,
       db_counts: dbCounts,
       storage: storageSummary,
       auth_users_deleted: authUsersDeleted,
@@ -21471,6 +22772,7 @@ app.delete("/admin/tenants/:id", requireAdminAuth, async (req, res) => {
       ok: true,
       tenant_name: tenant.name,
       tenant_slug: tenant.slug,
+      flow: flowBilling,
       db_counts: dbCounts,
       storage: storageSummary,
       auth_users_deleted: authUsersDeleted,
@@ -21645,7 +22947,7 @@ cron.schedule("7 * * * *", async () => {
   }
 });
 
-app.get("/api/pets/:slug", tenantAuthSlug, async (req, res) => {
+app.get("/api/pets/:slug", tenantAuthSlug, requireModuleReadAccess("clientes"), async (req, res) => {
   try {
     const { slug } = req.params;
     const { phone, email } = req.query;
