@@ -47,7 +47,9 @@ function buildGoogleCalendarUrl({ title, start, end, location, details }) {
 //   decide server.js); si no, se muestra solo la dirección.
 // - Instrucciones: solo si el negocio las cargó en el servicio
 //   (services.customer_instructions); sin texto por defecto.
-// - Mismos parámetros de siempre + logoUrl/brandColor/branchName/endAt
+// - Profesional: fila propia si la cita tiene staff asignado (staffName).
+// - Veterinarias: el saludo menciona a la mascota si trae nombre.
+// - Mismos parámetros de siempre + logoUrl/brandColor/branchName/endAt/staffName
 //   (todos opcionales: GET /jobs/send-reminders llama con menos datos).
 async function sendBookingEmail({
   email,
@@ -68,6 +70,7 @@ async function sendBookingEmail({
   logoUrl,
   brandColor,
   branchName,
+  staffName,
 }) {
   try {
     // 👇 evita que explote en local
@@ -148,8 +151,13 @@ async function sendBookingEmail({
             </td>
           </tr>`;
 
+    // Nombre de mascota para el saludo: solo negocios veterinarios y solo
+    // si la cita trae una mascota con nombre.
+    const petGreetingName = isVeterinary ? String(petName || "").trim() : "";
+
     const rowsHtml = [
       detailRow("Servicio", esc(service)),
+      staffName ? detailRow("Profesional", esc(staffName)) : "",
       branchName || address
         ? detailRow(
             branchName ? "Sucursal" : "Dirección",
@@ -213,7 +221,7 @@ async function sendBookingEmail({
           </tr></table>
           <h1 style="margin:14px 0 4px; font:700 24px/1.25 Arial,Helvetica,sans-serif; color:#0f172a;">${esc(dateCap)}</h1>
           <div style="font:700 34px/1.1 Arial,Helvetica,sans-serif; color:#0f172a; letter-spacing:-0.5px;">${esc(timeLabel)} <span style="font-size:15px; font-weight:600; color:#64748b; letter-spacing:0;">hrs</span></div>
-          <p style="margin:16px 0 0; font:400 15px/1.55 Arial,Helvetica,sans-serif; color:#475569;">Hola <strong style="color:#0f172a;">${esc(customerName)}</strong>, te esperamos. Aquí está el detalle de tu reserva.</p>
+          <p style="margin:16px 0 0; font:400 15px/1.55 Arial,Helvetica,sans-serif; color:#475569;">Hola <strong style="color:#0f172a;">${esc(customerName)}</strong>, te esperamos${petGreetingName ? ` junto a <strong style="color:#0f172a;">${esc(petGreetingName)}</strong>` : ""}. Aquí está el detalle de tu reserva.</p>
         </td></tr>
 
         <tr><td style="padding:14px 32px 18px;">
@@ -248,9 +256,10 @@ async function sendBookingEmail({
     const text = [
       `Reserva confirmada · ${business}`,
       "",
-      `Hola ${customerName || ""}, te esperamos.`,
+      `Hola ${customerName || ""}, te esperamos${petGreetingName ? ` junto a ${petGreetingName}` : ""}.`,
       "",
       `Servicio: ${service}`,
+      staffName ? `Profesional: ${staffName}` : null,
       `Fecha: ${dateCap}`,
       `Hora: ${timeLabel} hrs`,
       branchName ? `Sucursal: ${branchName}` : null,

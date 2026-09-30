@@ -1312,10 +1312,9 @@ function normalizeBookingPhone(rawPhone) {
 // POST /appointments/slot para poder reutilizarlo EXACTO (mismos templates,
 // misma lógica de cupo) desde POST /appointments/:id/deposit/confirm, sin
 // duplicar código ni crear nada nuevo en Twilio. `startAt` acepta Date o
-// string ISO. `petName`/`petSpecies` son opcionales — al confirmar un
-// depósito no se re-resuelven desde la mascota (limitación conocida, ver
-// CLAUDE.md: la confirmación disparada desde ahí sale sin datos de mascota
-// incluso para tenants veterinarios).
+// string ISO. `petName`/`petSpecies` son opcionales — si no vienen, se
+// resuelven desde `petId` (así la confirmación de depósito también trae la
+// mascota). `staffId` resuelve el nombre del profesional para el correo.
 // Nombre de sucursal para el correo de confirmación: solo si el negocio
 // tiene 2+ sucursales activas (con una sola, el correo muestra solo la
 // dirección). Best-effort: ante error, sin nombre.
@@ -1349,10 +1348,41 @@ async function sendBookingConfirmations({
   branchAddress,
   branchName,
   customerInstructions,
+  staffId,
+  petId,
 }) {
   const start = startAt instanceof Date ? startAt : new Date(startAt);
 
   if (normalizedEmail) {
+    // Profesional asignado a la cita (con "cualquiera disponible" la
+    // página pública igual envía el staff_id del horario elegido). Y la
+    // mascota por pet_id cuando el caller no la trae resuelta (ej.
+    // confirmación de depósito). Best-effort: ante error, sin el dato.
+    let staffName = null;
+    if (staffId) {
+      const { data: staffRow } = await supabase
+        .from("staff")
+        .select("name")
+        .eq("id", staffId)
+        .eq("tenant_id", tenantId)
+        .maybeSingle();
+      staffName = String(staffRow?.name || "").trim() || null;
+    }
+
+    let resolvedPetName = String(petName || "").trim() || null;
+    let resolvedPetSpecies = String(petSpecies || "").trim() || null;
+    if (!resolvedPetName && petId) {
+      const { data: petRow } = await supabase
+        .from("pets")
+        .select("name, species_base, species_custom")
+        .eq("id", petId)
+        .eq("tenant_id", tenantId)
+        .maybeSingle();
+      resolvedPetName = String(petRow?.name || "").trim() || null;
+      resolvedPetSpecies =
+        resolvedPetSpecies || String(petRow?.species_custom || petRow?.species_base || "").trim() || null;
+    }
+
     await sendBookingEmail({
       email: normalizedEmail,
       customerName,
@@ -1364,8 +1394,9 @@ async function sendBookingConfirmations({
       address: branchAddress || tenantInfo?.address || null,
       phone: tenantInfo?.phone || null,
       businessCategory: tenantInfo?.business_category || null,
-      petName: petName || null,
-      petSpecies: petSpecies || null,
+      petName: resolvedPetName,
+      petSpecies: resolvedPetSpecies,
+      staffName,
       customerInstructions: customerInstructions || null,
       logoUrl: tenantInfo?.logo_url || null,
       brandColor: tenantInfo?.brand_color || null,
@@ -6920,6 +6951,8 @@ if (!appointmentRequiresDeposit) {
     branchAddress: branchInfoForEmail?.address || null,
     branchName: branchInfoForEmail?.name || null,
     customerInstructions,
+    staffId: apptUpdated?.staff_id || staff_id || null,
+    petId: resolvedPet?.id || null,
   });
 
   if (waConfirmationSent) {
@@ -11659,6 +11692,8 @@ app.post(
         branchAddress: branchInfoForEmail?.address || null,
         branchName: branchInfoForEmail?.name || null,
         customerInstructions: serviceInfoForEmail?.customer_instructions || null,
+        staffId: appt.staff_id || null,
+        petId: appt.pet_id || null,
       });
 
       let finalAppointment = updated;
