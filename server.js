@@ -3647,7 +3647,7 @@ async function getOrCreateFlowPlan(plan_id, periodicidad, monto) {
       currency: "CLP",
       interval: intervalConfig.interval,
       interval_count: intervalConfig.interval_count,
-      urlCallback: "https://orbyx-backend.onrender.com/billing/flow/webhook",
+      urlCallback: "https://api.orbyx.cl/billing/flow/webhook",
     });
   } catch (createErr) {
     const alreadyExists = /there is a plan|plan.*(already|exist)/i.test(createErr.message || "");
@@ -22866,8 +22866,24 @@ app.listen(PORT, () => {
 // equivalente, así que el comportamiento y el resultado son idénticos.
 // Los 4 endpoints HTTP siguen funcionando igual (protegidos con
 // x-maintenance-secret) — esto es solo una vía adicional de disparo.
+//
+// DISABLE_INTERNAL_CRONS=true salta el registro de todas estas tareas:
+// para cuando corren dos servicios a la vez (ej. migración de región en
+// Render) y no deben ejecutarse dos veces (cobros de add-ons, cambios de
+// plan, etc.). Sin la variable, o con cualquier otro valor, corren igual.
+const INTERNAL_CRONS_DISABLED =
+  String(process.env.DISABLE_INTERNAL_CRONS || "").trim().toLowerCase() === "true";
 
-cron.schedule("*/5 * * * *", async () => {
+if (INTERNAL_CRONS_DISABLED) {
+  console.warn("[CRON] DISABLE_INTERNAL_CRONS=true — tareas programadas internas desactivadas en este servicio");
+}
+
+function scheduleInternalCron(expression, task) {
+  if (INTERNAL_CRONS_DISABLED) return;
+  cron.schedule(expression, task);
+}
+
+scheduleInternalCron("*/5 * * * *", async () => {
   console.log("[CRON] release-expired-deposits: iniciando...");
   try {
     const result = await releaseExpiredDeposits();
@@ -22877,7 +22893,7 @@ cron.schedule("*/5 * * * *", async () => {
   }
 });
 
-cron.schedule("0 4 * * *", async () => {
+scheduleInternalCron("0 4 * * *", async () => {
   console.log("[CRON] signup/maintenance/sweep: iniciando...");
   try {
     const result = await sweepSignupIntents();
@@ -22889,7 +22905,7 @@ cron.schedule("0 4 * * *", async () => {
   }
 });
 
-cron.schedule("0 5 * * *", async () => {
+scheduleInternalCron("0 5 * * *", async () => {
   console.log("[CRON] billing/addons/maintenance/charge-recurring: iniciando...");
   try {
     const result = await chargeRecurringAddons();
@@ -22901,7 +22917,7 @@ cron.schedule("0 5 * * *", async () => {
   }
 });
 
-cron.schedule("*/10 * * * *", async () => {
+scheduleInternalCron("*/10 * * * *", async () => {
   console.log("[CRON] whatsapp/maintenance/send-reminders: iniciando...");
   try {
     const result = await sendWhatsAppReminders();
@@ -22913,7 +22929,7 @@ cron.schedule("*/10 * * * *", async () => {
   }
 });
 
-cron.schedule("0 6 * * *", async () => {
+scheduleInternalCron("0 6 * * *", async () => {
   console.log("[CRON] trial/maintenance/send-reminders: iniciando...");
   try {
     const result = await sendTrialEndingReminders();
@@ -22927,7 +22943,7 @@ cron.schedule("0 6 * * *", async () => {
 
 // Add-ons de pago único: vencimiento cada hora (para que la capacidad se
 // libere cerca de expires_at) y aviso diario antes de vencer.
-cron.schedule("17 * * * *", async () => {
+scheduleInternalCron("17 * * * *", async () => {
   try {
     const result = await expireOneTimeAddons();
     if (result.expired) {
@@ -22938,7 +22954,7 @@ cron.schedule("17 * * * *", async () => {
   }
 });
 
-cron.schedule("15 6 * * *", async () => {
+scheduleInternalCron("15 6 * * *", async () => {
   try {
     const result = await sendOneTimeAddonExpiryReminders();
     console.log(
@@ -22953,7 +22969,7 @@ cron.schedule("15 6 * * *", async () => {
 // antes se aplique el downgrade, antes se sincroniza Flow con el plan
 // nuevo (ver applyScheduledPlanChanges). La consulta solo trae tenants con
 // cambio vencido, así que un run sin nada que aplicar es barato.
-cron.schedule("7 * * * *", async () => {
+scheduleInternalCron("7 * * * *", async () => {
   try {
     const result = await applyScheduledPlanChanges();
     if (result.applied || result.blockedByLimits || result.failed) {
