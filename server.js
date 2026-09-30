@@ -2356,6 +2356,19 @@ windows = validRows
   return windows.sort((a, b) => a.start - b.start);
 }
 
+// Límites UTC del día calendario `date` (YYYY-MM-DD) en America/Santiago:
+// [00:00 local, 00:00 local del día siguiente). Usa santiagoLocalToUtcIso,
+// que ya considera horario de verano/invierno — nunca un offset fijo.
+function getSantiagoDayUtcRange(date) {
+  const [year, month, day] = String(date).split("-").map(Number);
+  const next = new Date(Date.UTC(year, month - 1, day + 1));
+  const nextDate = next.toISOString().slice(0, 10);
+  return {
+    startIso: santiagoLocalToUtcIso(date, 0, 0),
+    endIso: santiagoLocalToUtcIso(nextDate, 0, 0),
+  };
+}
+
 async function subtractAppointmentsFromWindows({
   tenant_id,
   branch_id,
@@ -2363,8 +2376,12 @@ async function subtractAppointmentsFromWindows({
   date,
   windows,
 }) {
-  const start = `${date}T00:00:00`;
-  const end = `${date}T23:59:59`;
+  // Antes: `${date}T00:00:00` / `T23:59:59` sin zona → Postgres lo
+  // interpretaba en UTC y las citas desde ~20:00-21:00 hora de Chile no se
+  // descontaban (auditoría 2026-09-29, C2). Ahora se traen las citas que
+  // se CRUZAN con el día local (incluye las que empiezan el día anterior
+  // y terminan este día, o empiezan este día y terminan el siguiente).
+  const { startIso, endIso } = getSantiagoDayUtcRange(date);
 
   let query = supabase
     .from("appointments")
@@ -2372,8 +2389,8 @@ async function subtractAppointmentsFromWindows({
     .eq("tenant_id", tenant_id)
     .eq("branch_id", branch_id)
     .eq("status", "booked")
-    .gte("start_at", start)
-    .lte("start_at", end)
+    .lt("start_at", endIso)
+    .gt("end_at", startIso)
     .order("start_at", { ascending: true });
 
   if (staff_id) {
@@ -2386,9 +2403,18 @@ async function subtractAppointmentsFromWindows({
 
   let result = [...(windows || [])];
 
+  const dayStartMs = new Date(startIso).getTime();
+  const dayEndMs = new Date(endIso).getTime();
+
   for (const appt of appointments || []) {
-    const apptStart = isoToMinutesInDate(appt.start_at, date);
-    const apptEnd = isoToMinutesInDate(appt.end_at, date);
+    const apptStartMs = new Date(appt.start_at).getTime();
+    const apptEndMs = new Date(appt.end_at).getTime();
+    if (Number.isNaN(apptStartMs) || Number.isNaN(apptEndMs)) continue;
+
+    // Si la cita empezó el día anterior o termina el día siguiente, se
+    // recorta a los bordes del día local (0 / 1440 min).
+    const apptStart = apptStartMs <= dayStartMs ? 0 : isoToMinutesInDate(appt.start_at, date);
+    const apptEnd = apptEndMs >= dayEndMs ? 24 * 60 : isoToMinutesInDate(appt.end_at, date);
 
     if (apptStart === null || apptEnd === null) continue;
 
@@ -6186,13 +6212,23 @@ const {
     const { data: tenantConfig, error: tenantConfigError } = await supabase
       .from("tenants")
       .select(
-        "min_booking_notice_minutes, max_booking_days_ahead, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name"
+        "id, is_active, paused_at, trial_ends_at, billing_cycle_end, min_booking_notice_minutes, max_booking_days_ahead, deposit_required, deposit_bank_name, deposit_account_type, deposit_account_number, deposit_holder_rut, deposit_holder_name"
       )
       .eq("id", cal.tenant_id)
       .single();
 
     if (tenantConfigError || !tenantConfig) {
       return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    // Pausado, inactivo o bloqueado por falta de pago hace más de 7 días:
+    // no se aceptan reservas (misma regla que GET /public/services/:slug).
+    const bookingStatus = await getPublicBookingStatus(tenantConfig);
+    if (!bookingStatus.open) {
+      return res.status(403).json({
+        error: "Este negocio no está recibiendo reservas por ahora.",
+        booking_closed: true,
+      });
     }
 
     // La ficha bancaria debe estar completa para que el flujo de depósito
@@ -6587,8 +6623,19 @@ next_control_at: next_control_at || null,
         insErr.message || insErr.details || ""
       ).toLowerCase();
 
+      // Trigger appointments_booking_guard (2026-09-29-appointments-
+      // booking-guard.sql): re-valida dentro de la transacción del insert,
+      // con candado, para que dos reservas simultáneas no pasen ambas.
+      if (normalizedInsertError.includes("appointment_group_full")) {
+        return res.status(409).json({
+          error: "Este horario ya alcanzó su capacidad máxima.",
+        });
+      }
+
       if (
         insErr.code === "23505" ||
+        insErr.code === "23P01" ||
+        normalizedInsertError.includes("appointment_slot_taken") ||
         normalizedInsertError.includes("duplicate key") ||
         normalizedInsertError.includes("unique constraint") ||
         normalizedInsertError.includes("appointments_unique_slot")
@@ -12103,6 +12150,41 @@ app.get("/_ping", (req, res) => {
 // provisionTenantCore/linkTenantOwner: lógica interna de /tenants/provision
 // extraída para reusarse desde el flujo de signup pagado (premium/vip/platinum),
 // donde el tenant se crea antes de que exista un user_id de Supabase Auth.
+// Rutas de primer nivel de orbyx-web (carpetas de app/ y de public/): un
+// negocio con uno de estos slugs quedaría con su página pública tapada por
+// la página de Orbyx (auditoría 2026-09-29, I14). Si se agrega una carpeta
+// nueva de primer nivel en orbyx-web/app, agregarla acá también.
+const RESERVED_PUBLIC_SLUGS = new Set([
+  "account",
+  "actualizar-password",
+  "admin",
+  "api",
+  "auth",
+  "cancel",
+  "checkout",
+  "checkout-premium",
+  "completar-registro",
+  "dashboard",
+  "invite",
+  "login",
+  "nosotros",
+  "onboarding",
+  "pago-exitoso",
+  "planes",
+  "privacidad",
+  "recuperar-password",
+  "signup",
+  "terminos",
+  "welcome",
+  "icons",
+  "images",
+  "rubros",
+]);
+
+function isReservedPublicSlug(slug) {
+  return RESERVED_PUBLIC_SLUGS.has(String(slug || "").trim().toLowerCase());
+}
+
 async function provisionTenantCore({ email, plan = "starter", billing_cycle, business_name }) {
   const provisionCycle = normalizeBillingCycle(billing_cycle);
 
@@ -12137,8 +12219,11 @@ async function provisionTenantCore({ email, plan = "starter", billing_cycle, bus
       .eq("slug", baseSlug)
       .maybeSingle();
 
+    // Flujo post-pago (no interactivo): si el nombre choca con una ruta de
+    // orbyx-web se agrega sufijo en vez de fallar — el cliente ya pagó.
     const suffix = Math.random().toString(16).slice(2, 6);
-    slug = existingTenant ? `${baseSlug}-${suffix}` : baseSlug;
+    slug =
+      existingTenant || isReservedPublicSlug(baseSlug) ? `${baseSlug}-${suffix}` : baseSlug;
   } else {
     tenantName = email;
     const baseSlug = String(email).split("@")[0] || "tenant";
@@ -12399,12 +12484,63 @@ async function recordLegalAcceptancesAndSendConfirmation({
   }
 }
 
+// Negocio activo más reciente del que el usuario ya es miembro (mismo
+// criterio que resolveTenantDestination en orbyx-web/app/login/page.tsx),
+// con los mismos ids que devuelve POST /tenants/provision.
+const provisionInFlightUserIds = new Set();
+
+async function findExistingOwnedTenantForProvision(user_id) {
+  const { data: membership } = await supabase
+    .from("tenant_users")
+    .select("tenant_id")
+    .eq("user_id", user_id)
+    .eq("is_active", true)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!membership?.tenant_id) return null;
+
+  const { data: calendar } = await supabase
+    .from("calendars")
+    .select("id")
+    .eq("tenant_id", membership.tenant_id)
+    .eq("is_active", true)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  const { data: branch } = await supabase
+    .from("branches")
+    .select("id")
+    .eq("tenant_id", membership.tenant_id)
+    .eq("is_active", true)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  return {
+    tenant_id: membership.tenant_id,
+    calendar_id: calendar?.id || null,
+    branch_id: branch?.id || null,
+  };
+}
+
 /* ======================================================
    ✅ SAAS: Provision tenant + owner user + main calendar
 ====================================================== */
 app.post("/tenants/provision", [publicLimiter, requireTenantAuth], async (req, res) => {
   try {
-    const { email, plan = "starter", billing_cycle, phone, full_name } = req.body;
+    // plan/billing_cycle del body se ignoran a propósito: el autoregistro
+    // público (/signup → primer login) SIEMPRE nace en starter con trial.
+    // Antes se aceptaba cualquier plan que mandara el navegador (o el
+    // user_metadata.plan, que también controla el usuario) y se podía
+    // crear un negocio premium/vip/platinum sin pagar (auditoría
+    // 2026-09-29, I11). Los planes pagos nacen solo por el flujo
+    // server-side de signup_intents (POST /signup/claim-account, tras
+    // registrar tarjeta en Flow).
+    const { email, phone, full_name } = req.body;
+    const plan = "starter";
     // user_id viene del token verificado (requireTenantAuth), nunca del
     // body — antes se confiaba en el user_id que mandaba el cliente, sin
     // confirmar que quien llama esté autenticado como ese usuario.
@@ -12456,8 +12592,32 @@ app.post("/tenants/provision", [publicLimiter, requireTenantAuth], async (req, r
       return res.status(400).json({ error: "Usuario no encontrado en auth. Intenta de nuevo." });
     }
 
-    const { tenant, calendar, branch } = await provisionTenantCore({ email, plan, billing_cycle });
-    await linkTenantOwner({ tenant_id: tenant.id, user_id, phone, full_name });
+    // Si este usuario ya tiene un negocio, no se crea otro (antes solo lo
+    // revisaba el frontend: doble clic, dos pestañas o una recarga durante
+    // el primer login creaban negocios duplicados — auditoría 2026-09-29,
+    // I12). Se devuelve el existente con la misma forma de respuesta.
+    const existingProvision = await findExistingOwnedTenantForProvision(user_id);
+    if (existingProvision) {
+      return res.json({ ok: true, already_provisioned: true, ...existingProvision });
+    }
+
+    // Candado en memoria por usuario para 2 requests prácticamente
+    // simultáneas (ambas pasarían el chequeo de arriba antes de que exista
+    // el tenant_users). Suficiente con una sola instancia de backend.
+    if (provisionInFlightUserIds.has(user_id)) {
+      return res.status(409).json({
+        error: "Tu negocio se está creando. Espera unos segundos e intenta de nuevo.",
+      });
+    }
+    provisionInFlightUserIds.add(user_id);
+
+    let tenant, calendar, branch;
+    try {
+      ({ tenant, calendar, branch } = await provisionTenantCore({ email, plan }));
+      await linkTenantOwner({ tenant_id: tenant.id, user_id, phone, full_name });
+    } finally {
+      provisionInFlightUserIds.delete(user_id);
+    }
 
     await recordLegalAcceptancesAndSendConfirmation({
       tenant_id: tenant.id,
@@ -16384,6 +16544,19 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
         .replace(/^-+|-+$/g, "")
         .slice(0, 30) || "negocio";
 
+      // Solo se rechaza si el slug CAMBIARÍA a uno reservado: un negocio
+      // que ya tiene ese slug (creado antes de esta validación) no queda
+      // bloqueado para guardar el resto de su configuración.
+      const { data: currentSlugRow } = isReservedPublicSlug(baseSlug)
+        ? await supabase.from("tenants").select("slug").eq("id", id).maybeSingle()
+        : { data: null };
+
+      if (isReservedPublicSlug(baseSlug) && currentSlugRow?.slug !== baseSlug) {
+        return res.status(400).json({
+          error: `El nombre "${String(business_name).trim()}" no se puede usar como dirección web de tu negocio porque coincide con una página de Orbyx. Usa un nombre más específico (por ejemplo, agrega tu ciudad o rubro).`,
+        });
+      }
+
       const { data: existing } = await supabase
         .from("tenants")
         .select("id")
@@ -17572,6 +17745,83 @@ app.delete("/services/:id", tenantAuthWrite, async (req, res) => {
    🌐 PUBLIC: servicios por slug
 ====================================================== */
 
+// Campos de `tenants` que la página pública de reservas (/[slug], /opinar)
+// realmente usa. Nunca plan, fechas de trial/facturación, paused_at,
+// prorrateos ni config de WhatsApp (auditoría 2026-09-29, I4).
+const PUBLIC_TENANT_FIELDS =
+  "id, name, slug, description, address, phone, email, whatsapp, logo_url, instagram_url, facebook_url, min_booking_notice_minutes, max_booking_days_ahead, booking_fields_config, business_category, business_subtype, business_subtype_config, deposit_required";
+const PUBLIC_TENANT_DEPOSIT_FIELDS = [
+  "deposit_bank_name",
+  "deposit_account_type",
+  "deposit_account_number",
+  "deposit_holder_rut",
+  "deposit_holder_name",
+];
+// Mismos campos públicos de sucursal que ya devolvía `branch` en estos
+// endpoints — se reutilizan para la lista `branches` (antes el proxy de
+// Next la pedía a GET /branches, que exige sesión y fallaba con 401).
+const PUBLIC_BRANCH_FIELDS =
+  "id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, use_global_hours, is_active";
+
+// Días que la página pública sigue aceptando reservas después de que la
+// cuenta queda bloqueada por falta de pago (decisión de producto
+// 2026-09-29). El dashboard se sigue bloqueando de inmediato.
+const PUBLIC_BOOKING_GRACE_DAYS = 7;
+
+// ¿Acepta reservas públicas este tenant? Mismo cálculo de bloqueo que
+// GET /billing/account-status y middleware.ts (trialExpired / ciclo
+// vencido sin pago), pero con el corte corrido PUBLIC_BOOKING_GRACE_DAYS
+// hacia adelante. Pausa manual de admin (paused_at) e is_active=false
+// cierran de inmediato. `tenant` debe traer is_active, paused_at,
+// trial_ends_at y billing_cycle_end.
+async function getPublicBookingStatus(tenant) {
+  if (!tenant || tenant.is_active === false) return { open: false, reason: "inactive" };
+  if (tenant.paused_at) return { open: false, reason: "paused" };
+
+  const { data: subscription } = await supabase
+    .from("subscriptions")
+    .select("status")
+    .eq("tenant_id", tenant.id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const hasActiveSubscription = subscription?.status === "active";
+  const isTrialingInFlow = subscription?.status === "trialing";
+  const now = new Date();
+  const trialEndsAt = tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null;
+  const billingCycleEnd = tenant.billing_cycle_end ? new Date(tenant.billing_cycle_end) : null;
+
+  const trialActive = Boolean(trialEndsAt && now < trialEndsAt && !hasActiveSubscription);
+  const awaitingPayment = !hasActiveSubscription && !trialActive && !isTrialingInFlow;
+  if (!awaitingPayment) return { open: true, reason: null };
+
+  // Momento en que el dashboard quedó bloqueado: el primero entre trial
+  // vencido y fin de ciclo sin pago (mismas dos condiciones que `blocked`).
+  const blockedCandidates = [];
+  if (trialEndsAt && now >= trialEndsAt) blockedCandidates.push(trialEndsAt.getTime());
+  if (billingCycleEnd && now >= billingCycleEnd) blockedCandidates.push(billingCycleEnd.getTime());
+  if (blockedCandidates.length === 0) return { open: true, reason: null };
+
+  const blockedSince = Math.min(...blockedCandidates);
+  const closesAt = blockedSince + PUBLIC_BOOKING_GRACE_DAYS * 24 * 60 * 60 * 1000;
+  return now.getTime() >= closesAt
+    ? { open: false, reason: "unpaid" }
+    : { open: true, reason: null };
+}
+
+function toPublicTenant(tenant) {
+  const publicTenant = { ...tenant };
+  delete publicTenant.is_active;
+  delete publicTenant.paused_at;
+  delete publicTenant.trial_ends_at;
+  delete publicTenant.billing_cycle_end;
+  if (!publicTenant.deposit_required) {
+    for (const field of PUBLIC_TENANT_DEPOSIT_FIELDS) delete publicTenant[field];
+  }
+  return publicTenant;
+}
+
 app.get("/public/services/:slug", publicLimiter, async (req, res) => {
   try {
     const { slug } = req.params;
@@ -17579,12 +17829,34 @@ app.get("/public/services/:slug", publicLimiter, async (req, res) => {
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("*")
+      .select(
+        `${PUBLIC_TENANT_FIELDS}, ${PUBLIC_TENANT_DEPOSIT_FIELDS.join(", ")}, is_active, paused_at, trial_ends_at, billing_cycle_end`
+      )
       .eq("slug", slug)
       .single();
 
     if (tenantError || !tenant) {
       return res.status(404).json({ error: "Negocio no encontrado" });
+    }
+
+    const bookingStatus = await getPublicBookingStatus(tenant);
+    if (!bookingStatus.open) {
+      return res.json({
+        booking_closed: true,
+        business: {
+          id: tenant.id,
+          name: tenant.name,
+          slug: tenant.slug,
+          logo_url: tenant.logo_url,
+          description: tenant.description,
+        },
+        branch: null,
+        branches: [],
+        calendar_id: null,
+        services: [],
+        service_groups: [],
+        business_hours: [],
+      });
     }
 
     // Fire-and-forget: única señal real de "carga de página pública" en el
@@ -17599,13 +17871,27 @@ app.get("/public/services/:slug", publicLimiter, async (req, res) => {
 
     const { data: branch, error: branchError } = await supabase
       .from("branches")
-      .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, use_global_hours, is_active")
+      .select(PUBLIC_BRANCH_FIELDS)
       .eq("id", resolvedBranchId)
       .eq("tenant_id", tenant.id)
       .single();
 
     if (branchError || !branch || !branch.is_active) {
       return res.status(404).json({ error: "Sucursal no encontrada" });
+    }
+
+    // Sucursales activas para el selector público (antes se pedían a
+    // GET /branches, que exige sesión — fallaba con 401 y la página caía
+    // a una sola sucursal, auditoría 2026-09-29 C1).
+    const { data: activeBranches, error: activeBranchesError } = await supabase
+      .from("branches")
+      .select(PUBLIC_BRANCH_FIELDS)
+      .eq("tenant_id", tenant.id)
+      .eq("is_active", true)
+      .order("created_at", { ascending: true });
+
+    if (activeBranchesError) {
+      return res.status(500).json({ error: activeBranchesError.message });
     }
 
     const { data: serviceGroups, error: serviceGroupsError } = await supabase
@@ -17672,8 +17958,9 @@ const filteredServices = (services || []).filter((s) =>
     }
 
     return res.json({
-      business: tenant,
+      business: toPublicTenant(tenant),
       branch,
+      branches: activeBranches || [],
       calendar_id: calendar.id,
       services: filteredServices,
       service_groups: serviceGroups || [],
@@ -17763,6 +18050,33 @@ app.get("/public/map-thumbnail/:slug", publicLimiter, async (req, res) => {
    🌐 PUBLIC: negocio por slug
 ====================================================== */
 
+// Campos de facturación/plan que el dashboard lee de este mismo endpoint
+// (layout, billing, branches, staff, etc. — todos con apiFetch, o sea con
+// token). Solo se devuelven a un miembro activo del negocio; al público
+// nunca (auditoría 2026-09-29, I4).
+const MEMBER_ONLY_TENANT_FIELDS =
+  "plan_slug, billing_cycle_start, billing_cycle_end, scheduled_plan_slug, scheduled_change_at, pending_change_type, proration_credit, proration_charge";
+
+async function isRequesterActiveTenantMember(req, tenantId) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) return false;
+    const { data, error } = await getUserCached(authHeader.split(" ")[1]);
+    const userId = data?.user?.id;
+    if (error || !userId) return false;
+    const { data: membership } = await supabase
+      .from("tenant_users")
+      .select("tenant_id")
+      .eq("user_id", userId)
+      .eq("tenant_id", tenantId)
+      .eq("is_active", true)
+      .maybeSingle();
+    return Boolean(membership);
+  } catch {
+    return false;
+  }
+}
+
 app.get("/public/business/:slug", publicLimiter, async (req, res) => {
   try {
     const { slug } = req.params;
@@ -17771,9 +18085,9 @@ app.get("/public/business/:slug", publicLimiter, async (req, res) => {
       return res.status(400).json({ error: "slug requerido" });
     }
 
-    const { data: tenant, error: tenantError } = await supabase
+    const { data: publicTenant, error: tenantError } = await supabase
       .from("tenants")
-.select(`
+      .select(`
   id,
   name,
   slug,
@@ -17788,14 +18102,6 @@ app.get("/public/business/:slug", publicLimiter, async (req, res) => {
   min_booking_notice_minutes,
   max_booking_days_ahead,
   is_active,
-  plan_slug,
-  billing_cycle_start,
-  billing_cycle_end,
-  scheduled_plan_slug,
-  scheduled_change_at,
-  pending_change_type,
-  proration_credit,
-  proration_charge,
   business_category,
   business_subtype,
   business_subtype_config,
@@ -17805,8 +18111,18 @@ app.get("/public/business/:slug", publicLimiter, async (req, res) => {
       .eq("is_active", true)
       .maybeSingle();
 
-    if (tenantError || !tenant) {
+    if (tenantError || !publicTenant) {
       return res.status(404).json({ error: "negocio no encontrado" });
+    }
+
+    let tenant = publicTenant;
+    if (await isRequesterActiveTenantMember(req, publicTenant.id)) {
+      const { data: memberFields } = await supabase
+        .from("tenants")
+        .select(MEMBER_ONLY_TENANT_FIELDS)
+        .eq("id", publicTenant.id)
+        .maybeSingle();
+      tenant = { ...publicTenant, ...(memberFields || {}) };
     }
 
     const { data: calendar } = await supabase
@@ -18044,8 +18360,7 @@ async function attachCapacityToSlots(slotsToCheck) {
     }));
   }
 
-  const dayStart = new Date(`${date}T00:00:00-03:00`).toISOString();
-  const dayEnd = new Date(`${date}T23:59:59-03:00`).toISOString();
+  const { startIso: dayStart, endIso: dayEnd } = getSantiagoDayUtcRange(date);
 
   let apptQuery = supabase
     .from("appointments")
@@ -18992,155 +19307,11 @@ app.post("/webhooks/meta-whatsapp", publicLimiter, (req, res) => {
 });
 
 /* ======================================================
-   ✅ ONBOARDING SETUP
+   POST /onboarding/setup retirado (auditoría 2026-09-29, I13): creaba
+   tenants sin autenticación ni dueño y solo lo usaba la página huérfana
+   /start (también retirada). El onboarding real es /onboarding, que usa
+   endpoints autenticados tras POST /tenants/provision.
 ====================================================== */
-app.post("/onboarding/setup", publicLimiter, async (req, res) => {
-  try {
-    const {
-      business,
-      service,
-      weekly_hours = [],
-      special_dates = [],
-    } = req.body;
-
-    if (!business?.name || !business?.slug) {
-      return res.status(400).json({
-        error: "Faltan campos obligatorios del negocio: name y slug",
-      });
-    }
-
-    const normalizedSlug = String(business.slug).trim().toLowerCase();
-
-    const { data: existingTenantBySlug, error: slugCheckError } = await supabase
-      .from("tenants")
-      .select("id, slug")
-      .eq("slug", normalizedSlug)
-      .maybeSingle();
-
-    if (slugCheckError) {
-      return res.status(500).json({ error: slugCheckError.message });
-    }
-
-    if (existingTenantBySlug) {
-      return res.status(400).json({
-        error: "Este slug ya está en uso. Prueba con otro nombre de negocio.",
-      });
-    }
-
-    const { data: createdTenant, error: tenantError } = await supabase
-      .from("tenants")
-      .insert({
-        name: String(business.name).trim(),
-        slug: normalizedSlug,
-        phone: business.contact_phone
-          ? String(business.contact_phone).trim()
-          : null,
-        address: business.address ? String(business.address).trim() : null,
-      })
-      .select()
-      .single();
-
-    if (tenantError) {
-      return res.status(500).json({ error: tenantError.message });
-    }
-
-    const tenant_id = createdTenant.id;
-
-    const { data: createdCalendar, error: calendarError } = await supabase
-      .from("calendars")
-      .insert({
-        tenant_id,
-        name: "Principal",
-        timezone: "America/Santiago",
-        is_active: true,
-        slot_minutes: 30,
-        buffer_minutes: 0,
-      })
-      .select()
-      .single();
-
-    if (calendarError) {
-      return res.status(500).json({ error: calendarError.message });
-    }
-
-    const calendar_id = createdCalendar.id;
-
-    let createdService = null;
-
-    if (service?.name) {
-      const { data: serviceInserted, error: serviceError } = await supabase
-        .from("services")
-        .insert({
-          tenant_id,
-          name: String(service.name).trim(),
-          duration_minutes: Number(service.duration_minutes || 30),
-          buffer_before_minutes: Number(service.buffer_before_minutes || 0),
-          buffer_after_minutes: Number(service.buffer_after_minutes || 0),
-          price: Number(service.price || 0),
-          active: true,
-        })
-        .select()
-        .single();
-
-      if (serviceError) {
-        return res.status(500).json({ error: serviceError.message });
-      }
-
-      createdService = serviceInserted;
-    }
-
-    if (Array.isArray(weekly_hours) && weekly_hours.length > 0) {
-      const weeklyRows = weekly_hours.map((row) => ({
-        tenant_id,
-        day_of_week: Number(row.day_of_week),
-        enabled: !!row.enabled,
-        start_time: row.enabled ? row.start_time || null : null,
-        end_time: row.enabled ? row.end_time || null : null,
-      }));
-
-      const { error: insertWeeklyError } = await supabase
-        .from("business_hours")
-        .upsert(weeklyRows, { onConflict: "tenant_id,day_of_week" });
-
-      if (insertWeeklyError) {
-        return res.status(500).json({ error: insertWeeklyError.message });
-      }
-    }
-
-    if (Array.isArray(special_dates) && special_dates.length > 0) {
-      const specialRows = special_dates.map((row) => ({
-        tenant_id,
-        date: row.date,
-        label: row.label || "Configuración especial",
-        is_closed: !!row.is_closed,
-        start_time: row.start_time || null,
-        end_time: row.end_time || null,
-      }));
-
-      const { error: insertSpecialError } = await supabase
-        .from("business_special_dates")
-        .insert(specialRows);
-
-      if (insertSpecialError) {
-        return res.status(500).json({ error: insertSpecialError.message });
-      }
-    }
-
-    return res.json({
-      ok: true,
-      tenant_id,
-      calendar_id,
-      slug: createdTenant.slug,
-      service: createdService,
-    });
-  } catch (err) {
-    console.error("Onboarding setup failed:", err);
-    return res.status(500).json({
-      error: "Onboarding setup failed",
-      detail: err.message,
-    });
-  }
-});
 
 /* ======================================================
    ✅ BOOKING FIELDS CONFIG (NUEVO)
