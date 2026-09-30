@@ -10,4 +10,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping health check
-        run: curl -fsS --max-time 20 https://orbyx-backend.onrender.com/health
+        run: curl -fsS --max-time 20 https://api.orbyx.cl/health

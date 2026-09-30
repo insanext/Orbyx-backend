@@ -37,11 +37,11 @@ function toWhatsAppAddress(value) {
   return trimmed.startsWith("whatsapp:") ? trimmed : `whatsapp:${trimmed}`;
 }
 
-// Mismo dominio self-referencing que ya usan los callbacks de Flow en
-// server.js (urlCallback/url_return apuntan a orbyx-backend.onrender.com
-// hardcodeado). Twilio hace POST acá cada vez que cambia el status del
+// Dominio propio del backend (api.orbyx.cl, CNAME al servicio de Render),
+// no la URL *.onrender.com: así un cambio de servicio/región no obliga a
+// tocar este código. Twilio hace POST acá cada vez que cambia el status del
 // mensaje (queued -> sent -> delivered/read, o failed/undelivered).
-const STATUS_CALLBACK_URL = "https://orbyx-backend.onrender.com/whatsapp/status-callback";
+const STATUS_CALLBACK_URL = "https://api.orbyx.cl/whatsapp/status-callback";
 
 // Envía un mensaje de WhatsApp usando un Content Template ya aprobado.
 // `to` debe venir en formato E.164 con "+" (ej: +56912345678). Nunca lanza:
@@ -128,4 +128,4 @@ async function sendWhatsAppTemplate({ to, contentSid, variables }) {
   }
 }
 
-module.exports = { sendWhatsAppTemplate, formatDateCL, formatTimeCL };
+module.exports = { sendWhatsAppTemplate, formatDateCL, formatTimeCL, STATUS_CALLBACK_URL };

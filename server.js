@@ -32,6 +32,7 @@ const {
   sendWhatsAppTemplate,
   formatDateCL,
   formatTimeCL,
+  STATUS_CALLBACK_URL: WHATSAPP_STATUS_CALLBACK_URL,
 } = require("./whatsapp");
 const { compressImage } = require("./imageCompression");
 
@@ -3721,7 +3722,7 @@ async function sendCampaignEmail({
 // el cliente de correo (encabezado List-Unsubscribe, RFC 8058).
 const MARKETING_UNSUBSCRIBE_PAGE_URL = "https://www.orbyx.cl/desuscribir";
 const MARKETING_UNSUBSCRIBE_ONE_CLICK_URL =
-  "https://orbyx-backend.onrender.com/public/marketing/unsubscribe";
+  "https://api.orbyx.cl/public/marketing/unsubscribe";
 
 // Devuelve Map(email -> { token, unsubscribed }) para los emails dados de
 // un negocio, creando la fila (y su token) la primera vez que un email
@@ -20438,10 +20439,18 @@ app.post(
       }
 
       const twilioSignature = req.headers["x-twilio-signature"];
-      const callbackUrl = "https://orbyx-backend.onrender.com/whatsapp/status-callback";
+      // Twilio firma con la URL exacta a la que llamó. Se acepta también la
+      // URL vieja *.onrender.com: los mensajes enviados antes del cambio a
+      // api.orbyx.cl siguen mandando sus avisos de status ahí.
+      const callbackUrls = [
+        WHATSAPP_STATUS_CALLBACK_URL,
+        "https://orbyx-backend.onrender.com/whatsapp/status-callback",
+      ];
       const isValid =
         typeof twilioSignature === "string" &&
-        twilio.validateRequest(authToken, twilioSignature, callbackUrl, req.body);
+        callbackUrls.some((url) =>
+          twilio.validateRequest(authToken, twilioSignature, url, req.body)
+        );
 
       if (!isValid) {
         console.warn("POST /whatsapp/status-callback: firma inválida, request descartada");
