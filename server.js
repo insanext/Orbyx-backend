@@ -17866,7 +17866,7 @@ app.get("/tenants/:id", tenantAuthParam, async (req, res) => {
 
     const { data, error } = await supabase
       .from("tenants")
-      .select("id, name, slug, business_category, address, commune, region")
+      .select("id, name, slug, business_category, address, commune, region, phone, whatsapp")
       .eq("id", id)
       .single();
 
