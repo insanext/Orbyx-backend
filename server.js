@@ -19665,6 +19665,7 @@ app.get("/public/business/:slug", publicLimiter, async (req, res) => {
   email,
   whatsapp,
   logo_url,
+  banner_url,
   instagram_url,
   facebook_url,
   description,
