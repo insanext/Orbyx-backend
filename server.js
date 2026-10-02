@@ -15751,6 +15751,9 @@ app.post("/billing/flow/unregister-card", tenantAuthWrite, async (req, res) => {
 ====================================================== */
 async function handleRegisterCardCallback(req, res) {
     const token = req.body?.token || req.query?.token;
+    console.log(
+      `[card-callback] ${req.method} slug=${req.query?.slug || "-"} token=${token ? "sí" : "no"}`
+    );
     // Dominio canónico (con www): el apex no conserva la sesión del panel y
     // mandaba al usuario a la home pública.
     const frontendBase = "https://www.orbyx.cl";
