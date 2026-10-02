@@ -17897,7 +17897,22 @@ app.get("/tenants/:id", tenantAuthParam, async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    return res.json({ tenant: data });
+    // ¿El nombre lo definió el cliente en /checkout-premium? Solo los
+    // negocios nacidos de un signup pagado tienen una signup_intent con
+    // business_name (el flujo gratis nace con el correo como nombre). El
+    // onboarding lo usa para mostrar ese nombre bloqueado.
+    const { data: checkoutIntent } = await supabase
+      .from("signup_intents")
+      .select("id")
+      .eq("tenant_id", id)
+      .not("business_name", "is", null)
+      .neq("business_name", "")
+      .limit(1)
+      .maybeSingle();
+
+    return res.json({
+      tenant: { ...data, name_from_checkout: Boolean(checkoutIntent) },
+    });
   } catch (err) {
     console.error("GET /tenants/:id error:", err.message);
     return res.status(500).json({ error: err.message });
