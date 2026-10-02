@@ -1123,12 +1123,31 @@ async function isStarterTenantInTrial(tenant_id) {
     .limit(1)
     .maybeSingle();
   const status = latestSub?.status;
-  // Mismo criterio que awaiting_payment/trial_active en GET
-  // /billing/account-status: sin suscripción activa ni tarjeta
-  // registrada (trialing) -- incluye tanto el trial vigente como uno ya
-  // vencido sin pago, a propósito (Parte D.3/F.2: el cupo empieza a
-  // contar solo cuando hay suscripción real, no antes ni después).
-  return status !== "active" && status !== "trialing";
+  if (status === "active") return false;
+
+  // 'trialing' = tarjeta inscrita y primer cobro programado, pero SIN cobro
+  // real todavía. Cada mensaje de WhatsApp tiene un costo real (Twilio), así
+  // que el cupo del plan no se abre solo por tener tarjeta: se abre con el
+  // primer cobro (el cobro automático al terminar el trial pone la
+  // suscripción en 'active' y tenants.is_trial=false; "Pagar ahora" pone
+  // is_trial=false de inmediato). Por eso 'trialing' solo deja de ser trial
+  // cuando el negocio ya pagó alguna vez (is_trial === false).
+  // Esto solo afecta el cupo de WhatsApp (getPlanCapabilities con is_trial
+  // únicamente anula max_wa_confirmacion): los 100 emails de campaña
+  // incluidos en el trial no dependen de esto.
+  if (status === "trialing") {
+    const { data: tenantRow } = await supabase
+      .from("tenants")
+      .select("is_trial")
+      .eq("id", tenant_id)
+      .maybeSingle();
+    return tenantRow?.is_trial !== false;
+  }
+
+  // Sin suscripción, tarjeta sin activar (card_registered/pending), error,
+  // canceled: trial vigente o vencido sin pago, a propósito (Parte D.3/F.2:
+  // el cupo empieza a contar solo con un cobro real).
+  return true;
 }
 
 async function checkMonthlyUsage(tenant_id, resource) {
@@ -14155,7 +14174,16 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
     // `trialActive || awaitingPayment` dado cómo se calculan arriba -- ese
     // es el criterio que hay que pasar acá para que el contador reboye lo
     // mismo que ya bloquea el envío.
-    const caps = getPlanCapabilities(normalizedPlan, { is_trial: trialActive || awaitingPayment });
+    // Mismo criterio que el enforcement real (checkMonthlyUsage): para
+    // Starter se usa isStarterTenantInTrial, que además mantiene el cupo en
+    // 0 mientras la suscripción está en 'trialing' sin cobro real. Para el
+    // resto de planes is_trial no tiene efecto (getPlanCapabilities solo lo
+    // aplica a starter).
+    const waTrialLocked =
+      normalizedPlan === "starter"
+        ? await isStarterTenantInTrial(tenant_id)
+        : trialActive || awaitingPayment;
+    const caps = getPlanCapabilities(normalizedPlan, { is_trial: waTrialLocked });
     const period = now.toISOString().slice(0, 7);
 
     const { data: addonRows } = await supabase
@@ -14242,6 +14270,10 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       blocked,
       blocked_reason: !blocked ? null : isPaused ? "paused" : trialExpired ? "trial_expired" : "payment_overdue",
       wa_confirmacion: usageEntry(caps.max_wa_confirmacion, "wa_confirmacion"),
+      // Starter sin cobro real todavía (incluye 'trialing' con tarjeta
+      // inscrita): el cupo de plan de WhatsApp sigue en 0. El panel lo usa
+      // para bloquear los toggles.
+      wa_trial_locked: normalizedPlan === "starter" && waTrialLocked,
       wa_confirmation_enabled: Boolean(tenant.wa_confirmation_enabled),
       wa_reminder_enabled: Boolean(tenant.wa_reminder_enabled),
       wa_reminder_hours_before: [1, 2].includes(Number(tenant.wa_reminder_hours_before))
@@ -15707,11 +15739,23 @@ app.post("/billing/flow/create-customer", tenantAuthWrite, async (req, res) => {
 
     const { data: existing } = await supabase
       .from("subscriptions")
-      .select("id")
+      .select("id, status")
       .eq("tenant_id", tenant_id)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
+
+    // Con una suscripción viva (active/trialing) esta llamada NUNCA debe
+    // tocar la fila: pisarla a 'pending' con otro plan/monto/consentimiento
+    // sacaría de su estado real a un negocio que ya está pagando (o en
+    // trial con tarjeta). La UI no llama esto en ese caso (cambiar tarjeta
+    // usa register-card), pero el endpoint no debe depender de eso.
+    if (existing && ["active", "trialing"].includes(existing.status)) {
+      return res.json({
+        subscription_id: existing.id,
+        flow_customer_id: flowCustomer.customerId,
+      });
+    }
 
     const payload = {
       plan_id,
