@@ -1516,6 +1516,25 @@ async function getBranchNameForBookingEmail(tenantId, branchName) {
   }
 }
 
+// Plantilla de confirmación por WhatsApp aprobada ("confirmacion_orbyx_final",
+// 7 variables): {{1}} cliente, {{2}} negocio, {{3}} fecha, {{4}} hora,
+// {{5}} dirección, {{6}} profesional, {{7}} contacto. Va fija en el código
+// (no en una env var) para que el cambio de variables y el SID salgan en el
+// mismo deploy: el envío con 7 variables contra la plantilla vieja de 5 (o al
+// revés) falla. El recordatorio usa otra plantilla (TEMPLATE_RECORDATORIO_SID).
+const WA_CONFIRMATION_CONTENT_SID = "HX0441fd79c0bb1170e54500a1f2d773e2";
+
+// {{7}} va en "Contáctanos al {{7}} o revisa tu correo de confirmación":
+// WhatsApp del negocio, si no su teléfono, y si no hay ninguno un texto que
+// siga leyéndose bien en la frase ("Contáctanos al número de este chat").
+function resolveWhatsAppContactLabel(tenantInfo) {
+  return (
+    String(tenantInfo?.whatsapp || "").trim() ||
+    String(tenantInfo?.phone || "").trim() ||
+    "número de este chat"
+  );
+}
+
 async function sendBookingConfirmations({
   tenantId,
   tenantInfo,
@@ -1536,22 +1555,24 @@ async function sendBookingConfirmations({
 }) {
   const start = startAt instanceof Date ? startAt : new Date(startAt);
 
-  if (normalizedEmail) {
-    // Profesional asignado a la cita (con "cualquiera disponible" la
-    // página pública igual envía el staff_id del horario elegido). Y la
-    // mascota por pet_id cuando el caller no la trae resuelta (ej.
-    // confirmación de depósito). Best-effort: ante error, sin el dato.
-    let staffName = null;
-    if (staffId) {
-      const { data: staffRow } = await supabase
-        .from("staff")
-        .select("name")
-        .eq("id", staffId)
-        .eq("tenant_id", tenantId)
-        .maybeSingle();
-      staffName = String(staffRow?.name || "").trim() || null;
-    }
+  // Profesional asignado a la cita (con "cualquiera disponible" la página
+  // pública igual envía el staff_id del horario elegido). Lo usan el email
+  // y la variable {{6}} del WhatsApp, por eso se resuelve fuera del bloque
+  // de email. Best-effort: ante error, sin el dato.
+  let staffName = null;
+  if (staffId) {
+    const { data: staffRow } = await supabase
+      .from("staff")
+      .select("name")
+      .eq("id", staffId)
+      .eq("tenant_id", tenantId)
+      .maybeSingle();
+    staffName = String(staffRow?.name || "").trim() || null;
+  }
 
+  if (normalizedEmail) {
+    // Mascota por pet_id cuando el caller no la trae resuelta (ej.
+    // confirmación de depósito).
     let resolvedPetName = String(petName || "").trim() || null;
     let resolvedPetSpecies = String(petSpecies || "").trim() || null;
     if (!resolvedPetName && petId) {
@@ -1607,13 +1628,15 @@ async function sendBookingConfirmations({
     if (waUsage.allowed) {
       const waResult = await sendWhatsAppTemplate({
         to: normalizedPhone,
-        contentSid: process.env.TEMPLATE_CONFIRMACION_SID,
+        contentSid: WA_CONFIRMATION_CONTENT_SID,
         variables: {
           1: customerName,
           2: tenantInfo?.name || "Tu negocio",
           3: formatDateCL(start),
           4: formatTimeCL(start),
           5: fullAddress || serviceName || "",
+          6: staffName || `Equipo de ${tenantInfo?.name || "Tu negocio"}`,
+          7: resolveWhatsAppContactLabel(tenantInfo),
         },
       });
       if (waResult.ok) {
@@ -7358,7 +7381,7 @@ if (customerData && typeof customerData === "object" && Object.keys(customerData
 
 const { data: tenantInfo, error: tenantInfoError } = await supabase
   .from("tenants")
-  .select("name, address, commune, region, phone, business_category, wa_confirmation_enabled, logo_url, brand_color")
+  .select("name, address, commune, region, phone, whatsapp, business_category, wa_confirmation_enabled, logo_url, brand_color")
   .eq("id", cal.tenant_id)
   .single();
 
@@ -12160,7 +12183,7 @@ app.get(
 
 // POST /appointments/:id/deposit/confirm
 // El tenant aprueba el comprobante: dispara la MISMA confirmación
-// (email + WhatsApp, mismo TEMPLATE_CONFIRMACION_SID) que una reserva
+// (email + WhatsApp, misma plantilla WA_CONFIRMATION_CONTENT_SID) que una reserva
 // normal recibe al crearse, vía sendBookingConfirmations().
 app.post(
   "/appointments/:id/deposit/confirm",
@@ -12204,7 +12227,7 @@ app.post(
 
       const { data: tenantInfo } = await supabase
         .from("tenants")
-        .select("name, slug, address, commune, region, phone, business_category, wa_confirmation_enabled, logo_url, brand_color")
+        .select("name, slug, address, commune, region, phone, whatsapp, business_category, wa_confirmation_enabled, logo_url, brand_color")
         .eq("id", appt.tenant_id)
         .single();
 
