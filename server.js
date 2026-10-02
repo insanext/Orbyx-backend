@@ -13856,6 +13856,10 @@ app.get("/billing/addons", tenantAuth, async (req, res) => {
 // días después de la fecha en que se habría bloqueado.
 const PAYMENT_FAILED_GRACE_DAYS = 3;
 
+// Días de anticipación del aviso "te falta tarjeta" (suscripción viva sin
+// tarjeta inscrita y renovación cerca) en el dashboard.
+const CARD_RENEWAL_WARNING_DAYS = 3;
+
 // Estado de acceso por facturación — fuente única para
 // GET /billing/account-status, getPublicBookingStatus y deriveTenantBucket
 // (middleware.ts replica la misma fórmula, no puede importar este archivo).
@@ -13963,7 +13967,7 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
 
     const { data: subscription } = await supabase
       .from("subscriptions")
-      .select("status")
+      .select("status, flow_customer_id")
       .eq("tenant_id", tenant_id)
       .order("created_at", { ascending: false })
       .limit(1)
@@ -14071,8 +14075,43 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       return { used: planUsed, total, remaining: Math.max(0, base - planUsed) + addon };
     };
 
+    // Aviso preventivo "te falta tarjeta": suscripción viva, sin tarjeta
+    // inscrita en Flow y próxima renovación en CARD_RENEWAL_WARNING_DAYS días
+    // o menos. Próxima renovación = billing_cycle_end si ya pagó alguna vez
+    // (is_trial === false), si no el fin del trial. La tarjeta no se guarda en
+    // la DB: se consulta a Flow (customer/get), pero solo cuando la renovación
+    // está cerca, para no llamar a Flow en cada carga del dashboard.
+    let missingCardWarning = null;
+    if (["active", "trialing"].includes(subscriptionStatus) && !isPaused && subscription?.flow_customer_id) {
+      const nextRenewal =
+        (tenant.is_trial === false ? billingCycleEnd : trialEndsAt) || billingCycleEnd || trialEndsAt;
+      if (nextRenewal) {
+        const daysUntilRenewal = Math.ceil((nextRenewal.getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+        if (daysUntilRenewal >= 0 && daysUntilRenewal <= CARD_RENEWAL_WARNING_DAYS) {
+          try {
+            const customer = await flowApiRequest(
+              "/customer/get",
+              { customerId: subscription.flow_customer_id },
+              "GET"
+            );
+            const hasCard = Boolean(customer?.creditCardType && customer?.last4CardDigits);
+            if (!hasCard) {
+              missingCardWarning = {
+                days_until_renewal: daysUntilRenewal,
+                renewal_at: nextRenewal.toISOString(),
+              };
+            }
+          } catch (cardErr) {
+            // Si Flow no responde no se muestra aviso (mejor omitirlo que mentir).
+            console.error("GET /billing/account-status: customer/get falló:", cardErr.message);
+          }
+        }
+      }
+    }
+
     return res.json({
       ok: true,
+      missing_card_warning: missingCardWarning,
       // Aditivo (Parte D/F, auditoría 2026-09-20) -- para el aviso
       // comercial de WhatsApp/Email de campañas bloqueados durante el
       // trial de Starter en el popup Activaciones.
@@ -15626,9 +15665,20 @@ app.post("/billing/flow/register-card", tenantAuthWrite, async (req, res) => {
       return res.status(404).json({ error: "No hay un customer de Flow creado para este negocio" });
     }
 
+    // El slug viaja en el url_return: si el usuario cancela o vuelve desde
+    // Flow sin token, igual sabemos a qué panel devolverlo.
+    const { data: tenantForReturn } = await supabase
+      .from("tenants")
+      .select("slug")
+      .eq("id", tenant_id)
+      .maybeSingle();
+    const returnQuery = tenantForReturn?.slug
+      ? `?slug=${encodeURIComponent(tenantForReturn.slug)}`
+      : "";
+
     const registerResult = await flowApiRequest("/customer/register", {
       customerId: subscription.flow_customer_id,
-      url_return: "https://api.orbyx.cl/billing/flow/register-card-callback",
+      url_return: `https://api.orbyx.cl/billing/flow/register-card-callback${returnQuery}`,
     });
 
     return res.json({
@@ -15671,15 +15721,21 @@ app.post("/billing/flow/unregister-card", tenantAuthWrite, async (req, res) => {
       return res.status(404).json({ error: "No hay una tarjeta registrada para este negocio" });
     }
 
-    if (["active", "trialing", "card_registered"].includes(subscription.status)) {
-      return res.status(400).json({
-        error: "Estás suscrito — primero cancela tu suscripción para eliminar tu tarjeta.",
-      });
-    }
-
     await flowApiRequest("/customer/unRegister", {
       customerId: subscription.flow_customer_id,
     });
+
+    // Con suscripción viva (active/trialing) NO se toca el estado: el negocio
+    // conserva el acceso de su ciclo pagado y solo queda sin tarjeta para el
+    // próximo cobro (el dashboard avisa unos días antes). Si estaba en
+    // 'card_registered' (tarjeta sin cobro activado todavía), sin tarjeta ya
+    // no hay nada que activar: vuelve a 'pending' para que pueda reintentar.
+    if (subscription.status === "card_registered") {
+      await supabase
+        .from("subscriptions")
+        .update({ status: "pending", updated_at: new Date().toISOString() })
+        .eq("id", subscription.id);
+    }
 
     return res.json({ ok: true });
   } catch (err) {
@@ -15693,17 +15749,23 @@ app.post("/billing/flow/unregister-card", tenantAuthWrite, async (req, res) => {
    Flow llama este callback (POST, x-www-form-urlencoded) tras el
    enrolamiento de tarjeta. No usa auth de tenant: lo invoca Flow.
 ====================================================== */
-app.post(
-  "/billing/flow/register-card-callback",
-  publicLimiter,
-  express.urlencoded({ extended: true }),
-  async (req, res) => {
-    const token = req.body?.token;
-    const frontendBase = "https://orbyx.cl";
+async function handleRegisterCardCallback(req, res) {
+    const token = req.body?.token || req.query?.token;
+    // Dominio canónico (con www): el apex no conserva la sesión del panel y
+    // mandaba al usuario a la home pública.
+    const frontendBase = "https://www.orbyx.cl";
+    const returnSlug = /^[a-z0-9-]{1,80}$/i.test(String(req.query?.slug || ""))
+      ? String(req.query.slug)
+      : null;
 
     if (!token) {
-      console.error("POST /billing/flow/register-card-callback: falta token en el body");
-      return res.redirect(`${frontendBase}/dashboard?card_status=error`);
+      // Cancelación / "Volver" desde Flow sin completar el registro.
+      console.warn("billing/flow/register-card-callback: sin token (cancelado o vuelta atrás)");
+      return res.redirect(
+        returnSlug
+          ? `${frontendBase}/dashboard/${returnSlug}/billing?card_status=cancel`
+          : `${frontendBase}/dashboard`
+      );
     }
 
     try {
@@ -15723,7 +15785,7 @@ app.post(
           "POST /billing/flow/register-card-callback: no se encontró subscription para customerId",
           status.customerId
         );
-        return res.redirect(`${frontendBase}/dashboard?card_status=error`);
+        return res.redirect(returnSlug ? `${frontendBase}/dashboard/${returnSlug}/billing?card_status=error` : `${frontendBase}/dashboard?card_status=error`);
       }
 
       // Cambio de tarjeta con suscripción viva (C3, auditoría 2026-09-30):
@@ -15749,7 +15811,7 @@ app.post(
           "POST /billing/flow/register-card-callback: fallo al actualizar subscriptions",
           updateErr.message
         );
-        return res.redirect(`${frontendBase}/dashboard?card_status=error`);
+        return res.redirect(returnSlug ? `${frontendBase}/dashboard/${returnSlug}/billing?card_status=error` : `${frontendBase}/dashboard?card_status=error`);
       }
 
       const { data: tenant } = await supabase
@@ -15766,10 +15828,21 @@ app.post(
       return res.redirect(redirectUrl);
     } catch (err) {
       console.error("POST /billing/flow/register-card-callback error:", err.message);
-      return res.redirect(`${frontendBase}/dashboard?card_status=error`);
+      return res.redirect(
+        returnSlug
+          ? `${frontendBase}/dashboard/${returnSlug}/billing?card_status=error`
+          : `${frontendBase}/dashboard?card_status=error`
+      );
     }
-  }
+}
+
+app.post(
+  "/billing/flow/register-card-callback",
+  publicLimiter,
+  express.urlencoded({ extended: true }),
+  handleRegisterCardCallback
 );
+app.get("/billing/flow/register-card-callback", publicLimiter, handleRegisterCardCallback);
 
 // Correo al dueño cuando Flow rechaza el cobro de la suscripción (I7):
 // informa la fecha límite de la gracia (mismo corte que
