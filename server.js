@@ -17934,6 +17934,7 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
       wa_confirmation_enabled,
       wa_reminder_enabled,
       wa_reminder_hours_before,
+      banner_url,
     } = req.body;
 
     if (!id) {
@@ -18148,6 +18149,8 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
         email: email ? String(email).trim() : null,
         whatsapp: whatsapp ? String(whatsapp).trim() : null,
         logo_url: normalizeNullableUrl(logo_url),
+        // Solo si viene: otros llamadores de este PATCH no deben borrar el banner.
+        ...(banner_url !== undefined && { banner_url: normalizeNullableUrl(banner_url) }),
         instagram_url: instagram_url ? String(instagram_url).trim() : null,
         facebook_url: facebook_url ? String(facebook_url).trim() : null,
         description: description ? String(description).trim() : null,
@@ -18407,6 +18410,8 @@ app.post("/branches", tenantAuthWrite, async (req, res) => {
       website_url,
       use_global_socials = true,
       use_global_contact = true,
+      banner_url,
+      use_global_banner = true,
     } = req.body;
 
     if (!tenant_id || !name) {
@@ -18497,6 +18502,8 @@ app.post("/branches", tenantAuthWrite, async (req, res) => {
         website_url: normalizeNullableUrl(website_url),
         use_global_socials: Boolean(use_global_socials),
         use_global_contact: Boolean(use_global_contact),
+        ...(banner_url !== undefined && { banner_url: normalizeNullableUrl(banner_url) }),
+        use_global_banner: Boolean(use_global_banner),
         is_active: true,
       })
       .select()
@@ -18547,6 +18554,8 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
       use_global_contact,
       use_global_hours,
       use_global_special_dates,
+      banner_url,
+      use_global_banner,
     } = req.body;
 
     if (!id) {
@@ -18698,6 +18707,10 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
     }
     if (use_global_special_dates !== undefined) {
       updateData.use_global_special_dates = Boolean(use_global_special_dates);
+    }
+    if (banner_url !== undefined) updateData.banner_url = normalizeNullableUrl(banner_url);
+    if (use_global_banner !== undefined) {
+      updateData.use_global_banner = Boolean(use_global_banner);
     }
 
     if (updateData.use_global_contact === false && !normalizeNullableText(address)) {
@@ -19235,7 +19248,7 @@ app.delete("/services/:id", tenantAuthWrite, async (req, res) => {
 // realmente usa. Nunca plan, fechas de trial/facturación, paused_at,
 // prorrateos ni config de WhatsApp (auditoría 2026-09-29, I4).
 const PUBLIC_TENANT_FIELDS =
-  "id, name, slug, description, address, commune, region, phone, email, whatsapp, logo_url, instagram_url, facebook_url, min_booking_notice_minutes, max_booking_days_ahead, booking_fields_config, business_category, business_subtype, business_subtype_config, deposit_required";
+  "id, name, slug, description, address, commune, region, phone, email, whatsapp, logo_url, banner_url, instagram_url, facebook_url, min_booking_notice_minutes, max_booking_days_ahead, booking_fields_config, business_category, business_subtype, business_subtype_config, deposit_required";
 const PUBLIC_TENANT_DEPOSIT_FIELDS = [
   "deposit_bank_name",
   "deposit_account_type",
@@ -19247,7 +19260,7 @@ const PUBLIC_TENANT_DEPOSIT_FIELDS = [
 // endpoints — se reutilizan para la lista `branches` (antes el proxy de
 // Next la pedía a GET /branches, que exige sesión y fallaba con 401).
 const PUBLIC_BRANCH_FIELDS =
-  "id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, region, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, use_global_hours, is_active";
+  "id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, region, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, use_global_hours, banner_url, use_global_banner, is_active";
 
 // Días que la página pública sigue aceptando reservas después de que la
 // cuenta queda bloqueada por falta de pago (decisión de producto
@@ -19311,7 +19324,19 @@ function toPublicTenant(tenant) {
 // lógica.
 function withEffectiveFullAddress(branch, tenant) {
   if (!branch) return branch;
-  return { ...branch, full_address: resolveEffectiveFullAddress(tenant, branch) };
+  return {
+    ...branch,
+    full_address: resolveEffectiveFullAddress(tenant, branch),
+    effective_banner_url: resolveEffectiveBannerUrl(tenant, branch),
+  };
+}
+
+// Banner de portada efectivo: la sucursal usa el suyo solo si
+// use_global_banner === false y tiene uno cargado; si no, el del negocio.
+function resolveEffectiveBannerUrl(tenant, branch) {
+  const own = String(branch?.banner_url || "").trim();
+  if (branch && branch.use_global_banner === false && own) return own;
+  return String(tenant?.banner_url || "").trim() || null;
 }
 
 /* ======================================================
