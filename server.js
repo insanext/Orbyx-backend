@@ -16100,6 +16100,27 @@ app.post(
   }
 );
 
+// Lee de Flow si la primera factura de una suscripción recién creada ya se
+// pagó. subscription/create devuelve status 1 (activa) aunque el cobro
+// inicial sea rechazado o siga pendiente, así que ese status por sí solo no
+// prueba el pago. Invoice status de Flow: 0 impaga, 1 pagada, 2 anulada.
+// Devuelve "paid" | "unpaid" | "unknown" (no se pudo consultar: no se trata
+// como rechazo para no cancelar un cobro que quizá sí entró).
+async function waitForFlowFirstInvoice(flowSubscriptionId, attempts = 4, delayMs = 1500) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const sub = await flowApiRequest("/subscription/get", { subscriptionId: flowSubscriptionId }, "GET");
+      const invoices = Array.isArray(sub?.invoices) ? sub.invoices : [];
+      if (invoices.some((inv) => Number(inv?.status) === 1)) return "paid";
+    } catch (err) {
+      console.warn("waitForFlowFirstInvoice: no se pudo consultar Flow:", err.message);
+      return "unknown";
+    }
+    if (i < attempts - 1) await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return "unpaid";
+}
+
 /* ======================================================
    ✅ POST /billing/flow/subscribe (sandbox)
    Activa la primera suscripción real en Flow para un tenant que ya
@@ -16107,6 +16128,8 @@ app.post(
    posteriores; este endpoint solo dispara la activación inicial.
 ====================================================== */
 app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
+  // Reclamo atómico de la fila (I2): { id, from } una vez ganado.
+  let claim = null;
   try {
     const { tenant_id } = req.body;
     const plan_id = String(req.body.plan_id || "").toLowerCase();
@@ -16156,18 +16179,48 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
     // mantiene el comportamiento actual: cobro inmediato al suscribirse.
     const { data: tenantRow } = await supabase
       .from("tenants")
-      .select("trial_ends_at")
+      .select("trial_ends_at, is_trial, billing_cycle_end")
       .eq("id", tenant_id)
       .maybeSingle();
 
     let trialPeriodDays = null;
+    const nowForTrial = new Date();
     if (tenantRow?.trial_ends_at) {
       const trialEndsAt = new Date(tenantRow.trial_ends_at);
-      const now = new Date();
-      if (trialEndsAt > now) {
-        trialPeriodDays = Math.ceil((trialEndsAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+      if (trialEndsAt > nowForTrial) {
+        trialPeriodDays = Math.ceil((trialEndsAt.getTime() - nowForTrial.getTime()) / (24 * 60 * 60 * 1000));
       }
     }
+
+    // Nunca cobrar dos veces el mismo ciclo: si el tenant ya pagó y su ciclo
+    // sigue vigente (p. ej. canceló y reactiva, o cambió la tarjeta estando
+    // 'canceled'), la nueva suscripción parte recién cuando ese ciclo termina.
+    if (tenantRow?.is_trial === false && tenantRow?.billing_cycle_end) {
+      const paidUntil = new Date(tenantRow.billing_cycle_end);
+      if (paidUntil > nowForTrial) {
+        const daysToCycleEnd = Math.ceil((paidUntil.getTime() - nowForTrial.getTime()) / (24 * 60 * 60 * 1000));
+        trialPeriodDays = Math.max(trialPeriodDays || 0, daysToCycleEnd);
+      }
+    }
+
+    // Reclamo atómico (I2): doble clic o dos pestañas no crean dos
+    // suscripciones ni cobran dos veces; solo gana quien logra pasar la fila
+    // de su estado actual a 'pending'. Si algo falla más abajo, el catch la
+    // devuelve a su estado anterior.
+    const { data: claimed, error: claimErr } = await supabase
+      .from("subscriptions")
+      .update({ status: "pending", updated_at: new Date().toISOString() })
+      .eq("id", subscription.id)
+      .eq("status", subscription.status)
+      .select("id")
+      .maybeSingle();
+    if (claimErr) throw claimErr;
+    if (!claimed) {
+      return res.status(409).json({
+        error: "Ya estamos procesando tu suscripción. Espera unos segundos y recarga la página.",
+      });
+    }
+    claim = { id: subscription.id, from: subscription.status };
 
     // Nunca dos suscripciones vivas en Flow para el mismo tenant (C3,
     // auditoría 2026-09-30): si la fila todavía apunta a una suscripción
@@ -16237,6 +16290,41 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
       );
     }
 
+    // Cobro inmediato (sin trial ni ciclo ya pagado): comprobar con Flow que
+    // la primera factura realmente se pagó antes de reactivar al negocio.
+    let paymentState = "not_applicable";
+    if (mappedStatus === "active" && !trialPeriodDays) {
+      paymentState = await waitForFlowFirstInvoice(flowSubscription.subscriptionId);
+    }
+
+    if (paymentState === "unpaid") {
+      // Tarjeta rechazada o cobro sin confirmar: se cancela la suscripción
+      // recién creada para que Flow no siga reintentando por su cuenta.
+      try {
+        await flowApiRequest("/subscription/cancel", {
+          subscriptionId: flowSubscription.subscriptionId,
+        });
+      } catch (cancelErr) {
+        console.error(
+          `POST /billing/flow/subscribe: no se pudo cancelar la suscripción sin pago ${flowSubscription.subscriptionId}:`,
+          cancelErr.message
+        );
+      }
+      await supabase
+        .from("subscriptions")
+        .update({
+          flow_subscription_id: flowSubscription.subscriptionId,
+          status: "error",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", subscription.id);
+      claim = null;
+      return res.status(402).json({
+        error: "No pudimos procesar el cobro con esa tarjeta. Intenta con otra tarjeta.",
+        payment_status: "unpaid",
+      });
+    }
+
     const { error: updateErr } = await supabase
       .from("subscriptions")
       .update({
@@ -16250,13 +16338,14 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
       .eq("id", subscription.id);
 
     if (updateErr) throw updateErr;
+    claim = null;
 
     // Cobro inmediato (sin trial): el período pagado empieza hoy. Sin esto
     // un tenant que se suscribe semanas después de vencer su trial quedaba
     // con billing_cycle_end en el pasado, y al cancelar perdía el acceso
     // en el acto en vez de al fin del ciclo pagado (I6). is_trial=false
     // marca que ya pagó (ver computeBillingAccessState). Best-effort.
-    if (mappedStatus === "active") {
+    if (mappedStatus === "active" && !trialPeriodDays) {
       const cycleStart = new Date();
       const { error: cycleErr } = await supabase
         .from("tenants")
@@ -16278,9 +16367,18 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
       subscription_id: subscription.id,
       flow_subscription_id: flowSubscription.subscriptionId,
       status: mappedStatus,
+      payment_status: paymentState,
     });
   } catch (err) {
     console.error("POST /billing/flow/subscribe error:", err.message);
+    if (claim) {
+      // Devuelve la fila a su estado previo para que el usuario pueda reintentar.
+      await supabase
+        .from("subscriptions")
+        .update({ status: claim.from, updated_at: new Date().toISOString() })
+        .eq("id", claim.id)
+        .eq("status", "pending");
+    }
     return res.status(500).json({ error: err.message });
   }
 });
