@@ -1401,6 +1401,96 @@ function normalizeBookingPhone(rawPhone) {
   return matchesAllowedCountry ? `+${digits}` : null;
 }
 
+/* ======================================================
+   📍 DIRECCIÓN COMPLETA (calle + comuna + región)
+   Única fuente de verdad de "qué dirección se le muestra al cliente" para
+   una sucursal: email de confirmación, WhatsApp de confirmación y de
+   recordatorio, página pública, agenda y mapa. Antes cada consumidor hacía
+   su propio `branch.address || tenant.address` (y los WhatsApp ni miraban
+   la sucursal).
+
+   Herencia (use_global_contact): si la sucursal usa contacto propio
+   (`use_global_contact === false`) y tiene calle, se usa TODO lo suyo
+   (calle + comuna + región de la sucursal — nunca se mezcla la región del
+   negocio con la calle de otra sucursal). En cualquier otro caso (sin
+   sucursal, hereda del negocio, o contacto propio pero sin calle cargada)
+   se usa la dirección del negocio completa.
+====================================================== */
+function cleanAddressPart(value) {
+  return String(value ?? "").trim();
+}
+
+// "Gacitúa 77" + "Concepción" + "Región del Biobío" →
+// "Gacitúa 77, Concepción, Región del Biobío". Sin calle devuelve "" (no
+// tiene sentido mostrar solo comuna/región). Si la calle ya trae la comuna
+// o la región como un segmento propio (dato viejo escrito a mano:
+// "Av. Principal 123, Concepción"), ese segmento no se repite.
+function formatFullAddress({ address, commune, region } = {}) {
+  const street = cleanAddressPart(address);
+  if (!street) return "";
+
+  const streetSegments = street
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  const parts = [street];
+  for (const raw of [commune, region]) {
+    const part = cleanAddressPart(raw);
+    if (!part) continue;
+    if (streetSegments.includes(part.toLowerCase())) continue;
+    parts.push(part);
+  }
+  return parts.join(", ");
+}
+
+// tenant: { address, commune, region }. branch (opcional):
+// { address, commune, region, use_global_contact }.
+function resolveEffectiveAddressFields(tenant, branch) {
+  const branchOwnsAddress =
+    branch &&
+    branch.use_global_contact === false &&
+    cleanAddressPart(branch.address);
+  const source = branchOwnsAddress ? branch : tenant;
+  return {
+    address: cleanAddressPart(source?.address),
+    commune: cleanAddressPart(source?.commune),
+    region: cleanAddressPart(source?.region),
+  };
+}
+
+function resolveEffectiveFullAddress(tenant, branch) {
+  return formatFullAddress(resolveEffectiveAddressFields(tenant, branch));
+}
+
+// Versión async para los consumidores que solo tienen ids. `tenant`/`branch`
+// opcionales: si el caller ya los leyó con address/commune/region (y, para
+// la sucursal, use_global_contact) se reutilizan y no se hace otra consulta.
+async function getEffectiveFullAddress({ tenant_id, branch_id, tenant = null, branch = null }) {
+  let tenantRow = tenant;
+  if (!tenantRow && tenant_id) {
+    const { data } = await supabase
+      .from("tenants")
+      .select("address, commune, region")
+      .eq("id", tenant_id)
+      .maybeSingle();
+    tenantRow = data || null;
+  }
+
+  let branchRow = branch;
+  if (!branchRow && branch_id && tenant_id) {
+    const { data } = await supabase
+      .from("branches")
+      .select("address, commune, region, use_global_contact")
+      .eq("id", branch_id)
+      .eq("tenant_id", tenant_id)
+      .maybeSingle();
+    branchRow = data || null;
+  }
+
+  return resolveEffectiveFullAddress(tenantRow, branchRow);
+}
+
 // Envía la confirmación de reserva (email + WhatsApp) — extraído de
 // POST /appointments/slot para poder reutilizarlo EXACTO (mismos templates,
 // misma lógica de cupo) desde POST /appointments/:id/deposit/confirm, sin
@@ -1438,7 +1528,7 @@ async function sendBookingConfirmations({
   cancelUrl,
   petName,
   petSpecies,
-  branchAddress,
+  fullAddress,
   branchName,
   customerInstructions,
   staffId,
@@ -1484,7 +1574,7 @@ async function sendBookingConfirmations({
       startAt: start.toISOString(),
       endAt: endAt ? new Date(endAt).toISOString() : null,
       cancelUrl,
-      address: branchAddress || tenantInfo?.address || null,
+      address: fullAddress || null,
       phone: tenantInfo?.phone || null,
       businessCategory: tenantInfo?.business_category || null,
       petName: resolvedPetName,
@@ -1523,7 +1613,7 @@ async function sendBookingConfirmations({
           2: tenantInfo?.name || "Tu negocio",
           3: formatDateCL(start),
           4: formatTimeCL(start),
-          5: tenantInfo?.address || serviceName || "",
+          5: fullAddress || serviceName || "",
         },
       });
       if (waResult.ok) {
@@ -2209,7 +2299,7 @@ async function getMainBranchByTenantId(tenant_id) {
 async function getBranchById(branch_id) {
   const { data, error } = await supabase
     .from("branches")
-    .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, use_global_hours, use_global_special_dates, is_active, created_at")
+    .select("id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, region, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, use_global_hours, use_global_special_dates, is_active, created_at")
     .eq("id", branch_id)
     .single();
 
@@ -7268,13 +7358,13 @@ if (customerData && typeof customerData === "object" && Object.keys(customerData
 
 const { data: tenantInfo, error: tenantInfoError } = await supabase
   .from("tenants")
-  .select("name, address, phone, business_category, wa_confirmation_enabled, logo_url, brand_color")
+  .select("name, address, commune, region, phone, business_category, wa_confirmation_enabled, logo_url, brand_color")
   .eq("id", cal.tenant_id)
   .single();
 
 const { data: branchInfoForEmail } = await supabase
   .from("branches")
-  .select("name, address")
+  .select("name, address, commune, region, use_global_contact")
   .eq("id", resolvedBranchId)
   .maybeSingle();
 
@@ -7305,7 +7395,7 @@ if (!appointmentRequiresDeposit) {
     cancelUrl,
     petName,
     petSpecies,
-    branchAddress: branchInfoForEmail?.address || null,
+    fullAddress: resolveEffectiveFullAddress(tenantInfo, branchInfoForEmail),
     branchName: branchInfoForEmail?.name || null,
     customerInstructions,
     staffId: apptUpdated?.staff_id || staff_id || null,
@@ -12114,14 +12204,14 @@ app.post(
 
       const { data: tenantInfo } = await supabase
         .from("tenants")
-        .select("name, slug, address, phone, business_category, wa_confirmation_enabled, logo_url, brand_color")
+        .select("name, slug, address, commune, region, phone, business_category, wa_confirmation_enabled, logo_url, brand_color")
         .eq("id", appt.tenant_id)
         .single();
 
       const { data: branchInfoForEmail } = appt.branch_id
         ? await supabase
             .from("branches")
-            .select("name, address")
+            .select("name, address, commune, region, use_global_contact")
             .eq("id", appt.branch_id)
             .maybeSingle()
         : { data: null };
@@ -12151,7 +12241,7 @@ app.post(
         startAt: appt.start_at,
         endAt: appt.end_at || null,
         cancelUrl,
-        branchAddress: branchInfoForEmail?.address || null,
+        fullAddress: resolveEffectiveFullAddress(tenantInfo, branchInfoForEmail),
         branchName: branchInfoForEmail?.name || null,
         customerInstructions: serviceInfoForEmail?.customer_instructions || null,
         staffId: appt.staff_id || null,
@@ -17776,7 +17866,7 @@ app.get("/tenants/:id", tenantAuthParam, async (req, res) => {
 
     const { data, error } = await supabase
       .from("tenants")
-      .select("id, name, slug, business_category")
+      .select("id, name, slug, business_category, address, commune, region")
       .eq("id", id)
       .single();
 
@@ -17804,6 +17894,8 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
       business_name,
       phone,
       address,
+      commune,
+      region,
       email,
       whatsapp,
       logo_url,
@@ -17834,6 +17926,8 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
       ["business_name", 200],
       ["phone", 50],
       ["address", 500],
+      ["commune", 100],
+      ["region", 100],
       ["email", 200],
       ["whatsapp", 50],
       ["description", 1000],
@@ -18024,6 +18118,10 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
         name: String(name).trim(),
         phone: phone ? String(phone).trim() : null,
         address: address ? String(address).trim() : null,
+        // Solo si vienen: otros llamadores de este PATCH (que no conocen
+        // comuna/región) no deben borrarlas.
+        ...(commune !== undefined && { commune: normalizeNullableText(commune) }),
+        ...(region !== undefined && { region: normalizeNullableText(region) }),
         email: email ? String(email).trim() : null,
         whatsapp: whatsapp ? String(whatsapp).trim() : null,
         logo_url: normalizeNullableUrl(logo_url),
@@ -18237,9 +18335,22 @@ app.get("/branches", tenantAuth, async (req, res) => {
 
     if (error) throw error;
 
+    // `full_address` (calle, comuna, región, con la herencia
+    // use_global_contact resuelta) para que la agenda/lista del dashboard
+    // no repitan esa lógica en el frontend.
+    const { data: tenantAddressRow } = await supabase
+      .from("tenants")
+      .select("address, commune, region")
+      .eq("id", tenant_id)
+      .maybeSingle();
+
+    const branchesWithAddress = (data || []).map((b) =>
+      withEffectiveFullAddress(b, tenantAddressRow)
+    );
+
     return res.json({
-      total: data?.length || 0,
-      branches: data || [],
+      total: branchesWithAddress.length,
+      branches: branchesWithAddress,
     });
   } catch (err) {
     console.error("GET /branches error:", err.message);
@@ -18263,6 +18374,7 @@ app.post("/branches", tenantAuthWrite, async (req, res) => {
       description,
       city,
       commune,
+      region,
       map_url,
       latitude,
       longitude,
@@ -18289,6 +18401,7 @@ app.post("/branches", tenantAuthWrite, async (req, res) => {
       ["description", 1000],
       ["city", 100],
       ["commune", 100],
+      ["region", 100],
       ["map_url", 300],
       ["instagram_url", 300],
       ["facebook_url", 300],
@@ -18351,6 +18464,7 @@ app.post("/branches", tenantAuthWrite, async (req, res) => {
         description: normalizeNullableText(description),
         city: normalizeNullableText(city),
         commune: normalizeNullableText(commune),
+        region: normalizeNullableText(region),
         map_url: normalizeNullableUrl(map_url),
         latitude: normalizeNullableNumber(latitude),
         longitude: normalizeNullableNumber(longitude),
@@ -18398,6 +18512,7 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
       description,
       city,
       commune,
+      region,
       map_url,
       latitude,
       longitude,
@@ -18436,6 +18551,7 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
       ["description", 1000],
       ["city", 100],
       ["commune", 100],
+      ["region", 100],
       ["map_url", 300],
       ["instagram_url", 300],
       ["facebook_url", 300],
@@ -18540,6 +18656,7 @@ app.patch("/branches/:id", tenantAuthWrite, async (req, res) => {
     if (description !== undefined) updateData.description = normalizeNullableText(description);
     if (city !== undefined) updateData.city = normalizeNullableText(city);
     if (commune !== undefined) updateData.commune = normalizeNullableText(commune);
+    if (region !== undefined) updateData.region = normalizeNullableText(region);
     if (map_url !== undefined) updateData.map_url = normalizeNullableUrl(map_url);
     if (latitude !== undefined) updateData.latitude = normalizeNullableNumber(latitude);
     if (longitude !== undefined) updateData.longitude = normalizeNullableNumber(longitude);
@@ -19095,7 +19212,7 @@ app.delete("/services/:id", tenantAuthWrite, async (req, res) => {
 // realmente usa. Nunca plan, fechas de trial/facturación, paused_at,
 // prorrateos ni config de WhatsApp (auditoría 2026-09-29, I4).
 const PUBLIC_TENANT_FIELDS =
-  "id, name, slug, description, address, phone, email, whatsapp, logo_url, instagram_url, facebook_url, min_booking_notice_minutes, max_booking_days_ahead, booking_fields_config, business_category, business_subtype, business_subtype_config, deposit_required";
+  "id, name, slug, description, address, commune, region, phone, email, whatsapp, logo_url, instagram_url, facebook_url, min_booking_notice_minutes, max_booking_days_ahead, booking_fields_config, business_category, business_subtype, business_subtype_config, deposit_required";
 const PUBLIC_TENANT_DEPOSIT_FIELDS = [
   "deposit_bank_name",
   "deposit_account_type",
@@ -19107,7 +19224,7 @@ const PUBLIC_TENANT_DEPOSIT_FIELDS = [
 // endpoints — se reutilizan para la lista `branches` (antes el proxy de
 // Next la pedía a GET /branches, que exige sesión y fallaba con 401).
 const PUBLIC_BRANCH_FIELDS =
-  "id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, use_global_hours, is_active";
+  "id, tenant_id, name, slug, address, phone, whatsapp, email, description, city, commune, region, map_url, latitude, longitude, instagram_url, facebook_url, tiktok_url, website_url, use_global_socials, use_global_contact, use_global_hours, is_active";
 
 // Días que la página pública sigue aceptando reservas después de que la
 // cuenta queda bloqueada por falta de pago (decisión de producto
@@ -19162,7 +19279,16 @@ function toPublicTenant(tenant) {
   if (!publicTenant.deposit_required) {
     for (const field of PUBLIC_TENANT_DEPOSIT_FIELDS) delete publicTenant[field];
   }
+  publicTenant.full_address = resolveEffectiveFullAddress(tenant, null);
   return publicTenant;
+}
+
+// Sucursal + `full_address` ya resuelto (calle, comuna, región, con la
+// herencia use_global_contact aplicada) para que el frontend no repita esa
+// lógica.
+function withEffectiveFullAddress(branch, tenant) {
+  if (!branch) return branch;
+  return { ...branch, full_address: resolveEffectiveFullAddress(tenant, branch) };
 }
 
 /* ======================================================
@@ -19352,8 +19478,8 @@ const filteredServices = (services || []).filter((s) =>
 
     return res.json({
       business: toPublicTenant(tenant),
-      branch,
-      branches: activeBranches || [],
+      branch: withEffectiveFullAddress(branch, tenant),
+      branches: (activeBranches || []).map((b) => withEffectiveFullAddress(b, tenant)),
       calendar_id: calendar.id,
       services: filteredServices,
       service_groups: serviceGroups || [],
@@ -19384,7 +19510,7 @@ app.get("/public/map-thumbnail/:slug", publicLimiter, async (req, res) => {
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
-      .select("id, address")
+      .select("id, address, commune, region")
       .eq("slug", slug)
       .eq("is_active", true)
       .single();
@@ -19399,7 +19525,7 @@ app.get("/public/map-thumbnail/:slug", publicLimiter, async (req, res) => {
     });
 
     const branch = resolvedBranchId ? await getBranchById(resolvedBranchId) : null;
-    const address = branch?.address || tenant.address;
+    const address = resolveEffectiveFullAddress(tenant, branch);
 
     if (!address) {
       return res.status(404).json({ error: "Sin dirección disponible" });
@@ -19486,6 +19612,8 @@ app.get("/public/business/:slug", publicLimiter, async (req, res) => {
   slug,
   phone,
   address,
+  commune,
+  region,
   email,
   whatsapp,
   logo_url,
@@ -19529,6 +19657,7 @@ app.get("/public/business/:slug", publicLimiter, async (req, res) => {
     return res.json({
       business: {
         ...tenant,
+        full_address: resolveEffectiveFullAddress(tenant, null),
         min_booking_notice_minutes: tenant.min_booking_notice_minutes || 0,
         max_booking_days_ahead: tenant.max_booking_days_ahead || 60,
       },
@@ -20323,7 +20452,7 @@ async function sendWhatsAppReminders() {
 
   const { data: appointments, error } = await supabase
     .from("appointments")
-    .select("id, tenant_id, customer_name, customer_phone, start_at")
+    .select("id, tenant_id, branch_id, customer_name, customer_phone, start_at")
     .eq("status", "booked")
     .eq("wa_recordatorio_enviado", false)
     .gte("start_at", windowStart.toISOString())
@@ -20339,7 +20468,7 @@ async function sendWhatsAppReminders() {
 
     const { data: tenantInfo } = await supabase
       .from("tenants")
-      .select("name, address, wa_reminder_enabled, wa_reminder_hours_before")
+      .select("name, address, commune, region, wa_reminder_enabled, wa_reminder_hours_before")
       .eq("id", appt.tenant_id)
       .single();
 
@@ -20368,6 +20497,14 @@ async function sendWhatsAppReminders() {
       continue;
     }
 
+    // Dirección de la sucursal de ESTA cita (hereda la del negocio según
+    // use_global_contact), no siempre la del negocio.
+    const reminderAddress = await getEffectiveFullAddress({
+      tenant_id: appt.tenant_id,
+      branch_id: appt.branch_id,
+      tenant: tenantInfo,
+    });
+
     const waResult = await sendWhatsAppTemplate({
       to: appt.customer_phone,
       contentSid: process.env.TEMPLATE_RECORDATORIO_SID,
@@ -20375,7 +20512,7 @@ async function sendWhatsAppReminders() {
         1: appt.customer_name || "",
         2: tenantInfo.name || "Tu negocio",
         3: formatTimeCL(appt.start_at),
-        4: tenantInfo.address || "",
+        4: reminderAddress || "",
       },
     });
 
