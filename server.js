@@ -16373,11 +16373,16 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
       .maybeSingle();
 
     let trialPeriodDays = null;
+    // Cuándo se hará el primer cobro automático cuando no hay cobro hoy
+    // (fin del trial o del ciclo ya pagado). La pantalla de billing lo
+    // muestra en "Tarjeta registrada... primer cobro el <fecha>".
+    let firstChargeAt = null;
     const nowForTrial = new Date();
     if (tenantRow?.trial_ends_at) {
       const trialEndsAt = new Date(tenantRow.trial_ends_at);
       if (trialEndsAt > nowForTrial) {
         trialPeriodDays = Math.ceil((trialEndsAt.getTime() - nowForTrial.getTime()) / (24 * 60 * 60 * 1000));
+        firstChargeAt = trialEndsAt;
       }
     }
 
@@ -16389,6 +16394,7 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
       if (paidUntil > nowForTrial) {
         const daysToCycleEnd = Math.ceil((paidUntil.getTime() - nowForTrial.getTime()) / (24 * 60 * 60 * 1000));
         trialPeriodDays = Math.max(trialPeriodDays || 0, daysToCycleEnd);
+        if (!firstChargeAt || paidUntil > firstChargeAt) firstChargeAt = paidUntil;
       }
     }
 
@@ -16557,6 +16563,7 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
       flow_subscription_id: flowSubscription.subscriptionId,
       status: mappedStatus,
       payment_status: paymentState,
+      first_charge_at: trialPeriodDays && firstChargeAt ? firstChargeAt.toISOString() : null,
     });
   } catch (err) {
     console.error("POST /billing/flow/subscribe error:", err.message);
@@ -16568,6 +16575,271 @@ app.post("/billing/flow/subscribe", tenantAuthWrite, async (req, res) => {
         .eq("id", claim.id)
         .eq("status", "pending");
     }
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   ✅ "Pagar ahora y activar de inmediato" (durante el trial)
+   Para quien está en su prueba gratuita (nunca pagó), ya inscribió tarjeta
+   y no quiere esperar al fin del trial. NO cambia de plan: cobra el plan
+   actual del tenant.
+
+   Orden pensado para que un cobro fallido deje todo como estaba:
+     1. Reclamo atómico de la fila de suscripción (anti doble clic).
+     2. Cobro inmediato con la tarjeta inscrita (customer/charge, el mismo
+        chargeFlowCustomer que usan los add-ons; el cargo aparece en el
+        historial de pagos). Si falla: se devuelve la fila a su estado
+        anterior y NADA más se toca (el trial y la suscripción en Flow
+        siguen igual).
+     3. Cobro OK: se termina el trial (is_trial=false, trial_ends_at=ahora)
+        y el ciclo pasa a hoy → hoy + 1 mes.
+     4. La suscripción de Flow (que cobraba al terminar el trial) se
+        reemplaza por una nueva con trial_period_days hasta el fin del nuevo
+        ciclo — misma técnica que POST /billing/flow/subscribe usa para un
+        ciclo ya pagado — así Flow no cobra de nuevo hasta la renovación.
+        Si este paso falla, el pago ya está hecho: la fila queda en
+        'card_registered' (subscribe reintenta sin volver a cobrar porque el
+        ciclo ya está pagado) y se avisa con renewal_pending.
+====================================================== */
+async function getPayNowContext(tenant_id) {
+  const { data: tenantRow, error: tenantErr } = await supabase
+    .from("tenants")
+    .select("plan_slug, is_trial, trial_ends_at")
+    .eq("id", tenant_id)
+    .maybeSingle();
+  if (tenantErr) throw tenantErr;
+
+  const now = new Date();
+  const trialEndsAt = tenantRow?.trial_ends_at ? new Date(tenantRow.trial_ends_at) : null;
+  if (!tenantRow || tenantRow.is_trial === false || !trialEndsAt || trialEndsAt <= now) {
+    return { eligible: false, reason: "Pagar ahora solo está disponible durante tu período de prueba." };
+  }
+
+  const plan_id = String(tenantRow.plan_slug || "").toLowerCase();
+  if (!isSellablePlanSlug(plan_id)) {
+    return { eligible: false, reason: "Tu plan actual no se puede contratar desde aquí." };
+  }
+  const monto = computePlanNetAmount(plan_id, "mensual");
+  if (!monto) {
+    return { eligible: false, reason: "No se pudo calcular el monto de tu plan." };
+  }
+
+  const { data: subscription, error: subErr } = await supabase
+    .from("subscriptions")
+    .select("id, flow_customer_id, flow_subscription_id, status")
+    .eq("tenant_id", tenant_id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (subErr) throw subErr;
+
+  if (
+    !subscription?.flow_customer_id ||
+    !["trialing", "card_registered"].includes(subscription.status)
+  ) {
+    return { eligible: false, reason: "Inscribe una tarjeta primero para poder pagar ahora." };
+  }
+
+  return { eligible: true, plan_id, monto, subscription, trialEndsAt, now };
+}
+
+app.get("/billing/flow/pay-now-preview", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+    if (!tenant_id) return res.status(400).json({ error: "tenant_id es obligatorio" });
+
+    const ctx = await getPayNowContext(tenant_id);
+    if (!ctx.eligible) return res.json({ eligible: false, reason: ctx.reason });
+
+    const total = applyIva(ctx.monto);
+    return res.json({
+      eligible: true,
+      plan_id: ctx.plan_id,
+      net_amount: ctx.monto,
+      iva_amount: total - ctx.monto,
+      total_amount: total,
+      trial_ends_at: ctx.trialEndsAt.toISOString(),
+      new_renewal_date: addMonths(ctx.now, 1).toISOString(),
+    });
+  } catch (err) {
+    console.error("GET /billing/flow/pay-now-preview error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/billing/flow/pay-now", tenantAuthWrite, async (req, res) => {
+  let claim = null;
+  const restoreClaim = async () => {
+    if (!claim) return;
+    await supabase
+      .from("subscriptions")
+      .update({ status: claim.from, updated_at: new Date().toISOString() })
+      .eq("id", claim.id)
+      .eq("status", "pending");
+    claim = null;
+  };
+
+  try {
+    const { tenant_id } = req.body;
+    if (!tenant_id) return res.status(400).json({ error: "tenant_id es obligatorio" });
+
+    const ctx = await getPayNowContext(tenant_id);
+    if (!ctx.eligible) return res.status(400).json({ error: ctx.reason });
+    const { plan_id, monto, subscription } = ctx;
+
+    // La tarjeta tiene que existir de verdad en Flow (el estado de la fila
+    // por sí solo no lo prueba).
+    let customer = null;
+    try {
+      customer = await flowApiRequest(
+        "/customer/get",
+        { customerId: subscription.flow_customer_id },
+        "GET"
+      );
+    } catch (customerErr) {
+      console.error("POST /billing/flow/pay-now: customer/get falló:", customerErr.message);
+    }
+    if (!customer?.creditCardType || !customer?.last4CardDigits) {
+      return res.status(400).json({ error: "No encontramos una tarjeta inscrita. Inscribe una tarjeta primero." });
+    }
+
+    const { data: claimed, error: claimErr } = await supabase
+      .from("subscriptions")
+      .update({ status: "pending", updated_at: new Date().toISOString() })
+      .eq("id", subscription.id)
+      .eq("status", subscription.status)
+      .select("id")
+      .maybeSingle();
+    if (claimErr) throw claimErr;
+    if (!claimed) {
+      return res.status(409).json({
+        error: "Ya estamos procesando tu pago. Espera unos segundos y recarga la página.",
+      });
+    }
+    claim = { id: subscription.id, from: subscription.status };
+
+    // 2. Cobro inmediato. Si falla, no se toca nada más.
+    try {
+      await chargeFlowCustomer({
+        customerId: subscription.flow_customer_id,
+        amount: applyIva(monto),
+        subject: `Orbyx ${plan_id} (mensual) - pago anticipado`,
+        commerceOrder: `paynow_${tenant_id}_${Date.now()}`,
+      });
+    } catch (chargeErr) {
+      console.error(`POST /billing/flow/pay-now: cobro rechazado (tenant ${tenant_id}):`, chargeErr.message);
+      await restoreClaim();
+      return res.status(402).json({
+        error: chargeErr.message || "No pudimos procesar el cobro con tu tarjeta.",
+        payment_status: "unpaid",
+      });
+    }
+
+    // 3. Pago confirmado: termina el trial y arranca el ciclo pagado.
+    const cycleStart = new Date();
+    const cycleEnd = addMonths(cycleStart, 1);
+    const { error: cycleErr } = await supabase
+      .from("tenants")
+      .update({
+        is_trial: false,
+        trial_ends_at: cycleStart.toISOString(),
+        billing_cycle_start: cycleStart.toISOString(),
+        billing_cycle_end: cycleEnd.toISOString(),
+      })
+      .eq("id", tenant_id);
+    if (cycleErr) {
+      console.error(
+        `POST /billing/flow/pay-now: COBRO REALIZADO pero no se pudo fijar el ciclo de tenant ${tenant_id}:`,
+        cycleErr.message
+      );
+      await restoreClaim();
+      return res.status(500).json({
+        error:
+          "Tu pago se realizó, pero no pudimos actualizar tu cuenta. Escríbenos a soporte@orbyx.cl y lo resolvemos de inmediato.",
+      });
+    }
+
+    // 4. Reemplaza la suscripción de Flow para que la próxima renovación
+    // sea al fin del nuevo ciclo (no al fin del trial viejo).
+    let mappedStatus = "card_registered";
+    let flowSubscriptionId = subscription.flow_subscription_id;
+    let renewalPending = false;
+    try {
+      if (subscription.flow_subscription_id) {
+        let previousFlowSub = null;
+        try {
+          previousFlowSub = await flowApiRequest(
+            "/subscription/get",
+            { subscriptionId: subscription.flow_subscription_id },
+            "GET"
+          );
+        } catch (lookupErr) {
+          console.warn(
+            `POST /billing/flow/pay-now: no se pudo consultar la suscripción ${subscription.flow_subscription_id} (se asume inexistente):`,
+            lookupErr.message
+          );
+        }
+        if ([1, 2].includes(Number(previousFlowSub?.status))) {
+          await flowApiRequest("/subscription/cancel", {
+            subscriptionId: subscription.flow_subscription_id,
+          });
+        }
+      }
+
+      const flowPlanId = await getOrCreateFlowPlan(plan_id, "mensual", monto);
+      const daysToRenewal = Math.max(
+        1,
+        Math.ceil((cycleEnd.getTime() - cycleStart.getTime()) / (24 * 60 * 60 * 1000))
+      );
+      const flowSubscription = await flowApiRequest("/subscription/create", {
+        planId: flowPlanId,
+        customerId: subscription.flow_customer_id,
+        trial_period_days: daysToRenewal,
+      });
+      const flowStatus = Number(flowSubscription.status);
+      if (flowStatus !== 1 && flowStatus !== 2) {
+        throw new Error(`status inesperado de Flow (${flowSubscription.status})`);
+      }
+      flowSubscriptionId = flowSubscription.subscriptionId;
+      mappedStatus = flowStatus === 1 ? "active" : "trialing";
+    } catch (swapErr) {
+      renewalPending = true;
+      console.error(
+        `POST /billing/flow/pay-now: pago OK pero no se pudo reprogramar la renovación en Flow (tenant ${tenant_id}):`,
+        swapErr.message
+      );
+    }
+
+    const { error: updateErr } = await supabase
+      .from("subscriptions")
+      .update({
+        plan_id,
+        periodicidad: "mensual",
+        monto,
+        flow_subscription_id: flowSubscriptionId,
+        status: mappedStatus,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", subscription.id);
+    claim = null;
+    if (updateErr) {
+      console.error(
+        `POST /billing/flow/pay-now: pago OK pero no se pudo actualizar la suscripción de tenant ${tenant_id}:`,
+        updateErr.message
+      );
+    }
+
+    return res.json({
+      ok: true,
+      amount_charged: applyIva(monto),
+      billing_cycle_end: cycleEnd.toISOString(),
+      status: mappedStatus,
+      renewal_pending: renewalPending,
+    });
+  } catch (err) {
+    console.error("POST /billing/flow/pay-now error:", err.message);
+    await restoreClaim();
     return res.status(500).json({ error: err.message });
   }
 });
