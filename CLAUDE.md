@@ -289,6 +289,15 @@ Lets an owner/admin move their customer base from another system (e.g. AgendaPro
 - **Tests**: `node scripts/test-customer-import.js` (parser, mapping, plan, malicious files). Fixtures: `samples/importar-clientes-prueba.xlsx|.csv` (valid, errors, duplicates; rows 16/17 expect existing customers with phone `987650001` / email `elena.existente@correo.cl`) and the public template `orbyx-web/public/plantillas/importar-clientes-plantilla.xlsx`.
 - **Not done / future**: no retention cleanup of `customer_imports`; "Deshacer" doesn't revert `fill_empty` updates; `delete_tenant_cascade` was not modified (relies on `customer_imports.tenant_id ... on delete cascade`).
 
+## Dependency Security (2026-10-12)
+
+- **Backend**: `npm audit` = 0 vulnerabilities. multer 2.4.0, sharp 0.35.5, and (lockfile-only, transitive) axios 1.20.0 via twilio, proxy-addr 2.0.8 via express, ip-address 10.7.4 via express-rate-limit, brace-expansion 2.1.7 via googleapis. One commit per library. No `package.json` range is pinned for the transitive ones: if the lockfile is ever regenerated, re-check `npm audit`.
+- **orbyx-web**: next 16.3.8 (minimum fix inside 16.3.x — `npm audit fix` wanted 16.4.0, a minor jump, deliberately avoided), sharp 0.35.5, plus dev/build-only source-map-js, brace-expansion, @humanfs/*.
+- **Still open (frontend, dev-only, no fix exists)**: `braces` ≤3.0.3 (GHSA-vfj7-8cjw-p6xm) via `eslint-config-next > @next/eslint-plugin-next > fast-glob > micromatch`. No patched `braces` release exists (3.0.3 is the latest) and the only "fix" npm offers is downgrading `eslint-config-next` to 14.x, which breaks the lint setup for Next 16. It only runs when linting, never in production. Re-check when `eslint-config-next`/`fast-glob` publish a release.
+- **Never** run `npm audit fix --force`. Use `npm update <pkg>` (or `npm install pkg@x.y.z`) one library at a time and re-run the smoke tests below.
+- **Smoke tests for dependency bumps** (take a `baseline` snapshot BEFORE updating, then compare): `node scripts/smoke-dependencies.js baseline` / `after-<lib>` boots the real `server.js` with a fake Supabase from an empty cwd and fake credentials (nothing touches prod) and checks multer uploads and limits, sharp profiles, outgoing Twilio calls (axios) against a local mock, `trust proxy`/`req.ip` and rate limiting (IPv4 and IPv6 /56). Frontend: build with dummy `NEXT_PUBLIC_SUPABASE_URL`/`NEXT_PUBLIC_SUPABASE_ANON_KEY`, then `node orbyx-web/scripts/smoke-web.js baseline-web` / `after-<lib>` (next start + routes + middleware redirects + sharp). Compare `npm run lint` counts too (434 existing problems).
+- Render has no `engines` in `package.json` (sharp 0.35.x needs Node >= 20.9); the Node version comes from Render's own config. Do not add `engines` without checking what version Render would then pick.
+
 ## Business Categories
 
 Known categories:
