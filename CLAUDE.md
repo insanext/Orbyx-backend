@@ -299,6 +299,15 @@ Lets an owner/admin move their customer base from another booking system. Button
 - **Smoke tests for dependency bumps** (take a `baseline` snapshot BEFORE updating, then compare): `node scripts/smoke-dependencies.js baseline` / `after-<lib>` boots the real `server.js` with a fake Supabase from an empty cwd and fake credentials (nothing touches prod) and checks multer uploads and limits, sharp profiles, outgoing Twilio calls (axios) against a local mock, `trust proxy`/`req.ip` and rate limiting (IPv4 and IPv6 /56). Frontend: build with dummy `NEXT_PUBLIC_SUPABASE_URL`/`NEXT_PUBLIC_SUPABASE_ANON_KEY`, then `node orbyx-web/scripts/smoke-web.js baseline-web` / `after-<lib>` (next start + routes + middleware redirects + sharp). Compare `npm run lint` counts too (434 existing problems).
 - Render has no `engines` in `package.json` (sharp 0.35.x needs Node >= 20.9); the Node version comes from Render's own config. Do not add `engines` without checking what version Render would then pick.
 
+## Select component and color-scheme (2026-10-13)
+
+- **Never use a native `<select>` again.** Use `orbyx-web/components/ui/Select.tsx` (`import Select from "@/components/ui/Select"`): same API (`value`, `onChange(e)` with `e.target.value`, `disabled`, `className`, `style`, `<option>`/`<optgroup>` children, `required`/`name`). All 70 former `<select>` in the app were replaced 1:1.
+- It renders a `button.orbyx-select-trigger` (receives the same `className`/`style` as the old select) and a portal'd `listbox` (`position: fixed`, so panels/modals with `overflow` never clip it; bottom sheet under 640px). Keyboard: arrows, Home/End, Enter/Space, Escape, Tab, type-ahead. `required`/`name` keep working through a hidden native `<select>`. The arrow is hidden automatically with `appearance-none`, or with `hideChevron` when the container draws its own.
+- **Colors**: the trigger is added to the same `select` rules in `globals.css` (and the agenda's scoped rules), so it looks exactly like the old select in both themes. The menu uses `--bg-card/--border-color/--text-main/--bg-soft/--accent-solid` of `<html data-theme>`; if the control sits on a background of the other tone (e.g. admin is always dark) it is forced to a fixed dark/light palette (`data-force`). Tone is read from the trigger's real background with transitions disabled (the global `* { transition }` made computed colors lag).
+- **Click-outside handlers**: the menu lives under `<body>`, so a `document` mousedown handler that does `ref.contains(target)` will treat an option click as "outside". Ignore targets inside `[data-orbyx-select-menu]` (done in the agenda filters panel).
+- **`color-scheme`** is set per theme in `globals.css`: `:root` light, `:root[data-theme="nocturno"]` dark, `.orbyx-public[data-public-theme]`, and the admin layout root is `dark`. Native date pickers/scrollbars/checkboxes follow it.
+- Agenda "Filtros" button next to "Calendario semanal": icon + "Filtros (N)", `orbyx-header-btn orbyx-filter-btn`, same count as the mobile button (`mobileActiveFilterCount`: search + professional + service + status != "active").
+
 ## Business Categories
 
 Known categories:
