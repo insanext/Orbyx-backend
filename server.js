@@ -35,6 +35,8 @@ const {
   STATUS_CALLBACK_URL: WHATSAPP_STATUS_CALLBACK_URL,
 } = require("./whatsapp");
 const { compressImage } = require("./imageCompression");
+// Importador de clientes (Excel/CSV): lectura, validación y plan (funciones puras).
+const CUSTOMER_IMPORT = require("./customerImport");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -3388,6 +3390,11 @@ function classifyCustomerFromAppointments(appointments, options = {}) {
   const now = options.now instanceof Date ? options.now : new Date();
   const thresholds = options.thresholds || CUSTOMER_CATEGORY_DEFAULT_THRESHOLDS;
   const nowMs = now.getTime();
+  // Historial traído de otro sistema al importar clientes (customers.
+  // imported_last_visit_at / imported_visit_count). Se combina con las visitas
+  // reales de Orbyx: la última visita es la más reciente de ambas y las
+  // visitas se suman.
+  const imported = options.imported || null;
 
   let attendedVisits = 0;
   let lastVisitMs = null;
@@ -3437,9 +3444,21 @@ function classifyCustomerFromAppointments(appointments, options = {}) {
     if (lastVisitMs === null || startMs > lastVisitMs) lastVisitMs = startMs;
   }
 
+  const importedCount = Math.max(0, Math.floor(Number(imported?.visit_count) || 0));
+  const importedLastMs = imported?.last_visit_at ? new Date(imported.last_visit_at).getTime() : NaN;
+  const hasImportedLast = Number.isFinite(importedLastMs);
+  // Una última visita importada implica al menos 1 visita.
+  const importedVisits = importedCount > 0 ? importedCount : hasImportedLast ? 1 : 0;
+
+  const orbyxVisits = attendedVisits;
+  attendedVisits += importedVisits;
+  if (hasImportedLast && (lastVisitMs === null || importedLastMs > lastVisitMs)) lastVisitMs = importedLastMs;
+
   let category = "prospect";
   let daysSinceLastVisit = null;
 
+  // Sin fecha de última visita (p. ej. se importó solo la cantidad de
+  // visitas) no hay cómo medir antigüedad: queda como prospecto.
   if (attendedVisits > 0 && lastVisitMs !== null) {
     const diff = getSantiagoDayDiff(new Date(lastVisitMs), now);
     daysSinceLastVisit = Math.max(0, diff === null ? 0 : diff);
@@ -3454,6 +3473,10 @@ function classifyCustomerFromAppointments(appointments, options = {}) {
   if (category === "prospect") {
     if (nextAppointmentMs !== null) {
       reason = `Primera cita agendada para el ${formatDayMonthCL(new Date(nextAppointmentMs))}`;
+    } else if (attendedVisits > 0) {
+      reason = `Importado con ${attendedVisits} visita${attendedVisits === 1 ? "" : "s"}, sin fecha de la última`;
+    } else if (imported?.is_imported && (appointments || []).length === 0) {
+      reason = "Importado sin historial de visitas";
     } else if (canceledCount > 0 && noShowCount === 0 && rescheduledCount === 0) {
       reason = canceledCount === 1 ? "Canceló su primera cita" : `Canceló sus ${canceledCount} citas`;
     } else if (noShowCount > 0 && canceledCount === 0 && rescheduledCount === 0) {
@@ -3476,6 +3499,8 @@ function classifyCustomerFromAppointments(appointments, options = {}) {
     category_label: CUSTOMER_CATEGORY_LABELS[category],
     reason,
     attended_visits: attendedVisits,
+    orbyx_visits: orbyxVisits,
+    imported_visits: importedVisits,
     last_visit_at: lastVisitMs !== null ? new Date(lastVisitMs).toISOString() : null,
     days_since_last_visit: daysSinceLastVisit,
     no_show_count: noShowCount,
@@ -3504,7 +3529,17 @@ async function fetchAllPages(buildQuery, { pageSize = 1000, maxRows = 20000 } = 
 // Map(customer_id -> resultado de classifyCustomerFromAppointments).
 // `branchId` (opcional) limita las citas consideradas a esa sucursal, igual
 // que ya hacía el listado de clientes con branch_id.
-async function getCustomerCategoryMap({ tenantId, customerIds, branchId = null, now = new Date(), tenant = null }) {
+//
+// `customerRows` (opcional): filas de customers ya cargadas con select("*");
+// si vienen, se usan para leer el historial importado sin otra consulta.
+async function getCustomerCategoryMap({
+  tenantId,
+  customerIds,
+  branchId = null,
+  now = new Date(),
+  tenant = null,
+  customerRows = null,
+}) {
   const thresholds = getCustomerCategoryThresholds(tenant);
   const ids = Array.from(new Set((customerIds || []).filter(Boolean)));
   const apptsByCustomer = new Map();
@@ -3541,9 +3576,48 @@ async function getCustomerCategoryMap({ tenantId, customerIds, branchId = null, 
     }
   }
 
+  // Historial importado (importador de clientes). Si la migración todavía no
+  // existe, las columnas no están: se sigue sin historial importado.
+  const importedById = new Map();
+  if (Array.isArray(customerRows)) {
+    for (const row of customerRows) importedById.set(row.id, row);
+  } else {
+    for (let i = 0; i < chunks.length; i += PARALLEL_CHUNKS) {
+      const batch = chunks.slice(i, i + PARALLEL_CHUNKS);
+      const batchRows = await Promise.all(
+        batch.map(async (chunk) => {
+          const { data, error } = await supabase
+            .from("customers")
+            .select("id, import_id, imported_last_visit_at, imported_visit_count")
+            .eq("tenant_id", tenantId)
+            .in("id", chunk);
+          if (error) {
+            console.warn("getCustomerCategoryMap: historial importado no disponible:", error.message);
+            return [];
+          }
+          return data || [];
+        })
+      );
+      for (const rows of batchRows) for (const row of rows) importedById.set(row.id, row);
+    }
+  }
+
   const result = new Map();
   for (const id of ids) {
-    result.set(id, classifyCustomerFromAppointments(apptsByCustomer.get(id) || [], { now, thresholds }));
+    const row = importedById.get(id);
+    const summary = classifyCustomerFromAppointments(apptsByCustomer.get(id) || [], {
+      now,
+      thresholds,
+      imported: row
+        ? {
+            is_imported: Boolean(row.import_id),
+            last_visit_at: row.imported_last_visit_at || null,
+            visit_count: row.imported_visit_count || 0,
+          }
+        : null,
+    });
+    summary.is_imported = Boolean(row?.import_id);
+    result.set(id, summary);
   }
   return result;
 }
@@ -3564,6 +3638,8 @@ function toCustomerCategoryFields(summary) {
     no_show_count: summary.no_show_count,
     next_appointment_at: summary.next_appointment_at,
     is_inactive: summary.category === "inactive",
+    // Cliente traído con el importador (puede traer historial del sistema anterior).
+    is_imported: summary.is_imported === true,
   };
 }
 
@@ -8676,7 +8752,7 @@ app.get("/stats/:slug", tenantAuthSlug, requireModuleReadAccess("indicadores"), 
 
     const classifiedCustomers = allCustomerRows
       .map((c) => ({ row: c, summary: categoryMap.get(c.id) }))
-      .filter(({ summary }) => summary && (!resolvedBranchId || summary.appointments_count > 0))
+      .filter(({ summary }) => summary && (!resolvedBranchId || summary.appointments_count > 0 || summary.is_imported))
       .map(({ row, summary }) => ({ ...row, ...toCustomerCategoryFields(summary) }));
 
     const customerCategoryCounts = { prospect: 0, new: 0, active: 0, at_risk: 0, inactive: 0 };
@@ -9689,12 +9765,16 @@ app.get("/customers/:slug", tenantAuthSlug, requireModuleReadAccess("clientes", 
       branchId: resolvedBranchId,
       now,
       tenant,
+      customerRows,
     });
 
     // Con sucursal activa, el listado solo muestra clientes con alguna cita
     // en esa sucursal (mismo comportamiento de antes).
     const rows = resolvedBranchId
-      ? customerRows.filter((customer) => (categoryMap.get(customer.id)?.appointments_count || 0) > 0)
+      ? customerRows.filter((customer) => {
+          const summary = categoryMap.get(customer.id);
+          return (summary?.appointments_count || 0) > 0 || summary?.is_imported === true;
+        })
       : customerRows;
 
     // Clientes ya reseñados (botón "Pedir reseña" → "Ya reseñó"). Una sola
@@ -9786,6 +9866,415 @@ app.get("/customers/:slug", tenantAuthSlug, requireModuleReadAccess("clientes", 
     return res.status(500).json({ error: err.message });
   }
 });
+
+/* ======================================================
+   📥 Importador de clientes (Excel / CSV) — 2026-10-12
+   Lectura/validación en customerImport.js (funciones puras). Aquí van solo
+   la autenticación, la carga de clientes existentes y la ejecución atómica
+   (función SQL import_customers_batch, migración 2026-10-12-customer-import.sql).
+
+   Flujo (sin estado en el servidor): el frontend envía el MISMO archivo en
+   "preview" y en "commit"; commit vuelve a leer y validar todo, así nunca se
+   confía en datos ya validados por el cliente.
+   - tenant_id sale siempre de la sesión (slug de la URL + membresía), nunca
+     del archivo.
+   - Solo owner/admin.
+====================================================== */
+const customerImportUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: CUSTOMER_IMPORT.LIMITS.MAX_BYTES, files: 1, fields: 10, fieldSize: 20 * 1024 },
+});
+
+const customerImportLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiados intentos de importación. Espera unos minutos e inténtalo de nuevo." },
+});
+
+function requireOwnerOrAdminRole(req, res, next) {
+  const role = req.authenticatedUser?.role;
+  if (role === "owner" || role === "admin") return next();
+  return res.status(403).json({ error: "Solo el dueño o un administrador puede importar clientes." });
+}
+
+// Recibe el archivo DESPUÉS de autenticar (así nadie sin permiso sube 5 MB).
+function receiveCustomerImportFile(req, res, next) {
+  customerImportUpload.single("file")(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({
+        error: "El archivo pesa más de 5 MB. Divídelo en partes más pequeñas.",
+        code: "too_big",
+      });
+    }
+    return res.status(400).json({ error: "No pudimos recibir el archivo. Inténtalo de nuevo." });
+  });
+}
+
+class CustomerImportHttpError extends Error {
+  constructor(status, message, code) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function sendCustomerImportError(res, err, label) {
+  if (err instanceof CUSTOMER_IMPORT.ImportFileError) {
+    return res.status(400).json({ error: err.message, code: err.code });
+  }
+  if (err instanceof CustomerImportHttpError) {
+    return res.status(err.status).json({ error: err.message, code: err.code });
+  }
+  // Sin datos del archivo en el log: solo el mensaje técnico.
+  console.error(`${label} error:`, err?.message);
+  return res.status(500).json({ error: "Ocurrió un error al procesar la importación. No se guardó nada." });
+}
+
+function sanitizeImportFileName(name) {
+  return String(name || "archivo")
+    .replace(/[\u0000-\u001F\u007F]/g, "")
+    .replace(/[\\/]/g, "_")
+    .trim()
+    .slice(0, 120);
+}
+
+// Valida el archivo + mapeo y arma el plan contra los clientes existentes.
+async function prepareCustomerImport(req) {
+  const { slug } = req.params;
+
+  const { data: tenant, error: tenantError } = await supabase
+    .from("tenants")
+    .select("id, slug, plan_slug, plan")
+    .eq("slug", slug)
+    .eq("is_active", true)
+    .single();
+  if (tenantError || !tenant) {
+    throw new CustomerImportHttpError(404, "Negocio no encontrado");
+  }
+
+  if (!req.file || !req.file.buffer) {
+    throw new CustomerImportHttpError(400, "Selecciona un archivo .xlsx o .csv.", "no_file");
+  }
+
+  const parsed = await CUSTOMER_IMPORT.readImportFile(req.file.buffer, req.file.originalname);
+
+  const suggested = CUSTOMER_IMPORT.suggestMapping(parsed.headers);
+  let rawMapping = suggested;
+  if (req.body && req.body.mapping !== undefined && String(req.body.mapping).trim() !== "") {
+    try {
+      const candidate = JSON.parse(String(req.body.mapping));
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) rawMapping = candidate;
+    } catch {
+      throw new CustomerImportHttpError(400, "El mapeo de columnas no es válido. Vuelve a seleccionar las columnas.");
+    }
+  }
+  const { mapping, problems } = CUSTOMER_IMPORT.normalizeMapping(rawMapping, parsed.headers.length);
+
+  const duplicateMode = String(req.body?.duplicate_mode || "skip") === "fill_empty" ? "fill_empty" : "skip";
+
+  let existing = [];
+  if (problems.length === 0) {
+    try {
+      existing = await fetchAllPages(
+        () =>
+          supabase
+            .from("customers")
+            .select("id, name, email, phone, rut, birth_date, notes, imported_last_visit_at, imported_visit_count")
+            .eq("tenant_id", tenant.id)
+            .order("id", { ascending: true }),
+        { maxRows: 200000 }
+      );
+    } catch (err) {
+      if (/imported_|import_id/i.test(String(err?.message))) {
+        throw new CustomerImportHttpError(
+          503,
+          "La importación de clientes todavía no está disponible. Avísale al equipo de Orbyx.",
+          "migration_missing"
+        );
+      }
+      throw err;
+    }
+  }
+
+  const plan =
+    problems.length === 0
+      ? CUSTOMER_IMPORT.buildImportPlan({
+          rows: parsed.rows,
+          mapping,
+          existing,
+          normalizePhone: normalizeChileanPhone,
+          isValidEmail,
+          duplicateMode,
+          now: new Date(),
+        })
+      : { rows: [], summary: null };
+
+  // Límite de clientes del plan: hoy ningún plan lo define (plan_config no
+  // tiene max_customers); queda el gancho para cuando exista.
+  const caps = getPlanCapabilities(tenant.plan_slug || tenant.plan);
+  const maxCustomers = Number(caps?.max_customers);
+  let planLimit = null;
+  if (Number.isFinite(maxCustomers) && maxCustomers > 0 && plan.summary) {
+    const available = Math.max(maxCustomers - existing.length, 0);
+    planLimit = {
+      max_customers: maxCustomers,
+      current_customers: existing.length,
+      available,
+      exceeded: plan.summary.new_count > available,
+    };
+  }
+
+  return { tenant, parsed, mapping, suggested, problems, duplicateMode, plan, planLimit };
+}
+
+function summarizeImportRow(r) {
+  return {
+    row: r.row,
+    name: r.display.name,
+    phone: r.display.phone,
+    email: r.display.email,
+    reason: r.reason || null,
+    action: r.action || null,
+    warnings: r.warnings || [],
+  };
+}
+
+function buildCustomerImportDetails(plan, { detailCap = 300 } = {}) {
+  const cap = (list) => ({ items: list.slice(0, detailCap).map(summarizeImportRow), total: list.length });
+  const rows = plan.rows;
+  return {
+    errors: cap(rows.filter((r) => r.status === "error")),
+    duplicates_in_file: cap(rows.filter((r) => r.status === "duplicate_file")),
+    duplicates_existing: cap(rows.filter((r) => r.status === "duplicate_existing")),
+    warnings: cap(rows.filter((r) => r.status === "new" && r.warnings && r.warnings.length > 0)),
+    sample_new: rows
+      .filter((r) => r.status === "new")
+      .slice(0, 8)
+      .map(summarizeImportRow),
+  };
+}
+
+app.post(
+  "/customers/import/:slug/preview",
+  customerImportLimiter,
+  ...tenantAuthSlugWrite,
+  requireOwnerOrAdminRole,
+  receiveCustomerImportFile,
+  async (req, res) => {
+    try {
+      const ctx = await prepareCustomerImport(req);
+      const { parsed, plan } = ctx;
+
+      const columns = parsed.headers.map((label, index) => {
+        const sample = [];
+        for (const row of parsed.rows) {
+          const v = row.cells[index];
+          const text = v === null || v === undefined ? "" : v instanceof Date ? v.toISOString().slice(0, 10) : String(v);
+          if (text.trim() !== "") sample.push(text.trim().slice(0, 40));
+          if (sample.length >= 3) break;
+        }
+        return { index, label, sample };
+      });
+
+      return res.json({
+        ok: true,
+        file: {
+          name: sanitizeImportFileName(req.file.originalname),
+          kind: parsed.kind,
+          size_bytes: req.file.size,
+          row_count: parsed.rows.length,
+        },
+        limits: { max_bytes: CUSTOMER_IMPORT.LIMITS.MAX_BYTES, max_rows: CUSTOMER_IMPORT.LIMITS.MAX_ROWS },
+        fields: CUSTOMER_IMPORT.FIELDS.map((f) => ({ key: f.key, label: f.label })),
+        columns,
+        mapping: ctx.mapping,
+        suggested_mapping: ctx.suggested,
+        mapping_problems: ctx.problems,
+        ready: ctx.problems.length === 0,
+        duplicate_mode: ctx.duplicateMode,
+        summary: plan.summary,
+        plan_limit: ctx.planLimit,
+        details: ctx.problems.length === 0 ? buildCustomerImportDetails(plan) : null,
+      });
+    } catch (err) {
+      return sendCustomerImportError(res, err, "POST /customers/import/:slug/preview");
+    }
+  }
+);
+
+app.post(
+  "/customers/import/:slug/commit",
+  customerImportLimiter,
+  ...tenantAuthSlugWrite,
+  requireOwnerOrAdminRole,
+  receiveCustomerImportFile,
+  async (req, res) => {
+    try {
+      if (String(req.body?.accepted_terms || "").toLowerCase() !== "true") {
+        return res.status(400).json({
+          error: "Debes confirmar que tienes autorización para traspasar los datos de tus clientes a Orbyx.",
+          code: "terms_required",
+        });
+      }
+
+      const ctx = await prepareCustomerImport(req);
+      const { tenant, plan } = ctx;
+
+      if (ctx.problems.length > 0) {
+        return res.status(400).json({ error: ctx.problems[0], code: "mapping_invalid" });
+      }
+
+      const toCreate = plan.rows.filter((r) => r.status === "new").map((r) => r.data);
+      const fills = plan.rows
+        .filter((r) => r.action === "fill")
+        .map((r) => ({ id: r.match.customer_id, ...r.fill }));
+
+      if (toCreate.length === 0 && fills.length === 0) {
+        return res.status(400).json({
+          error: "No hay clientes nuevos para importar. Revisa el detalle de filas omitidas.",
+          code: "nothing_to_import",
+        });
+      }
+
+      if (ctx.planLimit?.exceeded) {
+        return res.status(400).json({
+          error: `Tu plan permite hasta ${ctx.planLimit.max_customers} clientes. Tienes ${ctx.planLimit.current_customers} y quieres importar ${toCreate.length} más. Importa menos clientes o cambia de plan.`,
+          code: "plan_limit",
+        });
+      }
+
+      const skippedCount = plan.summary.skipped_count;
+
+      const { data: rpcData, error: rpcError } = await supabase.rpc("import_customers_batch", {
+        p_tenant_id: tenant.id,
+        p_user_id: req.authenticatedUser.user_id,
+        p_file_name: sanitizeImportFileName(req.file.originalname),
+        p_file_size: req.file.size,
+        p_total_rows: plan.summary.total_rows,
+        p_skipped_count: skippedCount,
+        p_error_count: plan.summary.error_count,
+        p_duplicate_mode: ctx.duplicateMode,
+        p_new_rows: toCreate,
+        p_fills: fills,
+      });
+
+      if (rpcError) {
+        console.error("POST /customers/import/:slug/commit rpc error:", rpcError.message);
+        return res.status(500).json({
+          error: "No se pudo completar la importación. No se guardó ningún cliente.",
+          code: "import_failed",
+        });
+      }
+
+      const details = buildCustomerImportDetails(plan, { detailCap: 500 });
+      console.log(
+        `customers import tenant=${tenant.id} import_id=${rpcData?.import_id} created=${rpcData?.created} updated=${rpcData?.updated} skipped=${skippedCount}`
+      );
+
+      return res.json({
+        ok: true,
+        import_id: rpcData?.import_id,
+        created: rpcData?.created ?? toCreate.length,
+        updated: rpcData?.updated ?? 0,
+        skipped: skippedCount,
+        errors: plan.summary.error_count,
+        with_history: plan.summary.with_history_count,
+        skipped_details: {
+          errors: details.errors,
+          duplicates_in_file: details.duplicates_in_file,
+          duplicates_existing: details.duplicates_existing,
+        },
+      });
+    } catch (err) {
+      return sendCustomerImportError(res, err, "POST /customers/import/:slug/commit");
+    }
+  }
+);
+
+// Últimas importaciones del negocio (para ofrecer "Deshacer" aunque se haya
+// recargado la página).
+app.get(
+  "/customers/import/:slug/history",
+  ...tenantAuthSlug,
+  requireOwnerOrAdminRole,
+  async (req, res) => {
+    try {
+      const { data: tenant, error: tenantError } = await supabase
+        .from("tenants")
+        .select("id")
+        .eq("slug", req.params.slug)
+        .eq("is_active", true)
+        .single();
+      if (tenantError || !tenant) return res.status(404).json({ error: "Negocio no encontrado" });
+
+      const { data, error } = await supabase
+        .from("customer_imports")
+        .select(
+          "id, file_name, total_rows, created_count, updated_count, skipped_count, error_count, duplicate_mode, status, created_at, undone_at, undone_count, undone_kept_count"
+        )
+        .eq("tenant_id", tenant.id)
+        .order("created_at", { ascending: false })
+        .limit(10);
+      if (error) {
+        // Tabla aún no creada (migración pendiente): el historial queda vacío.
+        if (/customer_imports/i.test(String(error.message))) return res.json({ ok: true, imports: [] });
+        throw error;
+      }
+
+      return res.json({ ok: true, imports: data || [] });
+    } catch (err) {
+      return sendCustomerImportError(res, err, "GET /customers/import/:slug/history");
+    }
+  }
+);
+
+// "Deshacer importación": elimina los clientes creados por esa importación
+// que aún no tienen citas (ver undo_customer_import en la migración).
+app.post(
+  "/customers/import/:slug/:importId/undo",
+  ...tenantAuthSlugWrite,
+  requireOwnerOrAdminRole,
+  async (req, res) => {
+    try {
+      const { importId } = req.params;
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(importId))) {
+        return res.status(400).json({ error: "Importación no válida." });
+      }
+
+      const { data: tenant, error: tenantError } = await supabase
+        .from("tenants")
+        .select("id")
+        .eq("slug", req.params.slug)
+        .eq("is_active", true)
+        .single();
+      if (tenantError || !tenant) return res.status(404).json({ error: "Negocio no encontrado" });
+
+      const { data, error } = await supabase.rpc("undo_customer_import", {
+        p_tenant_id: tenant.id,
+        p_import_id: importId,
+      });
+
+      if (error) {
+        const message = String(error.message || "");
+        if (message.includes("IMPORT_NOT_FOUND")) {
+          return res.status(404).json({ error: "No encontramos esa importación." });
+        }
+        if (message.includes("IMPORT_ALREADY_UNDONE")) {
+          return res.status(409).json({ error: "Esta importación ya fue deshecha." });
+        }
+        console.error("POST /customers/import/:slug/:importId/undo rpc error:", message);
+        return res.status(500).json({ error: "No se pudo deshacer la importación." });
+      }
+
+      return res.json({ ok: true, deleted: data?.deleted ?? 0, kept: data?.kept ?? 0 });
+    } catch (err) {
+      return sendCustomerImportError(res, err, "POST /customers/import/:slug/:importId/undo");
+    }
+  }
+);
 
 /* ======================================================
    ✅ PATCH /customers/:id
@@ -11356,6 +11845,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
       customerIds: rows.map((customer) => customer.id),
       now: new Date(),
       tenant,
+      customerRows: rows,
     });
 
     const audience = rows

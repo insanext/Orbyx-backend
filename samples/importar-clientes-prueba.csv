@@ -1,0 +1,17 @@
+﻿Nombre;Apellido;Celular;Email;RUT;Fecha de nacimiento;Última visita;Cantidad de visitas;Observaciones
+María;González;912345678;maria.gonzalez@correo.cl;12.345.678-5;15-03-1985;20-09-2026;7;Prefiere horario de tarde
+Juan;Pérez;+56 9 8765 4321;;;22-07-1990;05/08/2026;3;
+Camila;Soto;;camila.soto@correo.cl;;;10-03-2025;1;Cliente antigua (más de 120 días)
+Pedro;Ramírez;987650002;;9.876.543-2;;;;Importado sin historial de visitas
+Ana;Vega;956781234;ana.vega@correo.cl;;;15-07-2026;2;"=HYPERLINK(""http://ejemplo.com"",""clic"")"
+-Luisa;Mena;945671234;;;;;;+56 texto que empieza con signo más
+Rosa;Díaz;934561234;;;;;5;Trae visitas pero no la fecha de la última
+Tomás;Araya;923451234;;;31/02/1990;20/09/2099;;Fechas inválidas (se importa sin ellas)
+;;911112222;sin.nombre@correo.cl;;;;;Error: falta el nombre
+Sin;Contacto;;;;;;;Error: falta teléfono y email
+Teléfono;Fijo;22345678;;;;;;Error: teléfono fijo, no es celular
+Correo;Malo;;correo-malo@;;;;;Error: email inválido
+María;G.;56912345678;;;;;;Duplicado: mismo teléfono que la fila de María González
+Camila;S.;;CAMILA.SOTO@CORREO.CL;;;;;Duplicado: mismo email (en mayúsculas)
+Pedro;Existente;987650001;;;;01-09-2026;4;Coincide por teléfono con un cliente que ya existe
+Elena;Existente;;elena.existente@correo.cl;11.111.111-1;02-11-1979;;;Coincide por email con un cliente que ya existe

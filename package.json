@@ -13,6 +13,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.98.0",
     "cors": "^2.8.5",
+    "csv-parse": "^7.0.3",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "express-rate-limit": "^8.5.2",
@@ -22,6 +23,7 @@
     "node-cron": "^4.6.0",
     "open": "^11.0.0",
     "pdfkit": "^0.18.0",
+    "read-excel-file": "^9.3.12",
     "resend": "^6.9.3",
     "sharp": "^0.35.4",
     "twilio": "^6.0.2"
