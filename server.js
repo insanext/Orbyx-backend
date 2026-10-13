@@ -3277,6 +3277,331 @@ async function recalculateCustomerStats(customerId) {
   return updatedCustomer;
 }
 
+/* ======================================================
+   👥 Categorización de clientes — ÚNICA fuente de verdad (2026-10-12)
+   Listado de clientes, ficha, Campañas e Indicadores usan SOLO esto.
+   No duplicar esta lógica en endpoints ni en el frontend.
+
+   Qué cuenta como "visita asistida":
+   - status "completed" (el negocio la marcó como realizada), o
+   - status "booked" cuya hora de inicio ya pasó (nadie la marcó como
+     cancelada ni como inasistencia). Si tiene depósito aún pendiente de
+     revisión no cuenta: la reserva todavía no está confirmada.
+   NO cuentan: "canceled", "no_show", "rescheduled" ni citas futuras.
+
+   customers.total_visits / customers.last_visit_at (columnas cacheadas que
+   escribe recalculateCustomerStats) NO se usan acá: cuentan cualquier cita no
+   cancelada (incluye inasistencias y citas futuras), por eso una persona que
+   agendó, canceló y nunca asistió aparecía como "Inactiva".
+
+   Categorías (excluyentes, en este orden):
+   1. prospect  — 0 visitas asistidas
+   2. new       — 1 visita asistida y fue hace <= recent_days
+   3. active    — 2+ visitas asistidas y la última hace <= recent_days
+   4. at_risk   — última visita asistida hace entre recent_days+1 y at_risk_days
+   5. inactive  — última visita asistida hace más de at_risk_days
+====================================================== */
+const CUSTOMER_CATEGORY_KEYS = ["prospect", "new", "active", "at_risk", "inactive"];
+
+const CUSTOMER_CATEGORY_LABELS = {
+  prospect: "Prospecto",
+  new: "Nuevo",
+  active: "Activo",
+  at_risk: "En riesgo",
+  inactive: "Inactivo",
+};
+
+// Umbrales en UN solo lugar. Hoy son iguales para todos los negocios; a
+// futuro serán configurables por tenant: bastará con que
+// getCustomerCategoryThresholds lea la config del tenant (los llamadores ya
+// le pasan el tenant) sin tocar la clasificación ni los endpoints.
+const CUSTOMER_CATEGORY_DEFAULT_THRESHOLDS = Object.freeze({
+  recent_days: 60,
+  at_risk_days: 120,
+});
+
+function getCustomerCategoryThresholds(_tenant) {
+  return CUSTOMER_CATEGORY_DEFAULT_THRESHOLDS;
+}
+
+// Valores antiguos que todavía pueden llegar desde un frontend cacheado o
+// desde el historial: recurrente/frecuente ahora son "activo".
+function normalizeCustomerCategoryKey(value) {
+  const key = String(value || "").trim().toLowerCase();
+  if (CUSTOMER_CATEGORY_KEYS.includes(key)) return key;
+  if (key === "recurrent" || key === "frequent") return "active";
+  return null;
+}
+
+// Mínimo de días sin venir (desde la última visita ASISTIDA). null = sin filtro.
+function parseMinDaysWithoutVisit(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n) || n < 1) return null;
+  return Math.min(n, 3650);
+}
+
+const SANTIAGO_DATE_PARTS_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/Santiago",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+function getSantiagoDateParts(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const parts = {};
+  for (const part of SANTIAGO_DATE_PARTS_FORMATTER.formatToParts(date)) {
+    if (part.type === "year" || part.type === "month" || part.type === "day") {
+      parts[part.type] = Number(part.value);
+    }
+  }
+  if (!parts.year || !parts.month || !parts.day) return null;
+  return parts;
+}
+
+// Días calendario (hora de Chile) desde `fromValue` hasta `toValue`.
+function getSantiagoDayDiff(fromValue, toValue) {
+  const a = getSantiagoDateParts(fromValue);
+  const b = getSantiagoDateParts(toValue);
+  if (!a || !b) return null;
+  const aDays = Math.round(Date.UTC(a.year, a.month - 1, a.day) / 86400000);
+  const bDays = Math.round(Date.UTC(b.year, b.month - 1, b.day) / 86400000);
+  return bDays - aDays;
+}
+
+function describeDaysAgo(days) {
+  if (days <= 0) return "hoy";
+  if (days === 1) return "ayer";
+  return `hace ${days} días`;
+}
+
+function formatDayMonthCL(value) {
+  const parts = getSantiagoDateParts(value);
+  if (!parts) return "";
+  return `${String(parts.day).padStart(2, "0")}/${String(parts.month).padStart(2, "0")}`;
+}
+
+// Clasifica a UN cliente a partir de sus citas. Función pura (sin BD).
+function classifyCustomerFromAppointments(appointments, options = {}) {
+  const now = options.now instanceof Date ? options.now : new Date();
+  const thresholds = options.thresholds || CUSTOMER_CATEGORY_DEFAULT_THRESHOLDS;
+  const nowMs = now.getTime();
+
+  let attendedVisits = 0;
+  let lastVisitMs = null;
+  let nextAppointmentMs = null;
+  let noShowCount = 0;
+  let canceledCount = 0;
+  let rescheduledCount = 0;
+  let completedCount = 0;
+  // Citas que no cuentan como visita ni como cancelada/inasistencia (p. ej.
+  // reserva pasada con depósito aún sin revisar).
+  let unconfirmedCount = 0;
+
+  for (const appt of appointments || []) {
+    const status = String(appt?.status || "").toLowerCase();
+    const startMs = appt?.start_at ? new Date(appt.start_at).getTime() : NaN;
+
+    if (status === "canceled" || status === "cancelled") {
+      canceledCount++;
+      continue;
+    }
+    if (status === "no_show") {
+      noShowCount++;
+      continue;
+    }
+    if (status === "rescheduled") {
+      rescheduledCount++;
+      continue;
+    }
+    if (!Number.isFinite(startMs)) continue;
+
+    if (status === "booked" && startMs > nowMs) {
+      if (nextAppointmentMs === null || startMs < nextAppointmentMs) nextAppointmentMs = startMs;
+      continue;
+    }
+
+    if (status === "completed") completedCount++;
+
+    const attended =
+      status === "completed" ||
+      (status === "booked" && String(appt?.deposit_status || "").toLowerCase() !== "pending");
+    if (!attended) {
+      unconfirmedCount++;
+      continue;
+    }
+
+    attendedVisits++;
+    if (lastVisitMs === null || startMs > lastVisitMs) lastVisitMs = startMs;
+  }
+
+  let category = "prospect";
+  let daysSinceLastVisit = null;
+
+  if (attendedVisits > 0 && lastVisitMs !== null) {
+    const diff = getSantiagoDayDiff(new Date(lastVisitMs), now);
+    daysSinceLastVisit = Math.max(0, diff === null ? 0 : diff);
+
+    if (daysSinceLastVisit > thresholds.at_risk_days) category = "inactive";
+    else if (daysSinceLastVisit > thresholds.recent_days) category = "at_risk";
+    else if (attendedVisits === 1) category = "new";
+    else category = "active";
+  }
+
+  let reason;
+  if (category === "prospect") {
+    if (nextAppointmentMs !== null) {
+      reason = `Primera cita agendada para el ${formatDayMonthCL(new Date(nextAppointmentMs))}`;
+    } else if (canceledCount > 0 && noShowCount === 0 && rescheduledCount === 0) {
+      reason = canceledCount === 1 ? "Canceló su primera cita" : `Canceló sus ${canceledCount} citas`;
+    } else if (noShowCount > 0 && canceledCount === 0 && rescheduledCount === 0) {
+      reason = noShowCount === 1 ? "No asistió a su primera cita" : "No asistió a sus citas";
+    } else if (canceledCount + noShowCount + rescheduledCount + unconfirmedCount > 0) {
+      reason = "Todavía no ha asistido a ninguna cita";
+    } else {
+      reason = "Todavía no tiene citas";
+    }
+  } else if (category === "new") {
+    reason = `Vino 1 vez, ${describeDaysAgo(daysSinceLastVisit)}`;
+  } else if (category === "active") {
+    reason = `Vino ${attendedVisits} veces, la última ${describeDaysAgo(daysSinceLastVisit)}`;
+  } else {
+    reason = `Última visita ${describeDaysAgo(daysSinceLastVisit)}`;
+  }
+
+  return {
+    category,
+    category_label: CUSTOMER_CATEGORY_LABELS[category],
+    reason,
+    attended_visits: attendedVisits,
+    last_visit_at: lastVisitMs !== null ? new Date(lastVisitMs).toISOString() : null,
+    days_since_last_visit: daysSinceLastVisit,
+    no_show_count: noShowCount,
+    canceled_count: canceledCount,
+    completed_count: completedCount,
+    next_appointment_at: nextAppointmentMs !== null ? new Date(nextAppointmentMs).toISOString() : null,
+    appointments_count: (appointments || []).length,
+  };
+}
+
+// Lee todas las filas de una consulta paginando de a 1000 (Supabase corta en
+// 1000 filas por request sin avisar).
+async function fetchAllPages(buildQuery, { pageSize = 1000, maxRows = 20000 } = {}) {
+  const rows = [];
+  for (let from = 0; from < maxRows; from += pageSize) {
+    const { data, error } = await buildQuery().range(from, from + pageSize - 1);
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+    rows.push(...data);
+    if (data.length < pageSize) break;
+  }
+  return rows;
+}
+
+// Clasifica a varios clientes de un negocio de una vez. Devuelve
+// Map(customer_id -> resultado de classifyCustomerFromAppointments).
+// `branchId` (opcional) limita las citas consideradas a esa sucursal, igual
+// que ya hacía el listado de clientes con branch_id.
+async function getCustomerCategoryMap({ tenantId, customerIds, branchId = null, now = new Date(), tenant = null }) {
+  const thresholds = getCustomerCategoryThresholds(tenant);
+  const ids = Array.from(new Set((customerIds || []).filter(Boolean)));
+  const apptsByCustomer = new Map();
+  const CHUNK_SIZE = 150;
+  const PARALLEL_CHUNKS = 4;
+
+  const chunks = [];
+  for (let i = 0; i < ids.length; i += CHUNK_SIZE) chunks.push(ids.slice(i, i + CHUNK_SIZE));
+
+  for (let i = 0; i < chunks.length; i += PARALLEL_CHUNKS) {
+    const batch = chunks.slice(i, i + PARALLEL_CHUNKS);
+    const batchRows = await Promise.all(
+      batch.map((chunk) =>
+        fetchAllPages(() => {
+          let q = supabase
+            .from("appointments")
+            .select("id, customer_id, start_at, status, deposit_status")
+            .eq("tenant_id", tenantId)
+            .in("customer_id", chunk)
+            .order("start_at", { ascending: true })
+            .order("id", { ascending: true });
+          if (branchId) q = q.eq("branch_id", branchId);
+          return q;
+        })
+      )
+    );
+    for (const rows of batchRows) {
+      for (const row of rows) {
+        if (!row.customer_id) continue;
+        const list = apptsByCustomer.get(row.customer_id);
+        if (list) list.push(row);
+        else apptsByCustomer.set(row.customer_id, [row]);
+      }
+    }
+  }
+
+  const result = new Map();
+  for (const id of ids) {
+    result.set(id, classifyCustomerFromAppointments(apptsByCustomer.get(id) || [], { now, thresholds }));
+  }
+  return result;
+}
+
+// Campos que se agregan a cada cliente en las respuestas de la API. Se
+// conservan `segment`, `total_visits`, `last_visit_at` e `is_inactive` (ahora
+// con los valores nuevos) para no romper el contrato con el frontend.
+function toCustomerCategoryFields(summary) {
+  return {
+    segment: summary.category,
+    category: summary.category,
+    category_label: summary.category_label,
+    category_reason: summary.reason,
+    attended_visits: summary.attended_visits,
+    total_visits: summary.attended_visits,
+    last_visit_at: summary.last_visit_at,
+    days_since_last_visit: summary.days_since_last_visit,
+    no_show_count: summary.no_show_count,
+    next_appointment_at: summary.next_appointment_at,
+    is_inactive: summary.category === "inactive",
+  };
+}
+
+// Filtro de audiencia compartido (listado, Campañas, Indicadores):
+// categoría y/o "al menos N días sin venir". Los prospectos no tienen visita
+// asistida, así que nunca calzan con el filtro por días.
+function matchesCustomerAudienceFilter(summary, { category = null, minDaysWithoutVisit = null } = {}) {
+  if (category && summary.category !== category) return false;
+  if (minDaysWithoutVisit !== null) {
+    if (summary.days_since_last_visit === null || summary.days_since_last_visit === undefined) return false;
+    if (summary.days_since_last_visit < minDaysWithoutVisit) return false;
+  }
+  return true;
+}
+
+const CUSTOMER_SORT_KEYS = ["oldest", "recent", "most_visits", "least_visits"];
+
+// Ordena una lista de clientes ya enriquecidos (last_visit_at/total_visits
+// son los de visitas asistidas). Los sin visita van al final en
+// oldest/recent para que "los más antiguos" no sean los prospectos.
+function sortCustomersByAudienceSort(list, sortKey) {
+  const ts = (c) => (c.last_visit_at ? new Date(c.last_visit_at).getTime() : null);
+  const visits = (c) => Number(c.total_visits || 0);
+  const cmpNullLast = (a, b, dir) => {
+    const ta = ts(a);
+    const tb = ts(b);
+    if (ta === null && tb === null) return 0;
+    if (ta === null) return 1;
+    if (tb === null) return -1;
+    return dir * (ta - tb);
+  };
+  if (sortKey === "oldest") return list.sort((a, b) => cmpNullLast(a, b, 1));
+  if (sortKey === "recent") return list.sort((a, b) => cmpNullLast(a, b, -1));
+  if (sortKey === "most_visits") return list.sort((a, b) => visits(b) - visits(a));
+  if (sortKey === "least_visits") return list.sort((a, b) => visits(a) - visits(b));
+  return list;
+}
+
 async function upsertCustomerFromAppointment({
   tenant_id,
   customer_name,
@@ -8203,22 +8528,9 @@ function getStatsPlanLevel(planSlug) {
   return STATS_PLAN_LEVEL[normalized] || STATS_PLAN_LEVEL.starter;
 }
 
-// Mismo criterio de segmentación que getCustomerSegment (GET /customers/:slug
-// y GET /admin/tenants/:id, ambos con su propia copia inline) — factorizado
-// acá para no duplicarlo una tercera vez, sin tocar esos dos endpoints
-// existentes. inactive: sin visitas o última visita antes del corte;
-// frequent: >=5 visitas; recurrent: >=2; si no, new.
-function classifyCustomerActivity(totalVisits, lastVisitAt, inactiveCutoff) {
-  const lastVisit = lastVisitAt ? new Date(lastVisitAt) : null;
-  const isInactive =
-    !lastVisit || Number.isNaN(lastVisit.getTime())
-      ? true
-      : lastVisit.getTime() <= inactiveCutoff.getTime();
-  if (isInactive) return "inactive";
-  if (totalVisits >= 5) return "frequent";
-  if (totalVisits >= 2) return "recurrent";
-  return "new";
-}
+// La categorización de clientes (prospecto/nuevo/activo/en riesgo/inactivo)
+// vive en getCustomerCategoryMap (arriba, junto a recalculateCustomerStats):
+// /stats, /customers/:slug y /campaigns/* usan esa única función.
 
 /* ======================================================
    📊 GET /stats/:slug
@@ -8340,72 +8652,57 @@ app.get("/stats/:slug", tenantAuthSlug, requireModuleReadAccess("indicadores"), 
       .lte("created_at", toIso);
     if (customersNewError) throw customersNewError;
 
-    const { data: customerRows, error: customerRowsError } = await supabase
-      .from("customers")
-      .select("id, name, email, phone, total_visits, last_visit_at")
-      .eq("tenant_id", tenant.id)
-      .order("total_visits", { ascending: false })
-      .limit(500);
-    if (customerRowsError) throw customerRowsError;
+    // Categorización de clientes: MISMA función que usan el listado de
+    // clientes y Campañas (getCustomerCategoryMap), basada en visitas
+    // ASISTIDAS (no en las columnas cacheadas customers.total_visits /
+    // last_visit_at). Con branch_id solo se consideran las citas de esa
+    // sucursal y los clientes sin citas ahí quedan fuera, igual que en el
+    // listado.
+    const allCustomerRows = await fetchAllPages(() =>
+      supabase
+        .from("customers")
+        .select("id, name, email, phone")
+        .eq("tenant_id", tenant.id)
+        .order("id", { ascending: true })
+    );
 
-    // Corte de inactividad configurable desde el panel (30/60/90/personalizado)
-    // — antes fijo en 60, mismo default que getCustomerSegment (GET
-    // /customers/:slug) cuando no viene el parámetro. Clamp 1-365 para
-    // evitar valores absurdos desde el query string.
-    const inactiveDays = Math.max(1, Math.min(365, Number(inactive_days) || 60));
-    const inactiveCutoff = new Date(now.getTime() - inactiveDays * 24 * 60 * 60 * 1000);
+    const categoryMap = await getCustomerCategoryMap({
+      tenantId: tenant.id,
+      customerIds: allCustomerRows.map((c) => c.id),
+      branchId: resolvedBranchId,
+      now,
+      tenant,
+    });
 
-    const classifiedCustomers = (customerRows || []).map((c) => ({
-      ...c,
-      segment: classifyCustomerActivity(Number(c.total_visits || 0), c.last_visit_at, inactiveCutoff),
-    }));
+    const classifiedCustomers = allCustomerRows
+      .map((c) => ({ row: c, summary: categoryMap.get(c.id) }))
+      .filter(({ summary }) => summary && (!resolvedBranchId || summary.appointments_count > 0))
+      .map(({ row, summary }) => ({ ...row, ...toCustomerCategoryFields(summary) }));
 
+    const customerCategoryCounts = { prospect: 0, new: 0, active: 0, at_risk: 0, inactive: 0 };
+    for (const c of classifiedCustomers) customerCategoryCounts[c.category]++;
+
+    // "Días sin venir": cuántos días desde la última visita ASISTIDA. Los
+    // prospectos (0 visitas) nunca aparecen acá. Clamp 1-365 por el query
+    // string; default 60 = fin de la ventana "Activo/Nuevo".
+    const inactiveDays = Math.max(
+      1,
+      Math.min(365, Number(inactive_days) || CUSTOMER_CATEGORY_DEFAULT_THRESHOLDS.recent_days)
+    );
+
+    // Más activos: clientes nuevos y activos (visita en los últimos 60 días),
+    // los de más visitas primero.
     const activeCustomers = classifiedCustomers
-      .filter((c) => c.segment !== "inactive")
-      .sort((a, b) => Number(b.total_visits || 0) - Number(a.total_visits || 0))
+      .filter((c) => c.category === "new" || c.category === "active")
+      .sort(
+        (a, b) =>
+          b.attended_visits - a.attended_visits ||
+          new Date(b.last_visit_at || 0).getTime() - new Date(a.last_visit_at || 0).getTime()
+      )
       .slice(0, 15);
 
-    // "Inactivos" debe basarse en la ÚLTIMA VISITA COMPLETADA, no en
-    // customers.last_visit_at (que se actualiza con cualquier reserva no
-    // cancelada — ver recalculateCustomerStats — incluyendo no-show/booked/
-    // rescheduled). Con el criterio viejo, un cliente que solo tuvo
-    // reservas canceladas/no-show y NUNCA asistió terminaba mostrándose
-    // como "inactivo" cuando en realidad nunca fue un cliente activo. Se
-    // recalcula acá con datos reales de citas completadas, independiente
-    // de `segment` (que solo se usa arriba para "activos").
-    const customerIdsForStats = (customerRows || []).map((c) => c.id);
-    const completedByCustomer = new Map();
-    if (customerIdsForStats.length > 0) {
-      const { data: completedRows, error: completedRowsError } = await supabase
-        .from("appointments")
-        .select("customer_id, start_at")
-        .eq("tenant_id", tenant.id)
-        .eq("status", "completed")
-        .in("customer_id", customerIdsForStats);
-      if (completedRowsError) throw completedRowsError;
-      for (const row of completedRows || []) {
-        if (!row.customer_id) continue;
-        const startAtMs = row.start_at ? new Date(row.start_at).getTime() : 0;
-        const prev = completedByCustomer.get(row.customer_id);
-        if (prev) {
-          prev.count += 1;
-          if (startAtMs > prev.lastCompletedAt) prev.lastCompletedAt = startAtMs;
-        } else {
-          completedByCustomer.set(row.customer_id, { count: 1, lastCompletedAt: startAtMs });
-        }
-      }
-    }
-
     const inactiveCustomers = classifiedCustomers
-      .map((c) => {
-        const completed = completedByCustomer.get(c.id);
-        // Sin ninguna visita completada: no es "inactivo", es un caso
-        // distinto (reservó pero nunca asistió) — se excluye de esta lista.
-        if (!completed || completed.count === 0) return null;
-        if (completed.lastCompletedAt > inactiveCutoff.getTime()) return null;
-        return { ...c, total_visits: completed.count, last_visit_at: new Date(completed.lastCompletedAt).toISOString() };
-      })
-      .filter((c) => c !== null)
+      .filter((c) => matchesCustomerAudienceFilter(c, { minDaysWithoutVisit: inactiveDays }))
       .sort((a, b) => new Date(b.last_visit_at).getTime() - new Date(a.last_visit_at).getTime())
       .slice(0, 15);
 
@@ -8473,6 +8770,10 @@ app.get("/stats/:slug", tenantAuthSlug, requireModuleReadAccess("indicadores"), 
         cancellation_rate: Number((cancellationRate * 100).toFixed(1)),
       },
       customers: { total: customersTotal || 0, new_in_period: customersNew || 0 },
+      // Conteo por categoría (prospect/new/active/at_risk/inactive): mismo
+      // cálculo que el listado de clientes y Campañas.
+      customer_categories: customerCategoryCounts,
+      customer_category_thresholds: getCustomerCategoryThresholds(tenant),
       customer_ranking: {
         active: activeCustomers,
         inactive: inactiveCustomers,
@@ -9316,7 +9617,7 @@ function normalizeCampaignError(error) {
 app.get("/customers/:slug", tenantAuthSlug, requireModuleReadAccess("clientes", "campanas"), async (req, res) => {
   try {
     const { slug } = req.params;
-    const { q, segment, inactive_days, branch_id } = req.query;
+    const { q, segment, days_without_visit, branch_id, sort, limit } = req.query;
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
@@ -9333,8 +9634,19 @@ app.get("/customers/:slug", tenantAuthSlug, requireModuleReadAccess("clientes", 
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    const normalizedSegment = String(segment || "").trim().toLowerCase();
-    const inactiveDays = Math.max(1, Number(inactive_days || 60));
+    // Una sola categorización para todo (ver getCustomerCategoryMap).
+    // `segment` = categoría (prospect|new|active|at_risk|inactive);
+    // `days_without_visit` = mínimo de días desde la última visita ASISTIDA
+    // (excluye prospectos). Ambos filtros conviven. El parámetro antiguo
+    // `inactive_days` ya no se usa.
+    const normalizedSegment = normalizeCustomerCategoryKey(segment);
+    const minDaysWithoutVisit = parseMinDaysWithoutVisit(days_without_visit);
+    const normalizedSort = CUSTOMER_SORT_KEYS.includes(String(sort || "").trim().toLowerCase())
+      ? String(sort).trim().toLowerCase()
+      : null;
+    // Tope de filas devueltas (el `total` y el `summary` siempre son reales).
+    // Campañas pide más porque necesita toda la audiencia.
+    const rowLimit = Math.max(1, Math.min(2000, Math.floor(Number(limit)) || 300));
 
     let resolvedBranchId = null;
     if (branch_id) {
@@ -9350,132 +9662,53 @@ app.get("/customers/:slug", tenantAuthSlug, requireModuleReadAccess("clientes", 
       }
     }
 
-    let query = supabase
-      .from("customers")
-      .select("*")
-      .eq("tenant_id", tenant.id)
-      .order("updated_at", { ascending: false })
-      .limit(300);
+    const searchTerm =
+      q && String(q).trim().length >= 2 ? String(q).trim().replace(/[%(),]/g, "") : "";
 
-    if (q && String(q).trim().length >= 2) {
-      const search = String(q).trim().replace(/[%(),]/g, "");
-
-      query = query.or(
-        `name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`
-      );
-    }
-
-    const { data, error } = await query;
-
-    if (error) throw error;
-
-    let rows = Array.isArray(data) ? data : [];
-    let customerIds = rows.map((customer) => customer.id).filter(Boolean);
-    const activityByCustomer = new Map();
-    // Usado por el botón "Pedir reseña" del dashboard (link wa.me manual, sin
-    // Twilio): solo debe mostrarse para clientes con >=1 cita 'completed',
-    // no simplemente total_visits > 0 (eso incluye booked/no_show/rescheduled).
-    const completedVisitByCustomer = new Set();
-
-    if (customerIds.length > 0) {
-      let activityQuery = supabase
-        .from("appointments")
-        .select("customer_id, start_at, status")
+    const customerRows = await fetchAllPages(() => {
+      let query = supabase
+        .from("customers")
+        .select("*")
         .eq("tenant_id", tenant.id)
-        .in("customer_id", customerIds);
+        .order("updated_at", { ascending: false })
+        .order("id", { ascending: true });
 
-      if (resolvedBranchId) {
-        activityQuery = activityQuery.eq("branch_id", resolvedBranchId);
+      if (searchTerm) {
+        query = query.or(
+          `name.ilike.%${searchTerm}%,email.ilike.%${searchTerm}%,phone.ilike.%${searchTerm}%`
+        );
       }
 
-      const { data: activityRows, error: activityError } = await activityQuery;
+      return query;
+    });
 
-      if (activityError) throw activityError;
+    const now = new Date();
+    const categoryMap = await getCustomerCategoryMap({
+      tenantId: tenant.id,
+      customerIds: customerRows.map((customer) => customer.id),
+      branchId: resolvedBranchId,
+      now,
+      tenant,
+    });
 
-      for (const appt of activityRows || []) {
-        const customerId = appt.customer_id;
-        if (!customerId) continue;
+    // Con sucursal activa, el listado solo muestra clientes con alguna cita
+    // en esa sucursal (mismo comportamiento de antes).
+    const rows = resolvedBranchId
+      ? customerRows.filter((customer) => (categoryMap.get(customer.id)?.appointments_count || 0) > 0)
+      : customerRows;
 
-        const current =
-          activityByCustomer.get(customerId) || {
-            total_visits: 0,
-            last_visit_at: null,
-          };
-
-        const status = String(appt.status || "").toLowerCase();
-        const isCanceled = ["canceled", "cancelled"].includes(status);
-
-        if (status === "completed") {
-          completedVisitByCustomer.add(customerId);
-        }
-
-        if (!isCanceled) {
-          current.total_visits += 1;
-
-          if (
-            appt.start_at &&
-            (!current.last_visit_at ||
-              new Date(appt.start_at).getTime() >
-                new Date(current.last_visit_at).getTime())
-          ) {
-            current.last_visit_at = appt.start_at;
-          }
-        }
-
-        activityByCustomer.set(customerId, current);
-      }
-
-      if (resolvedBranchId) {
-        rows = rows.filter((customer) => activityByCustomer.has(customer.id));
-        customerIds = rows.map((customer) => customer.id).filter(Boolean);
-      }
-    }
-
-    // Usado por el botón "Pedir reseña" del dashboard: si el cliente ya
-    // tiene una fila en `reviews` (upsert único por tenant_id+customer_id),
-    // el botón se reemplaza por un indicador "Ya reseñó" en vez de dejarlo
-    // clickeable de nuevo.
+    // Clientes ya reseñados (botón "Pedir reseña" → "Ya reseñó"). Una sola
+    // consulta por negocio (la tabla es chica: 1 fila por cliente reseñador).
     const reviewedCustomerIds = new Set();
-    if (customerIds.length > 0) {
-      const { data: reviewRows, error: reviewsError } = await supabase
+    const reviewRows = await fetchAllPages(() =>
+      supabase
         .from("reviews")
         .select("customer_id")
         .eq("tenant_id", tenant.id)
-        .in("customer_id", customerIds);
-
-      if (reviewsError) throw reviewsError;
-
-      for (const review of reviewRows || []) {
-        if (review.customer_id) reviewedCustomerIds.add(review.customer_id);
-      }
-    }
-
-    const now = new Date();
-    const inactiveCutoff = new Date(
-      now.getTime() - inactiveDays * 24 * 60 * 60 * 1000
+        .order("customer_id", { ascending: true })
     );
-
-    function getCustomerSegment(customer) {
-      const activity = activityByCustomer.get(customer.id);
-      const totalVisits = resolvedBranchId
-        ? Number(activity?.total_visits || 0)
-        : Number(customer.total_visits || 0);
-      const lastVisitValue = resolvedBranchId
-        ? activity?.last_visit_at || null
-        : customer.last_visit_at;
-      const lastVisitAt = lastVisitValue
-        ? new Date(lastVisitValue)
-        : null;
-
-const isInactive =
-  !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
-    ? true
-    : lastVisitAt.getTime() <= inactiveCutoff.getTime();
-
-      if (isInactive) return "inactive";
-      if (totalVisits >= 5) return "frequent";
-      if (totalVisits >= 2) return "recurrent";
-      return "new";
+    for (const review of reviewRows) {
+      if (review.customer_id) reviewedCustomerIds.add(review.customer_id);
     }
 
     // Emails dados de baja de los correos de campaña de este negocio (I13):
@@ -9496,22 +9729,14 @@ const isInactive =
     }
 
     const enrichedCustomers = rows.map((customer) => {
-      const activity = activityByCustomer.get(customer.id);
-      const activityTotalVisits = resolvedBranchId
-        ? Number(activity?.total_visits || 0)
-        : Number(customer.total_visits || 0);
-      const activityLastVisitAt = resolvedBranchId
-        ? activity?.last_visit_at || null
-        : customer.last_visit_at;
-      const customerSegment = getCustomerSegment(customer);
+      const summary = categoryMap.get(customer.id);
 
       return {
         ...customer,
-        total_visits: activityTotalVisits,
-        last_visit_at: activityLastVisitAt,
-        segment: customerSegment,
-        is_inactive: customerSegment === "inactive",
-        has_completed_visit: completedVisitByCustomer.has(customer.id),
+        ...toCustomerCategoryFields(summary),
+        // "Pedir reseña": solo con >=1 cita 'completed' (no basta una visita
+        // asistida por hora pasada sin marcar).
+        has_completed_visit: summary.completed_count > 0,
         has_review: reviewedCustomerIds.has(customer.id),
         marketing_opt_out: customer.email
           ? optedOutEmails.has(String(customer.email).trim().toLowerCase())
@@ -9519,29 +9744,40 @@ const isInactive =
       };
     });
 
-    const filteredCustomers =
-      normalizedSegment && ["new", "recurrent", "frequent", "inactive"].includes(normalizedSegment)
-        ? enrichedCustomers.filter(
-            (customer) => customer.segment === normalizedSegment
-          )
-        : enrichedCustomers;
+    const filteredCustomers = enrichedCustomers.filter((customer) =>
+      matchesCustomerAudienceFilter(customer, {
+        category: normalizedSegment,
+        minDaysWithoutVisit,
+      })
+    );
+
+    if (normalizedSort) sortCustomersByAudienceSort(filteredCustomers, normalizedSort);
+
+    const countByCategory = { prospect: 0, new: 0, active: 0, at_risk: 0, inactive: 0 };
+    for (const customer of enrichedCustomers) countByCategory[customer.category]++;
 
     const summary = {
       total: enrichedCustomers.length,
-      nuevos: enrichedCustomers.filter((c) => c.segment === "new").length,
-      recurrentes: enrichedCustomers.filter((c) => c.segment === "recurrent").length,
-      frecuentes: enrichedCustomers.filter((c) => c.segment === "frequent").length,
-      inactivos: enrichedCustomers.filter((c) => c.segment === "inactive").length,
+      prospectos: countByCategory.prospect,
+      nuevos: countByCategory.new,
+      activos: countByCategory.active,
+      en_riesgo: countByCategory.at_risk,
+      inactivos: countByCategory.inactive,
     };
 
     return res.json({
       total: filteredCustomers.length,
-      customers: filteredCustomers,
+      customers: filteredCustomers.slice(0, rowLimit),
+      truncated: filteredCustomers.length > rowLimit,
       summary,
+      // Umbrales vigentes (días) para que el frontend arme los textos sin
+      // duplicar los números.
+      thresholds: getCustomerCategoryThresholds(tenant),
       filters: {
         q: q ? String(q) : "",
-        segment: normalizedSegment || null,
-        inactive_days: inactiveDays,
+        segment: normalizedSegment,
+        days_without_visit: minDaysWithoutVisit,
+        sort: normalizedSort,
         branch_id: resolvedBranchId,
       },
     });
@@ -10767,6 +11003,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
       channel = "email",
       segment,
       inactive_days = 60,
+      days_without_visit = null,
       subject,
       message,
       message_html = "",
@@ -10816,7 +11053,16 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
     }
 
     const normalizedChannel = String(channel).trim().toLowerCase();
-    const normalizedSegment = String(segment).trim().toLowerCase();
+    // Categoría de cliente (ver getCustomerCategoryMap). Acepta los valores
+    // antiguos recurrent/frequent como "active" por si llegan de un frontend
+    // cacheado.
+    const normalizedSegment = normalizeCustomerCategoryKey(segment);
+    // Filtro opcional "al menos N días sin venir" (desde la última visita
+    // asistida); convive con la categoría. Solo lo usa la rama sin audiencia
+    // curada: con audiencia curada el frontend ya filtró por lo mismo.
+    const minDaysWithoutVisit = parseMinDaysWithoutVisit(days_without_visit);
+    // Se guarda en campaign_history.inactive_days (columna existente, solo
+    // informativa).
     const inactiveDays = Math.max(1, Number(inactive_days || 60));
     const requestedLimit = Math.max(1, Number(limit || 50));
     const normalizedSort = String(sort || "oldest").trim().toLowerCase();
@@ -10827,9 +11073,9 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
       });
     }
 
-    if (!["new", "recurrent", "frequent", "inactive"].includes(normalizedSegment)) {
+    if (!normalizedSegment) {
       return res.status(400).json({
-        error: "segment inválido. Usa: new, recurrent, frequent o inactive",
+        error: "segment inválido. Usa: prospect, new, active, at_risk o inactive",
       });
     }
 
@@ -10873,59 +11119,6 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
     function isValidEmail(value) {
       const email = normalizeEmail(value);
       return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-    }
-
-    function getCustomerSegment(customer) {
-      const totalVisits = Number(customer.total_visits || 0);
-      const lastVisitAt = customer.last_visit_at
-        ? new Date(customer.last_visit_at)
-        : null;
-
-      const inactiveCutoff = new Date(
-        Date.now() - inactiveDays * 24 * 60 * 60 * 1000
-      );
-
-      const isInactive =
-        !lastVisitAt || Number.isNaN(lastVisitAt.getTime())
-          ? true
-          : lastVisitAt.getTime() <= inactiveCutoff.getTime();
-
-      if (isInactive) return "inactive";
-      if (totalVisits >= 5) return "frequent";
-      if (totalVisits >= 2) return "recurrent";
-      return "new";
-    }
-
-    function sortCustomers(list) {
-      if (normalizedSort === "oldest") {
-        return list.sort((a, b) => {
-          const aDate = new Date(a.last_visit_at || 0).getTime();
-          const bDate = new Date(b.last_visit_at || 0).getTime();
-          return aDate - bDate;
-        });
-      }
-
-      if (normalizedSort === "recent") {
-        return list.sort((a, b) => {
-          const aDate = new Date(a.last_visit_at || 0).getTime();
-          const bDate = new Date(b.last_visit_at || 0).getTime();
-          return bDate - aDate;
-        });
-      }
-
-      if (normalizedSort === "most_visits") {
-        return list.sort(
-          (a, b) => Number(b.total_visits || 0) - Number(a.total_visits || 0)
-        );
-      }
-
-      if (normalizedSort === "least_visits") {
-        return list.sort(
-          (a, b) => Number(a.total_visits || 0) - Number(b.total_visits || 0)
-        );
-      }
-
-      return list;
     }
 
     const hasCuratedAudience =
@@ -11148,25 +11341,36 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
 
     const appliedLimit = Math.min(requestedLimit, planLimit);
 
-    const { data: customers, error: customersError } = await supabase
-      .from("customers")
-      .select("*")
-      .eq("tenant_id", tenant.id)
-      .order("updated_at", { ascending: false })
-      .limit(1000);
+    // Misma categorización que el listado de clientes (visitas ASISTIDAS).
+    const rows = await fetchAllPages(() =>
+      supabase
+        .from("customers")
+        .select("*")
+        .eq("tenant_id", tenant.id)
+        .order("updated_at", { ascending: false })
+        .order("id", { ascending: true })
+    );
 
-    if (customersError) {
-      throw customersError;
-    }
-
-    const rows = Array.isArray(customers) ? customers : [];
-
-    const audience = rows.filter((customer) => {
-      const customerSegment = getCustomerSegment(customer);
-      return customerSegment === normalizedSegment;
+    const audienceCategoryMap = await getCustomerCategoryMap({
+      tenantId: tenant.id,
+      customerIds: rows.map((customer) => customer.id),
+      now: new Date(),
+      tenant,
     });
 
-    const sortedAudience = sortCustomers([...audience]);
+    const audience = rows
+      .map((customer) => ({
+        ...customer,
+        ...toCustomerCategoryFields(audienceCategoryMap.get(customer.id)),
+      }))
+      .filter((customer) =>
+        matchesCustomerAudienceFilter(customer, {
+          category: normalizedSegment,
+          minDaysWithoutVisit,
+        })
+      );
+
+    const sortedAudience = sortCustomersByAudienceSort([...audience], normalizedSort);
     const limitedAudience = sortedAudience.slice(0, appliedLimit);
 
     const audienceWithEmail = limitedAudience.filter(
@@ -11389,13 +11593,13 @@ app.post("/campaigns/send-whatsapp", tenantAuthSlugWrite, async (req, res) => {
       return res.status(400).json({ error: "segment es obligatorio" });
     }
 
-    const normalizedSegment = String(segment).trim().toLowerCase();
+    const normalizedSegment = normalizeCustomerCategoryKey(segment);
     const normalizedSort = String(sort || "oldest").trim().toLowerCase();
     const normalizedPlan = normalizePlanSlug(plan || "starter");
 
-    if (!["new", "recurrent", "frequent", "inactive"].includes(normalizedSegment)) {
+    if (!normalizedSegment) {
       return res.status(400).json({
-        error: "segment inválido. Usa: new, recurrent, frequent o inactive",
+        error: "segment inválido. Usa: prospect, new, active, at_risk o inactive",
       });
     }
 

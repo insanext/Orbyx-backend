@@ -248,6 +248,33 @@ Report: `ORBYX_AUDIT_SESION3_DINERO_PLAN_ADMIN.md` (untracked, repo root).
   - Trial reminder emails stop 14 days after expiry.
   - `/admin/planes` warns that plan price edits don't affect charges.
 
+## Middleware (orbyx-web, 2026-10-02)
+
+Motivo: el 2026-10-02 `/login` cayó con 504 `MIDDLEWARE_INVOCATION_TIMEOUT` porque el middleware esperaba a Supabase sin timeout. El inicio de sesión no puede depender de que Supabase responda rápido.
+
+- `orbyx-web/middleware.ts` **no hace queries a tablas**. Solo `auth.getClaims()` (verifica la firma del JWT localmente con JWKS cacheado, sin red salvo refresh/primera descarga de JWKS) + timeout de 3s en todo fetch (`AbortSignal.timeout`) y un `Promise.race` de respaldo. Responde únicamente "¿hay sesión válida?".
+- Matcher: solo `/dashboard/:path*` y `/admin/:path*`. `/login` quedó **fuera** (el form ya resuelve la sesión activa en `resolveTenantDestination`).
+- Sin sesión → `/login?redirectTo=...` (o `/admin/login`). Si falló por timeout/red → además `reason=timeout` (el login muestra aviso).
+- El middleware inyecta el header interno `x-orbyx-pathname` para que el template sepa la ruta.
+- **La lógica de tenant/billing vive en `app/dashboard/[slug]/template.tsx`** (server component) + `lib/dashboard-access.ts`: tenant por slug, pertenencia en `tenant_users`, bloqueo trial/pago/pausa (redirige a `/billing`, que está exento). Mismos redirects que antes (`/login?error=no_access`, `/dashboard/{slug}/billing`). Es `template` y no `layout` porque se re-ejecuta en cada navegación (el layout es client component de 2600 líneas y no re-chequea). Si las queries fallan o tardan >5s → `components/AccessCheckError.tsx` (pantalla con "Reintentar" = `router.refresh()`), nunca 500 ni loop de redirects.
+- La fórmula de bloqueo existe en `computeBillingAccessState` (server.js) y en `lib/dashboard-access.ts` — mantener iguales.
+- `/admin`: el middleware solo chequeaba sesión (la autorización admin/MFA la hace el backend desde `app/admin/layout.tsx`), no había queries que mover.
+- Requisito de Supabase: getClaims verifica localmente solo con JWT Signing Keys asimétricas; con secret HS256 legacy cae a `getUser()` (red).
+
+## Customer Categories (2026-10-12)
+
+One model, one function, used by the customer list/profile, Campaigns and Indicadores. Never re-implement it in an endpoint or in the frontend.
+
+- **Source of truth**: `getCustomerCategoryMap({ tenantId, customerIds, branchId, now, tenant })` in `server.js` (next to `recalculateCustomerStats`), built on the pure `classifyCustomerFromAppointments`. Thresholds live only in `CUSTOMER_CATEGORY_DEFAULT_THRESHOLDS` (`recent_days: 60`, `at_risk_days: 120`) behind `getCustomerCategoryThresholds(tenant)` — the future per-tenant config goes there, nothing else changes.
+- **Attended visit** = `completed`, or `booked` whose `start_at` already passed (not marked canceled/no_show) and without a pending deposit. `canceled`, `no_show`, `rescheduled` and future appointments never count. Computed from `appointments`, **not** from the cached `customers.total_visits`/`last_visit_at` (those count any non-canceled appointment and are no longer read for categorization; `recalculateCustomerStats` still writes them).
+- **Categories** (exclusive, in order): `prospect` (0 attended visits) → `new` (1 visit, last <= 60d) → `active` (2+ visits, last <= 60d) → `at_risk` (last 61–120d) → `inactive` (last > 120d). Days are Santiago calendar days. No-shows are a separate field (`no_show_count`), not a category.
+- **Per-customer fields** returned by `GET /customers/:slug`: `category`, `category_label`, `category_reason` (plain-Spanish "motivo"), `attended_visits`, `last_visit_at` (last *attended*), `days_since_last_visit`, `no_show_count`, `next_appointment_at`, `completed_count` is internal (drives `has_completed_visit`). Legacy keys `segment`, `total_visits`, `last_visit_at`, `is_inactive` are kept with the new values. Response also has `thresholds`, `summary` (`prospectos/nuevos/activos/en_riesgo/inactivos`), `total` (real filtered count) and `truncated` (rows capped by `limit`, default 300, max 2000).
+- **Filters** (same helper `matchesCustomerAudienceFilter` everywhere): `segment` = category, `days_without_visit` = at least N days since last attended visit (prospects never match). They combine. The old `inactive_days` param is ignored by `/customers/:slug`; `/stats/:slug` keeps `inactive_days` as the "days without visiting" cut-off for its list. Optional `sort` (`oldest|recent|most_visits|least_visits`) — before this, Campaigns' "Prioridad de envío" had no effect on the curated audience.
+- **Campaigns**: `POST /campaigns/send-email` and `/send-whatsapp` accept the 5 category keys (`recurrent`/`frequent` are mapped to `active` for stale clients); new optional body field `days_without_visit`. `campaign_history.segment` now stores the new keys (old rows keep `recurrent`/`frequent`; the UI labels both). The wizard shows "Con este filtro calzan N clientes" before sending.
+- **Indicadores**: `GET /stats/:slug` adds `basic.customer_categories` (counts) and `basic.customer_category_thresholds`; the ranking lists use the same map (and are branch-aware when `branch_id` is sent: only customers with appointments in that branch).
+- **Frontend**: `orbyx-web/lib/customer-categories.ts` holds presentation only (labels, descriptions, days options). It does not classify anything.
+- **Known caveat**: `campaign_history.segment` was never constrained in any repo migration, but the original table DDL isn't in the repo — if prod has a CHECK on it, new keys would fail the history insert (see the report for the verification query).
+
 ## Business Categories
 
 Known categories:
