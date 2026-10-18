@@ -8,6 +8,7 @@ const { createClient } = require("@supabase/supabase-js");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
+const { ipKeyGenerator } = require("express-rate-limit");
 const { google } = require("googleapis");
 const crypto = require("crypto");
 const PDFDocument = require("pdfkit");
@@ -1949,12 +1950,124 @@ app.use((req, res, next) => {
   next();
 });
 
+// IP real del cliente en las rutas públicas.
+// El navegador no le habla directo al backend en la mayoría de las rutas
+// públicas: pasa por rutas /api de Next (Vercel), así que para el backend
+// todas las solicitudes llegaban con la IP de Vercel y los límites por IP
+// eran un solo cupo compartido por todo el mundo. La ruta Next ahora manda
+// la IP real (la fija Vercel en el borde) en x-orbyx-client-ip, junto con
+// un secreto compartido (x-orbyx-proxy-secret = ORBYX_PROXY_SECRET). Solo
+// se confía en esa IP si el secreto coincide (comparación en tiempo
+// constante); en cualquier otro caso se usa req.ip. Sin ORBYX_PROXY_SECRET
+// en el entorno, todo funciona como antes (con un warning, una sola vez).
+let warnedMissingProxySecret = false;
+
+function safeEqualStrings(a, b) {
+  const ha = crypto.createHash("sha256").update(String(a)).digest();
+  const hb = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+function getClientIp(req) {
+  const fallbackIp = req.ip || req.socket?.remoteAddress || "unknown";
+  const secret = process.env.ORBYX_PROXY_SECRET;
+
+  if (!secret) {
+    if (!warnedMissingProxySecret) {
+      warnedMissingProxySecret = true;
+      console.warn(
+        "[IP] ORBYX_PROXY_SECRET no está definida: los límites por IP usan req.ip (la IP de Vercel para las rutas que pasan por Next)."
+      );
+    }
+    return fallbackIp;
+  }
+
+  const provided = req.headers["x-orbyx-proxy-secret"];
+  const forwardedIp = String(req.headers["x-orbyx-client-ip"] || "").trim();
+  if (
+    provided &&
+    forwardedIp &&
+    require("net").isIP(forwardedIp) &&
+    safeEqualStrings(provided, secret)
+  ) {
+    return forwardedIp;
+  }
+
+  return fallbackIp;
+}
+
+// Diagnóstico temporal: deja en los logs de Render, para las primeras
+// reservas tras cada arranque, qué IP vio el servidor y cuál se usó para los
+// límites (sirve para confirmar si api.orbyx.cl pasa por un proxy extra).
+// Quitar cuando se haya confirmado.
+let clientIpDebugLogsLeft = 5;
+function logClientIpDebug(req, res, next) {
+  if (clientIpDebugLogsLeft > 0) {
+    clientIpDebugLogsLeft--;
+    console.log(
+      `[IP-DEBUG] req.ip=${req.ip} xff=${req.headers["x-forwarded-for"] || "-"} cf=${req.headers["cf-connecting-ip"] || "-"} orbyx_ip=${req.headers["x-orbyx-client-ip"] || "-"} secret_sent=${Boolean(req.headers["x-orbyx-proxy-secret"])} resolved=${getClientIp(req)}`
+    );
+  }
+  next();
+}
+
+// Cupo por IP real (ver getClientIp). Valores generosos: una carga de la
+// página pública hace varias llamadas (negocio, servicios, staff, horarios).
+const PUBLIC_READ_MAX_PER_MINUTE = 150;
+
 const publicLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 100,
+  max: PUBLIC_READ_MAX_PER_MINUTE,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
   message: { error: "Demasiadas solicitudes. Intenta de nuevo en un momento." },
+});
+
+// --- Límites de la reserva pública (POST /appointments/slot) ---
+// Todos ajustables acá. Las reservas hechas desde el dashboard (Agenda) no
+// pasan por ninguno de estos límites.
+const PUBLIC_BOOKING_BURST_MAX = 5; // reservas por IP...
+const PUBLIC_BOOKING_BURST_WINDOW_MS = 10 * 60 * 1000; // ...cada 10 minutos
+const PUBLIC_BOOKING_DAILY_MAX = 20; // reservas por IP al día
+const PUBLIC_BOOKING_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const PUBLIC_BOOKING_CONTACT_DAILY_MAX = 5; // por teléfono o correo, entre todos los negocios, en 24 h
+const PUBLIC_BOOKING_TENANT_HOURLY_MAX = 30; // reservas públicas nuevas por negocio y por hora
+
+function isDashboardBookingAttempt(req) {
+  // Solo para decidir si se salta el contador de IP; la autorización real
+  // de la reserva manual la sigue haciendo resolveDashboardBookingAccess.
+  return req.body?.booking_origin === "dashboard" && Boolean(req.headers.authorization);
+}
+
+// skipFailedRequests: solo cuentan las reservas que se crean; un cliente que
+// se equivoca de dato o elige un horario ya tomado no gasta su cupo.
+const publicBookingBurstLimiter = rateLimit({
+  windowMs: PUBLIC_BOOKING_BURST_WINDOW_MS,
+  max: PUBLIC_BOOKING_BURST_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipFailedRequests: true,
+  skip: isDashboardBookingAttempt,
+  keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
+  message: {
+    error:
+      "Hiciste varias reservas seguidas desde este dispositivo. Espera unos minutos antes de intentar de nuevo.",
+  },
+});
+
+const publicBookingDailyLimiter = rateLimit({
+  windowMs: PUBLIC_BOOKING_DAILY_WINDOW_MS,
+  max: PUBLIC_BOOKING_DAILY_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipFailedRequests: true,
+  skip: isDashboardBookingAttempt,
+  keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
+  message: {
+    error:
+      "Alcanzaste el máximo de reservas por día desde este dispositivo. Intenta de nuevo mañana o contacta directamente al negocio.",
+  },
 });
 
 const dashboardLimiter = rateLimit({
@@ -2138,6 +2251,7 @@ const WRITE_ACCESS_MODULE_RULES = [
   { prefix: "/billing", access: "owner_admin" },
   { prefix: "/tenants", access: "owner_admin" },
   { prefix: "/invitations", access: "owner_admin" },
+  { prefix: "/blocked-contacts", access: "owner_admin" },
   { prefix: "/members", access: "owner_admin" },
   { prefix: "/upload/campaign-image", module: "campanas" },
   { prefix: "/campaign-images", module: "campanas" },
@@ -7012,7 +7126,96 @@ async function resolveDashboardBookingAccess(req, res, origin, tenantId) {
   return allowed ? true : null;
 }
 
-app.post("/appointments/slot", publicLimiter, async (req, res) => {
+// Antiabuso de la reserva pública (no aplica a reservas del dashboard):
+//  1) contactos bloqueados por el negocio,
+//  2) tope por teléfono/correo entre TODOS los negocios en 24 h,
+//  3) tope de reservas públicas nuevas por negocio y por hora.
+// Si una consulta falla (o la migración 2026-10-18 aún no está corrida) NO se
+// bloquea la reserva: es una defensa extra, no puede tumbar el flujo normal.
+// Devuelve null si todo está bien, o { status, error } para rechazar.
+async function checkPublicBookingAbuse({ tenantId, normalizedEmail, normalizedPhone }) {
+  try {
+    const { data: blockedRows, error: blockedError } = await supabase
+      .from("blocked_contacts")
+      .select("id")
+      .eq("tenant_id", tenantId)
+      .or(`phone.eq.${normalizedPhone},email.eq.${normalizedEmail}`)
+      .limit(1);
+
+    if (blockedError) {
+      if (!isMissingSchemaError(blockedError)) {
+        console.warn("[ABUSE] no se pudo consultar blocked_contacts:", blockedError.message);
+      }
+    } else if ((blockedRows || []).length > 0) {
+      console.warn(`[ABUSE] reserva rechazada: contacto bloqueado (tenant ${tenantId})`);
+      return {
+        status: 403,
+        error: "No es posible completar la reserva. Contacta directamente al negocio.",
+      };
+    }
+
+    const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const [byPhone, byEmail] = await Promise.all([
+      supabase
+        .from("appointments")
+        .select("id", { count: "exact", head: true })
+        .eq("source", "public_page")
+        .eq("customer_phone", normalizedPhone)
+        .gte("created_at", since24h),
+      supabase
+        .from("appointments")
+        .select("id", { count: "exact", head: true })
+        .eq("source", "public_page")
+        .eq("customer_email", normalizedEmail)
+        .gte("created_at", since24h),
+    ]);
+
+    if (
+      (byPhone.count || 0) >= PUBLIC_BOOKING_CONTACT_DAILY_MAX ||
+      (byEmail.count || 0) >= PUBLIC_BOOKING_CONTACT_DAILY_MAX
+    ) {
+      console.warn(
+        `[ABUSE] reserva rechazada: tope diario por contacto (tenant ${tenantId}, teléfono=${byPhone.count || 0}, correo=${byEmail.count || 0})`
+      );
+      return {
+        status: 429,
+        error:
+          "Este teléfono o correo ya hizo muchas reservas en las últimas 24 horas. Si necesitas más horas, contacta directamente al negocio.",
+      };
+    }
+
+    const sinceHour = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const { count: tenantHourly } = await supabase
+      .from("appointments")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenantId)
+      .eq("source", "public_page")
+      .gte("created_at", sinceHour);
+
+    if ((tenantHourly || 0) >= PUBLIC_BOOKING_TENANT_HOURLY_MAX) {
+      console.warn(
+        `[ABUSE] reserva rechazada: tenant ${tenantId} superó ${PUBLIC_BOOKING_TENANT_HOURLY_MAX} reservas públicas en la última hora (${tenantHourly})`
+      );
+      return {
+        status: 429,
+        error:
+          "Este negocio está recibiendo muchas reservas en este momento. Intenta de nuevo en unos minutos.",
+      };
+    }
+  } catch (err) {
+    console.warn("[ABUSE] checkPublicBookingAbuse falló (se deja pasar):", err.message);
+  }
+
+  return null;
+}
+
+app.post(
+  "/appointments/slot",
+  logClientIpDebug,
+  publicLimiter,
+  publicBookingBurstLimiter,
+  publicBookingDailyLimiter,
+  async (req, res) => {
   let apptCreated = null;
 
   try {
@@ -7160,6 +7363,32 @@ const {
     );
     if (isDashboardBooking === null) return;
 
+    // Reserva pública: captcha (Turnstile) + antiabuso. La reserva manual
+    // desde Agenda (isDashboardBooking, ya autenticada arriba) no pasa por
+    // nada de esto.
+    if (!isDashboardBooking) {
+      const captchaOk = await verifyTurnstileToken(
+        req.body?.captcha_token,
+        getClientIp(req)
+      );
+      if (!captchaOk) {
+        return res.status(400).json({
+          error:
+            "No pudimos verificar que no eres un robot. Desactiva el bloqueador de anuncios o intenta desde otro navegador.",
+          captcha_failed: true,
+        });
+      }
+
+      const abuse = await checkPublicBookingAbuse({
+        tenantId: cal.tenant_id,
+        normalizedEmail,
+        normalizedPhone,
+      });
+      if (abuse) {
+        return res.status(abuse.status).json({ error: abuse.error });
+      }
+    }
+
     const tenantRequiresDeposit =
       !isDashboardBooking &&
       Boolean(tenantConfig.deposit_required) &&
@@ -7285,89 +7514,71 @@ if (!isGroup) {
   }
 }
 
-        const nowIso = new Date().toISOString();
+    const nowIso = new Date().toISOString();
     const normalizedCustomerName = String(customer_name || "")
       .trim()
       .toLowerCase();
 
-    const { data: existingAppointments, error: existingErr } = await supabase
-      .from("appointments")
-      .select(
-        "id, start_at, status, customer_name, customer_email, customer_phone"
-      )
-      .eq("tenant_id", cal.tenant_id)
-      .eq("status", "booked")
-      .gte("start_at", nowIso);
-
-    if (existingErr) {
-      return res.status(500).json({ error: existingErr.message });
-    }
-
-    const futureAppointments = existingAppointments || [];
-
-
-
-
-
+    // Antes se traían TODAS las reservas futuras del negocio para filtrarlas
+    // acá (se rompía sobre 1000 filas, el tope de PostgREST). Ahora cada
+    // consulta trae solo las de ese correo / ese teléfono.
     if (!isGroup) {
-  const samePersonAppointment = futureAppointments.find((appt) => {
-    const apptName = String(appt.customer_name || "").trim().toLowerCase();
-    const sameName =
-      normalizedCustomerName && apptName === normalizedCustomerName;
+      const escapedEmailPattern = normalizedEmail.replace(/[\\%_]/g, "\\$&");
+      const personSelect = "id, customer_name, customer_email, customer_phone";
 
-    if (!sameName) return false;
+      const [emailRes, phoneRes] = await Promise.all([
+        supabase
+          .from("appointments")
+          .select(personSelect)
+          .eq("tenant_id", cal.tenant_id)
+          .eq("status", "booked")
+          .gte("start_at", nowIso)
+          .ilike("customer_email", escapedEmailPattern),
+        supabase
+          .from("appointments")
+          .select(personSelect)
+          .eq("tenant_id", cal.tenant_id)
+          .eq("status", "booked")
+          .gte("start_at", nowIso)
+          .eq("customer_phone", normalizedPhone),
+      ]);
 
-    const sameEmail =
-      normalizedEmail &&
-      appt.customer_email &&
-      String(appt.customer_email).trim().toLowerCase() === normalizedEmail;
+      if (emailRes.error || phoneRes.error) {
+        return res
+          .status(500)
+          .json({ error: (emailRes.error || phoneRes.error).message });
+      }
 
-    const samePhone =
-      normalizedPhone &&
-      appt.customer_phone &&
-      String(appt.customer_phone).trim() === normalizedPhone;
+      const emailAppointments = emailRes.data || [];
+      const phoneAppointments = phoneRes.data || [];
 
-    return sameEmail || samePhone;
-  });
+      const samePersonAppointment = [...emailAppointments, ...phoneAppointments].find(
+        (appt) =>
+          normalizedCustomerName &&
+          String(appt.customer_name || "").trim().toLowerCase() === normalizedCustomerName
+      );
 
-  if (samePersonAppointment) {
-    return res.status(409).json({
-      error:
-        "Esta persona ya tiene una reserva futura activa. Revisa su correo o cancela la reserva actual antes de tomar otra.",
-    });
-  }
+      if (samePersonAppointment) {
+        return res.status(409).json({
+          error:
+            "Esta persona ya tiene una reserva futura activa. Revisa su correo o cancela la reserva actual antes de tomar otra.",
+        });
+      }
 
-  if (normalizedEmail) {
-    const emailActiveCount = futureAppointments.filter(
-      (appt) =>
-        appt.customer_email &&
-        String(appt.customer_email).trim().toLowerCase() === normalizedEmail
-    ).length;
+      if (emailAppointments.length >= 2) {
+        return res.status(409).json({
+          error:
+            "Este correo ya alcanzó el máximo de 2 reservas futuras activas.",
+        });
+      }
 
-    if (emailActiveCount >= 2) {
-      return res.status(409).json({
-        error:
-          "Este correo ya alcanzó el máximo de 2 reservas futuras activas.",
-      });
+      if (phoneAppointments.length >= 2) {
+        return res.status(409).json({
+          error:
+            "Este teléfono ya alcanzó el máximo de 2 reservas futuras activas.",
+        });
+      }
     }
-  }
-
-  if (normalizedPhone) {
-    const phoneActiveCount = futureAppointments.filter(
-      (appt) =>
-        appt.customer_phone &&
-        String(appt.customer_phone).trim() === normalizedPhone
-    ).length;
-
-    if (phoneActiveCount >= 2) {
-      return res.status(409).json({
-        error:
-          "Este teléfono ya alcanzó el máximo de 2 reservas futuras activas.",
-      });
-    }
-  }
-}
-
 
     const totalMinutes = duration + bufferBefore + bufferAfter;
 
@@ -21507,68 +21718,207 @@ app.get("/public/reviews/:slug", publicLimiter, async (req, res) => {
 });
 
 /* ======================================================
-   🔔 RECORDATORIOS 24H
-   Mismo header x-maintenance-secret que /signup/maintenance/sweep,
-   /billing/addons/maintenance/charge-recurring y
-   /whatsapp/maintenance/send-reminders. Confirmado 2026-08-30: no hay
-   ningún cron interno (node-cron) ni externo llamando este endpoint hoy
-   — no está entre las 3 tareas programadas internas más abajo, y no hay
-   ninguna otra referencia en el código. En la práctica es funcionalidad
-   sin uso en producción actualmente (el único email automático real que
-   dispara Orbyx es la confirmación inmediata al agendar, no un
-   recordatorio 24h periódico) — se deja protegida por si se retoma más
-   adelante, no porque haya tráfico real que asegurar hoy.
+   🔔 RECORDATORIO POR CORREO (~24 h antes de la cita)
+   Independiente del recordatorio por WhatsApp: si el negocio tiene ambos,
+   salen ambos. No hay toggle por negocio: está activo para todos.
+   - Solo citas "booked" con correo, que no estén esperando aprobación de
+     depósito, y que se hayan agendado con al menos ~23 h de anticipación
+     (si no, la confirmación recién enviada ya cumple esa función).
+   - Idempotente: appointments.email_recordatorio_enviado se marca ANTES de
+     enviar (update condicional) y se revierte si el envío falla, así dos
+     corridas simultáneas no duplican el correo.
+   - Corre solo desde el cron interno (cada 15 min). El endpoint HTTP sigue
+     disponible para dispararlo a mano (x-maintenance-secret).
 ====================================================== */
+async function sendEmailReminders() {
+  const nowMs = Date.now();
+  const windowStart = new Date(nowMs + 23 * 60 * 60 * 1000);
+  const windowEnd = new Date(nowMs + (24 * 60 + 30) * 60 * 1000);
+
+  const { data: appointments, error } = await supabase
+    .from("appointments")
+    .select("*")
+    .eq("status", "booked")
+    .eq("email_recordatorio_enviado", false)
+    .not("customer_email", "is", null)
+    .gte("start_at", windowStart.toISOString())
+    .lte("start_at", windowEnd.toISOString())
+    .order("start_at", { ascending: true })
+    .limit(500);
+
+  if (error) {
+    if (isMissingSchemaError(error)) {
+      console.warn(
+        "[EMAIL-REMINDER] falta la columna appointments.email_recordatorio_enviado (migración 2026-10-18 pendiente): se omite."
+      );
+      return { sent: 0, skipped: 0 };
+    }
+    throw new Error(error.message);
+  }
+
+  const tenantCache = new Map();
+  const branchCache = new Map();
+  const serviceCache = new Map();
+  let sent = 0;
+  let skipped = 0;
+
+  for (const appt of appointments || []) {
+    const email = String(appt.customer_email || "").trim().toLowerCase();
+    if (!email) {
+      skipped++;
+      continue;
+    }
+
+    // Depósito sin aprobar: la reserva todavía no está confirmada.
+    if (appt.deposit_status === "pending") {
+      skipped++;
+      continue;
+    }
+
+    // Agendada con menos de ~23 h de anticipación: no se manda recordatorio.
+    if (
+      appt.created_at &&
+      new Date(appt.start_at).getTime() - new Date(appt.created_at).getTime() <
+        23 * 60 * 60 * 1000
+    ) {
+      skipped++;
+      continue;
+    }
+
+    try {
+      if (!tenantCache.has(appt.tenant_id)) {
+        const { data } = await supabase
+          .from("tenants")
+          .select("name, slug, address, commune, region, phone, business_category, logo_url, brand_color, is_active, paused_at")
+          .eq("id", appt.tenant_id)
+          .maybeSingle();
+        tenantCache.set(appt.tenant_id, data || null);
+      }
+      const tenantInfo = tenantCache.get(appt.tenant_id);
+      if (!tenantInfo || tenantInfo.is_active === false || tenantInfo.paused_at) {
+        skipped++;
+        continue;
+      }
+
+      // Reserva del update condicional: si otra corrida ya la tomó, se omite.
+      const { data: claimed, error: claimError } = await supabase
+        .from("appointments")
+        .update({ email_recordatorio_enviado: true })
+        .eq("id", appt.id)
+        .eq("email_recordatorio_enviado", false)
+        .select("id");
+      if (claimError || !(claimed || []).length) {
+        skipped++;
+        continue;
+      }
+
+      let ok = false;
+      try {
+        let branchInfo = null;
+        if (appt.branch_id) {
+          if (!branchCache.has(appt.branch_id)) {
+            const { data } = await supabase
+              .from("branches")
+              .select("name, address, commune, region, use_global_contact")
+              .eq("id", appt.branch_id)
+              .maybeSingle();
+            branchCache.set(appt.branch_id, data || null);
+          }
+          branchInfo = branchCache.get(appt.branch_id);
+        }
+
+        let customerInstructions = null;
+        if (appt.service_id) {
+          if (!serviceCache.has(appt.service_id)) {
+            const { data } = await supabase
+              .from("services")
+              .select("customer_instructions")
+              .eq("id", appt.service_id)
+              .maybeSingle();
+            serviceCache.set(appt.service_id, data || null);
+          }
+          customerInstructions = serviceCache.get(appt.service_id)?.customer_instructions || null;
+        }
+
+        let staffName = null;
+        if (appt.staff_id) {
+          const { data: staffRow } = await supabase
+            .from("staff")
+            .select("name")
+            .eq("id", appt.staff_id)
+            .eq("tenant_id", appt.tenant_id)
+            .maybeSingle();
+          staffName = String(staffRow?.name || "").trim() || null;
+        }
+
+        let petName = null;
+        let petSpecies = null;
+        if (appt.pet_id) {
+          const { data: petRow } = await supabase
+            .from("pets")
+            .select("name, species_base, species_custom")
+            .eq("id", appt.pet_id)
+            .eq("tenant_id", appt.tenant_id)
+            .maybeSingle();
+          petName = String(petRow?.name || "").trim() || null;
+          petSpecies = String(petRow?.species_custom || petRow?.species_base || "").trim() || null;
+        }
+
+        const bookingUrl = tenantInfo.slug
+          ? `https://www.orbyx.cl/${tenantInfo.slug}`
+          : "https://www.orbyx.cl";
+        const cancelUrl =
+          `https://www.orbyx.cl/cancel/${appt.id}?token=${appt.cancel_token}` +
+          `&redirect=${encodeURIComponent(bookingUrl)}`;
+
+        const result = await sendBookingEmail({
+          reminder: true,
+          email,
+          customerName: appt.customer_name,
+          businessName: tenantInfo.name || "Tu negocio",
+          serviceName: appt.service_name_snapshot || "Reserva",
+          startAt: appt.start_at,
+          endAt: appt.end_at || null,
+          cancelUrl,
+          address: resolveEffectiveFullAddress(tenantInfo, branchInfo) || null,
+          phone: tenantInfo.phone || null,
+          businessCategory: tenantInfo.business_category || null,
+          petName,
+          petSpecies,
+          staffName,
+          customerInstructions,
+          logoUrl: tenantInfo.logo_url || null,
+          brandColor: tenantInfo.brand_color || null,
+          branchName: await getBranchNameForBookingEmail(appt.tenant_id, branchInfo?.name || null),
+        });
+        ok = Boolean(result?.ok);
+      } catch (sendErr) {
+        console.warn(`[EMAIL-REMINDER] error preparando/enviando cita ${appt.id}:`, sendErr.message);
+      }
+
+      if (ok) {
+        sent++;
+      } else {
+        // No se envió: se libera para que el próximo ciclo lo reintente.
+        await supabase
+          .from("appointments")
+          .update({ email_recordatorio_enviado: false })
+          .eq("id", appt.id);
+        skipped++;
+      }
+    } catch (err) {
+      console.warn(`[EMAIL-REMINDER] cita ${appt.id} omitida:`, err.message);
+      skipped++;
+    }
+  }
+
+  return { sent, skipped };
+}
+
 app.get("/jobs/send-reminders", [publicLimiter, requireSignupMaintenanceSecret], async (req, res) => {
   try {
-    const now = new Date();
-    const in24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-
-    const { data: appointments, error } = await supabase
-      .from("appointments")
-      .select("*")
-      .eq("status", "booked")
-      .gte("start_at", in24h.toISOString())
-      .lte("start_at", new Date(in24h.getTime() + 60 * 60 * 1000).toISOString());
-
-    if (error) {
-      return res.status(500).json({ error: error.message });
-    }
-
-    let sent = 0;
-
-    for (const appt of appointments) {
-      if (!appt.customer_email) continue;
-
-      const { data: tenantData } = await supabase
-        .from("tenants")
-        .select("slug")
-        .eq("id", appt.tenant_id)
-        .single();
-
-      const bookingUrl = tenantData?.slug
-        ? `https://www.orbyx.cl/${tenantData.slug}`
-        : "https://www.orbyx.cl";
-
-      const cancelUrl =
-        `https://www.orbyx.cl/cancel/${appt.id}?token=${appt.cancel_token}` +
-        `&redirect=${encodeURIComponent(bookingUrl)}`;
-
-      await sendBookingEmail({
-        email: appt.customer_email,
-        customerName: appt.customer_name,
-        serviceName: appt.service_name_snapshot || "Reserva",
-        startAt: appt.start_at,
-        cancelUrl,
-      });
-
-      sent++;
-    }
-
-    return res.json({
-      ok: true,
-      reminders_sent: sent,
-    });
+    const result = await sendEmailReminders();
+    return res.json({ ok: true, reminders_sent: result.sent, skipped: result.skipped });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -23648,11 +23998,27 @@ const passwordResetCooldown = new Map(); // email -> timestamp último envío
 const PASSWORD_RESET_COOLDOWN_MS = 60 * 1000;
 let warnedMissingTurnstileSecret = false;
 
+// Render define RENDER=true en todos sus servicios (y NODE_ENV=production en
+// los de Node por defecto). Cualquiera de los dos cuenta como producción.
+function isProductionRuntime() {
+  return process.env.NODE_ENV === "production" || Boolean(process.env.RENDER);
+}
+
 async function verifyTurnstileToken(token, ip) {
   const secret = process.env.TURNSTILE_SECRET_KEY;
   if (!secret) {
+    // En producción falla CERRADO: sin el secret no se puede verificar nada,
+    // así que no se deja pasar a nadie (antes dejaba pasar todo). En
+    // desarrollo local sigue dejando pasar para poder probar sin captcha.
+    if (isProductionRuntime()) {
+      if (!warnedMissingTurnstileSecret) {
+        console.error("[turnstile] TURNSTILE_SECRET_KEY no configurada en producción: se rechaza el captcha (falla cerrado).");
+        warnedMissingTurnstileSecret = true;
+      }
+      return false;
+    }
     if (!warnedMissingTurnstileSecret) {
-      console.warn("[password-reset] TURNSTILE_SECRET_KEY no configurada: captcha NO verificado en backend.");
+      console.warn("[turnstile] TURNSTILE_SECRET_KEY no configurada (desarrollo): captcha NO verificado en backend.");
       warnedMissingTurnstileSecret = true;
     }
     return true;
@@ -23668,7 +24034,7 @@ async function verifyTurnstileToken(token, ip) {
     const result = await response.json().catch(() => null);
     return Boolean(result?.success);
   } catch (err) {
-    console.error("[password-reset] error verificando Turnstile:", err.message);
+    console.error("[turnstile] error verificando Turnstile:", err.message);
     return false;
   }
 }
@@ -24394,6 +24760,18 @@ scheduleInternalCron("0 6 * * *", async () => {
   }
 });
 
+// Recordatorio por correo ~24 h antes de la cita (ver sendEmailReminders).
+scheduleInternalCron("*/15 * * * *", async () => {
+  try {
+    const result = await sendEmailReminders();
+    if (result.sent) {
+      console.log(`[CRON] email/send-reminders: terminado — sent=${result.sent} skipped=${result.skipped}`);
+    }
+  } catch (err) {
+    console.error("[CRON] email/send-reminders: falló —", err.message);
+  }
+});
+
 // Add-ons de pago único: vencimiento cada hora (para que la capacidad se
 // libere cerca de expires_at) y aviso diario antes de vencer.
 scheduleInternalCron("17 * * * *", async () => {
@@ -24489,6 +24867,154 @@ app.get("/api/pets/:slug", tenantAuthSlug, requireModuleReadAccess("clientes"), 
    Crea una invitación pendiente y envía email al invitado.
    Body: { tenant_id, email, role, branch_id?, invited_by? }
 ====================================================== */
+/* ======================================================
+   🚫 CONTACTOS BLOQUEADOS (reserva pública)
+   El dueño/admin bloquea un teléfono o correo: si intenta reservar desde
+   la página pública recibe un error genérico (sin revelar que está
+   bloqueado). No afecta las reservas hechas desde Agenda. Es por negocio
+   (todas las sucursales). Tabla: blocked_contacts (migración 2026-10-18).
+====================================================== */
+function requireOwnerOrAdminForBlocking(req, res, next) {
+  const role = req.authenticatedUser?.role;
+  if (role === "owner" || role === "admin") return next();
+  return res.status(403).json({ error: "Solo el dueño o un administrador puede bloquear contactos." });
+}
+
+app.get(
+  "/blocked-contacts/:slug",
+  ...tenantAuthSlug,
+  requireOwnerOrAdminForBlocking,
+  async (req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from("blocked_contacts")
+        .select("id, contact_name, phone, email, created_at")
+        .eq("tenant_id", req.authenticatedUser.tenant_id)
+        .order("created_at", { ascending: false })
+        .limit(500);
+
+      if (error) {
+        if (isMissingSchemaError(error)) return res.json({ blocked: [] });
+        throw error;
+      }
+
+      return res.json({ blocked: data || [] });
+    } catch (err) {
+      console.error("GET /blocked-contacts/:slug error:", err.message);
+      return res.status(500).json({ error: "No pudimos cargar los contactos bloqueados." });
+    }
+  }
+);
+
+app.post(
+  "/blocked-contacts/:slug",
+  ...tenantAuthSlugWrite,
+  requireOwnerOrAdminForBlocking,
+  async (req, res) => {
+    try {
+      const tenantId = req.authenticatedUser.tenant_id;
+      const { customer_id, appointment_id } = req.body || {};
+      let rawPhone = req.body?.phone || null;
+      let rawEmail = req.body?.email || null;
+      let contactName = String(req.body?.name || "").trim() || null;
+
+      // Desde Clientes (customer_id) o desde el detalle de una reserva
+      // (appointment_id): los datos se leen del propio negocio, no del cliente.
+      if (customer_id) {
+        const { data: customer } = await supabase
+          .from("customers")
+          .select("name, phone, email")
+          .eq("id", customer_id)
+          .eq("tenant_id", tenantId)
+          .maybeSingle();
+        if (!customer) return res.status(404).json({ error: "Cliente no encontrado." });
+        rawPhone = customer.phone;
+        rawEmail = customer.email;
+        contactName = customer.name || contactName;
+      } else if (appointment_id) {
+        const { data: appt } = await supabase
+          .from("appointments")
+          .select("customer_name, customer_phone, customer_email")
+          .eq("id", appointment_id)
+          .eq("tenant_id", tenantId)
+          .maybeSingle();
+        if (!appt) return res.status(404).json({ error: "Reserva no encontrada." });
+        rawPhone = appt.customer_phone;
+        rawEmail = appt.customer_email;
+        contactName = appt.customer_name || contactName;
+      }
+
+      const phone = rawPhone ? normalizeBookingPhone(rawPhone) : null;
+      const emailCandidate = String(rawEmail || "").trim().toLowerCase();
+      const email = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(emailCandidate) ? emailCandidate : null;
+
+      if (!phone && !email) {
+        return res.status(400).json({ error: "Este contacto no tiene un teléfono o correo válido para bloquear." });
+      }
+
+      const filters = [];
+      if (phone) filters.push(`phone.eq.${phone}`);
+      if (email) filters.push(`email.eq.${email}`);
+      const { data: existing } = await supabase
+        .from("blocked_contacts")
+        .select("id")
+        .eq("tenant_id", tenantId)
+        .or(filters.join(","))
+        .limit(1);
+
+      if ((existing || []).length > 0) {
+        return res.json({ ok: true, already_blocked: true });
+      }
+
+      const { data: inserted, error: insertError } = await supabase
+        .from("blocked_contacts")
+        .insert({
+          tenant_id: tenantId,
+          phone,
+          email,
+          contact_name: contactName ? contactName.slice(0, 120) : null,
+          created_by: req.authenticatedUser.user_id,
+        })
+        .select("id, contact_name, phone, email, created_at")
+        .single();
+
+      if (insertError) throw insertError;
+
+      return res.status(201).json({ ok: true, blocked: inserted });
+    } catch (err) {
+      console.error("POST /blocked-contacts/:slug error:", err.message);
+      return res.status(500).json({ error: "No pudimos bloquear al contacto. Intenta de nuevo." });
+    }
+  }
+);
+
+app.delete(
+  "/blocked-contacts/:slug/:id",
+  ...tenantAuthSlugWrite,
+  requireOwnerOrAdminForBlocking,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id))) {
+        return res.status(400).json({ error: "Contacto no válido." });
+      }
+
+      const { error } = await supabase
+        .from("blocked_contacts")
+        .delete()
+        .eq("id", id)
+        .eq("tenant_id", req.authenticatedUser.tenant_id);
+
+      if (error) throw error;
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("DELETE /blocked-contacts/:slug/:id error:", err.message);
+      return res.status(500).json({ error: "No pudimos desbloquear al contacto. Intenta de nuevo." });
+    }
+  }
+);
+
 // Búsqueda de un usuario de Supabase Auth por correo. listUsers solo trae una
 // página: con más de 1000 usuarios, un usuario existente dejaba de
 // encontrarse (aceptar invitaciones fallaba con 500). Se pagina hasta

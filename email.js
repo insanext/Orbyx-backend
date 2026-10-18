@@ -71,12 +71,15 @@ async function sendBookingEmail({
   brandColor,
   branchName,
   staffName,
+  // true: mismo correo pero como recordatorio previo a la cita (títulos y
+  // asunto distintos). Ver sendEmailReminders() en server.js.
+  reminder = false,
 }) {
   try {
     // 👇 evita que explote en local
     if (!resend) {
       console.warn("⚠️ RESEND_API_KEY no configurada. Email omitido.");
-      return;
+      return { ok: false, reason: "resend_not_configured" };
     }
 
     const esc = (value) =>
@@ -203,7 +206,7 @@ async function sendBookingEmail({
     const preheader = `${business}: ${dateCap} a las ${timeLabel} hrs · ${service}`;
 
     const html = `<!doctype html>
-<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light only"><title>Reserva confirmada</title></head>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light only"><title>${reminder ? "Recordatorio de tu reserva" : "Reserva confirmada"}</title></head>
 <body style="margin:0; padding:0; background:#f1f5f9;">
   <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">${esc(preheader)}</div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;">
@@ -217,11 +220,11 @@ async function sendBookingEmail({
         <tr><td style="padding:26px 32px 6px;">
           <table role="presentation" cellpadding="0" cellspacing="0"><tr>
             <td style="width:22px; height:22px; background:#16a34a; border-radius:11px; text-align:center; vertical-align:middle; font:700 13px/22px Arial,Helvetica,sans-serif; color:#ffffff;">&#10003;</td>
-            <td style="padding-left:8px; font:700 12px/1.4 Arial,Helvetica,sans-serif; color:#16a34a; letter-spacing:0.08em; text-transform:uppercase;">Reserva confirmada</td>
+            <td style="padding-left:8px; font:700 12px/1.4 Arial,Helvetica,sans-serif; color:#16a34a; letter-spacing:0.08em; text-transform:uppercase;">${reminder ? "Recordatorio de tu reserva" : "Reserva confirmada"}</td>
           </tr></table>
           <h1 style="margin:14px 0 4px; font:700 24px/1.25 Arial,Helvetica,sans-serif; color:#0f172a;">${esc(dateCap)}</h1>
           <div style="font:700 34px/1.1 Arial,Helvetica,sans-serif; color:#0f172a; letter-spacing:-0.5px;">${esc(timeLabel)} <span style="font-size:15px; font-weight:600; color:#64748b; letter-spacing:0;">hrs</span></div>
-          <p style="margin:16px 0 0; font:400 15px/1.55 Arial,Helvetica,sans-serif; color:#475569;">Hola <strong style="color:#0f172a;">${esc(customerName)}</strong>, te esperamos${petGreetingName ? ` junto a <strong style="color:#0f172a;">${esc(petGreetingName)}</strong>` : ""}. Aquí está el detalle de tu reserva.</p>
+          <p style="margin:16px 0 0; font:400 15px/1.55 Arial,Helvetica,sans-serif; color:#475569;">Hola <strong style="color:#0f172a;">${esc(customerName)}</strong>, ${reminder ? "te recordamos que" : ""} te esperamos${petGreetingName ? ` junto a <strong style="color:#0f172a;">${esc(petGreetingName)}</strong>` : ""}. Aquí está el detalle de tu reserva.</p>
         </td></tr>
 
         <tr><td style="padding:14px 32px 18px;">
@@ -254,9 +257,9 @@ async function sendBookingEmail({
 </body></html>`;
 
     const text = [
-      `Reserva confirmada · ${business}`,
+      `${reminder ? "Recordatorio de tu reserva" : "Reserva confirmada"} · ${business}`,
       "",
-      `Hola ${customerName || ""}, te esperamos${petGreetingName ? ` junto a ${petGreetingName}` : ""}.`,
+      `Hola ${customerName || ""}, ${reminder ? "te recordamos que " : ""}te esperamos${petGreetingName ? ` junto a ${petGreetingName}` : ""}.`,
       "",
       `Servicio: ${service}`,
       staffName ? `Profesional: ${staffName}` : null,
@@ -277,15 +280,26 @@ async function sendBookingEmail({
       .filter((line) => line !== null)
       .join("\n");
 
-    await resend.emails.send({
+    // El SDK de Resend no lanza ante un rechazo de la API: devuelve { error }.
+    const { error: sendError } = await resend.emails.send({
       from: "Orbyx <reservas@notificaciones.orbyx.cl>",
       to: email,
-      subject: `Reserva confirmada · ${business}`,
+      subject: reminder
+        ? `Recordatorio de tu reserva · ${business}`
+        : `Reserva confirmada · ${business}`,
       html,
       text,
     });
+
+    if (sendError) {
+      console.error("Error enviando email:", sendError);
+      return { ok: false, reason: sendError.message || "resend_error" };
+    }
+
+    return { ok: true };
   } catch (error) {
     console.error("Error enviando email:", error);
+    return { ok: false, reason: error?.message || "unknown_error" };
   }
 }
 
