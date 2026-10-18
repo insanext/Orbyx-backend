@@ -566,10 +566,10 @@ async function sendSignupStuckAlertEmail({ to, signupIntentId, email, planId, mo
 <div style="font-family:Arial, Helvetica, sans-serif; padding:16px;">
   <h2>signup_intent pagado sin completar hace más de 24h</h2>
   <ul>
-    <li><strong>signup_intent_id:</strong> ${signupIntentId}</li>
-    <li><strong>email prospecto:</strong> ${email}</li>
-    <li><strong>plan:</strong> ${planId}</li>
-    <li><strong>monto:</strong> ${monto}</li>
+    <li><strong>signup_intent_id:</strong> ${escapeHtml(signupIntentId)}</li>
+    <li><strong>email prospecto:</strong> ${escapeHtml(email)}</li>
+    <li><strong>plan:</strong> ${escapeHtml(planId)}</li>
+    <li><strong>monto:</strong> ${escapeHtml(monto)}</li>
   </ul>
   <p>Requiere seguimiento manual: esta persona pagó y no tiene cuenta ni logró usar el link de recuperación.</p>
 </div>`,
@@ -1588,7 +1588,7 @@ async function sendDepositReceiptUploadedEmail({
           DEPÓSITO PENDIENTE DE REVISIÓN
         </div>
         <h1 style="color:#ffffff; margin:10px 0 0; font-size:24px;">
-          ${tenantName || "Orbyx"}
+          ${escapeHtml(tenantName || "Orbyx")}
         </h1>
       </div>
 
@@ -1601,8 +1601,8 @@ async function sendDepositReceiptUploadedEmail({
         <h2 style="margin:0 0 10px;">Un cliente subió su comprobante de depósito</h2>
 
         <p style="color:#475569; font-size:15px;">
-          <strong>${customerName || "Cliente"}</strong> subió un comprobante de transferencia
-          para reservar <strong>${serviceName || "un servicio"}</strong>
+          <strong>${escapeHtml(customerName || "Cliente")}</strong> subió un comprobante de transferencia
+          para reservar <strong>${escapeHtml(serviceName || "un servicio")}</strong>
           el <strong>${formattedDate}</strong>.
         </p>
 

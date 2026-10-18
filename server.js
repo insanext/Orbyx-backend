@@ -7074,6 +7074,12 @@ const {
       });
     }
 
+    if (String(customer_name).trim().length > 120) {
+      return res.status(400).json({
+        error: "El nombre no puede superar los 120 caracteres.",
+      });
+    }
+
     if (!normalizedPhone) {
       return res.status(400).json({
         error: "Por el momento solo aceptamos números de teléfono de Chile.",
@@ -10886,21 +10892,83 @@ app.put("/reviews/:slug/:reviewId/reaction", tenantAuthSlugWrite, async (req, re
    ✅ GET /pets/:slug
    Listar mascotas por negocio y opcionalmente por cliente
 ====================================================== */
-app.get("/pets/:slug", publicLimiter, async (req, res) => {
+// Dashboard (con sesión): lista completa de mascotas de un cliente. Es la
+// llamada que hacen la ficha del cliente y el informe clínico
+// (customer_id siempre viene en la query). Antes era la misma ruta pública:
+// cualquiera con un customer_id podía leerlas sin iniciar sesión.
+app.get(
+  "/pets/:slug",
+  (req, res, next) => (req.query.customer_id ? next() : next("route")),
+  tenantAuthSlug,
+  requireModuleReadAccess("clientes", "agenda"),
+  async (req, res) => {
+    try {
+      const { slug } = req.params;
+      const customerId = String(req.query.customer_id || "").trim();
+
+      const { data: tenant, error: tenantError } = await supabase
+        .from("tenants")
+        .select("id, slug")
+        .eq("slug", slug)
+        .eq("is_active", true)
+        .single();
+
+      if (tenantError || !tenant) {
+        return res.status(404).json({ error: "Negocio no encontrado" });
+      }
+
+      const { data, error } = await supabase
+        .from("pets")
+        .select("*")
+        .eq("tenant_id", tenant.id)
+        .eq("customer_id", customerId)
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+
+      return res.json({
+        total: data?.length || 0,
+        pets: data || [],
+        customer_found: true,
+        resolved_customer_id: customerId,
+      });
+    } catch (err) {
+      console.error("GET /pets/:slug (dashboard) error:", err.message);
+      return res.status(500).json({ error: "Error obteniendo mascotas" });
+    }
+  }
+);
+
+// Público (autocompletado de mascotas en la página de reservas). Solo
+// coincidencia EXACTA de teléfono normalizado (misma normalización que
+// POST /appointments/slot) o de correo, y solo se devuelve id, nombre y
+// especie: nada del cliente. Límite estricto por IP: el navegador llama
+// directo a este endpoint, así que req.ip es la IP real del visitante.
+const petsLookupLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiadas solicitudes. Intenta de nuevo en un momento." },
+});
+
+app.get("/pets/:slug", petsLookupLimiter, async (req, res) => {
   try {
     const { slug } = req.params;
-    const { customer_id, phone, email } = req.query;
+    const emptyResult = { total: 0, pets: [], customer_found: false };
 
     if (!slug) {
       return res.status(400).json({ error: "slug es obligatorio" });
     }
 
-    if (!customer_id && !phone && !email) {
-      return res.status(400).json({ error: "Se requiere customer_id, phone o email" });
-    }
+    const normalizedEmail = String(req.query.email || "").trim().toLowerCase();
+    const normalizedPhone = req.query.phone
+      ? normalizeBookingPhone(String(req.query.phone))
+      : null;
 
-    const normalizedEmail = String(email || "").trim().toLowerCase();
-    const normalizedPhoneDigits = String(phone || "").replace(/\D/g, "");
+    if (!normalizedPhone && !normalizedEmail) {
+      return res.json(emptyResult);
+    }
 
     const { data: tenant, error: tenantError } = await supabase
       .from("tenants")
@@ -10913,9 +10981,9 @@ app.get("/pets/:slug", publicLimiter, async (req, res) => {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
 
-    let resolvedCustomerId = customer_id || null;
+    let resolvedCustomerId = null;
 
-    if (!resolvedCustomerId && normalizedEmail) {
+    if (normalizedEmail) {
       const { data: customerByEmail } = await supabase
         .from("customers")
         .select("id")
@@ -10927,12 +10995,12 @@ app.get("/pets/:slug", publicLimiter, async (req, res) => {
       resolvedCustomerId = customerByEmail?.id || null;
     }
 
-    if (!resolvedCustomerId && normalizedPhoneDigits) {
+    if (!resolvedCustomerId && normalizedPhone) {
       const { data: customerByPhone } = await supabase
         .from("customers")
         .select("id")
         .eq("tenant_id", tenant.id)
-        .ilike("phone", `%${normalizedPhoneDigits}%`)
+        .eq("phone", normalizedPhone)
         .limit(1)
         .maybeSingle();
 
@@ -10940,17 +11008,12 @@ app.get("/pets/:slug", publicLimiter, async (req, res) => {
     }
 
     if (!resolvedCustomerId) {
-      return res.json({
-        total: 0,
-        pets: [],
-        customer_found: false,
-        resolved_customer_id: null,
-      });
+      return res.json(emptyResult);
     }
 
     const { data, error } = await supabase
       .from("pets")
-      .select("*")
+      .select("id, name, species_base, species_custom")
       .eq("tenant_id", tenant.id)
       .eq("customer_id", resolvedCustomerId)
       .order("created_at", { ascending: false });
@@ -10961,13 +11024,10 @@ app.get("/pets/:slug", publicLimiter, async (req, res) => {
       total: data?.length || 0,
       pets: data || [],
       customer_found: true,
-      resolved_customer_id: resolvedCustomerId,
     });
   } catch (err) {
     console.error("GET /pets/:slug error:", err.message);
-    return res.status(500).json({
-      error: err.message || "Error obteniendo mascotas",
-    });
+    return res.status(500).json({ error: "Error obteniendo mascotas" });
   }
 });
 
@@ -17818,6 +17878,14 @@ app.post("/signup/start-paid", publicLimiter, async (req, res) => {
       });
     }
 
+    if (
+      typeof email !== "string" ||
+      email.length > 254 ||
+      !/^[^\s@<>"']+@[^\s@<>"']+\.[^\s@<>"']{2,}$/.test(email.trim())
+    ) {
+      return res.status(400).json({ error: "El email ingresado no es válido." });
+    }
+
     if (!phone || !String(phone).trim()) {
       return res.status(400).json({ error: "phone es obligatorio" });
     }
@@ -24421,6 +24489,35 @@ app.get("/api/pets/:slug", tenantAuthSlug, requireModuleReadAccess("clientes"), 
    Crea una invitación pendiente y envía email al invitado.
    Body: { tenant_id, email, role, branch_id?, invited_by? }
 ====================================================== */
+// Búsqueda de un usuario de Supabase Auth por correo. listUsers solo trae una
+// página: con más de 1000 usuarios, un usuario existente dejaba de
+// encontrarse (aceptar invitaciones fallaba con 500). Se pagina hasta
+// encontrarlo o agotar las páginas.
+async function findAuthUserByEmail(email) {
+  const target = String(email || "").trim().toLowerCase();
+  if (!target) return null;
+  const perPage = 1000;
+  for (let page = 1; page <= 50; page++) {
+    const { data, error } = await supabase.auth.admin.listUsers({ page, perPage });
+    if (error) throw error;
+    const users = data?.users || [];
+    const match = users.find((u) => String(u.email || "").toLowerCase() === target);
+    if (match) return match;
+    if (users.length < perPage) return null;
+  }
+  return null;
+}
+
+// Endpoints públicos de invitación (aceptar / leer por token): el navegador
+// los llama directo, así que req.ip es la IP real del visitante.
+const invitationTokenLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiados intentos. Intenta de nuevo en un momento." },
+});
+
 app.post("/invitations", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, email, role, branch_id, invited_by, permissions } = req.body;
@@ -24480,10 +24577,7 @@ app.post("/invitations", tenantAuthWrite, async (req, res) => {
 
     // Verificar que el email no es ya miembro activo
     // Buscar el user_id correspondiente al email en auth.users
-    const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
-    const matchingAuthUser = authList?.users?.find(
-      (u) => String(u.email || "").toLowerCase() === normalizedEmail
-    );
+    const matchingAuthUser = await findAuthUserByEmail(normalizedEmail);
 
     if (matchingAuthUser) {
       const { data: existingMember } = await supabase
@@ -24529,7 +24623,9 @@ app.post("/invitations", tenantAuthWrite, async (req, res) => {
     const { data: invitation, error: insertError } = await supabase
       .from("tenant_invitations")
       .insert(insertPayload)
-      .select()
+      // Sin token: quien invita no debe poder aceptar la invitación por el
+      // invitado (el token solo viaja en el correo).
+      .select("id, tenant_id, email, role, branch_id, status, invited_by, expires_at, accepted_at, created_at")
       .single();
 
     if (insertError) throw insertError;
@@ -24631,7 +24727,7 @@ app.delete("/invitations/:id", tenantAuthWrite, async (req, res) => {
    Acepta una invitación: crea el miembro en tenant_users
    y opcionalmente en branch_access si role === 'branch'.
 ====================================================== */
-app.post("/invitations/accept/:token", async (req, res) => {
+app.post("/invitations/accept/:token", invitationTokenLimiter, async (req, res) => {
   try {
     const { token } = req.params;
 
@@ -24640,11 +24736,21 @@ app.post("/invitations/accept/:token", async (req, res) => {
     }
 
     // Buscar invitación por token
-    const { data: invitation, error: fetchError } = await supabase
+    // branch_ids se pierdía al aceptar (no estaba en el select). Si la
+    // columna no existiera en este ambiente, se reintenta sin ella.
+    let { data: invitation, error: fetchError } = await supabase
       .from("tenant_invitations")
-      .select("id, tenant_id, branch_id, email, role, permissions, status, expires_at")
+      .select("id, tenant_id, branch_id, branch_ids, email, role, permissions, status, expires_at")
       .eq("token", token)
       .single();
+
+    if (fetchError && isMissingSchemaError(fetchError)) {
+      ({ data: invitation, error: fetchError } = await supabase
+        .from("tenant_invitations")
+        .select("id, tenant_id, branch_id, email, role, permissions, status, expires_at")
+        .eq("token", token)
+        .single());
+    }
 
     if (fetchError || !invitation) {
       return res.status(404).json({ error: "Token de invitación no válido" });
@@ -24670,19 +24776,49 @@ app.post("/invitations/accept/:token", async (req, res) => {
       return res.status(410).json({ error: "Esta invitación ha expirado. Solicita una nueva al administrador." });
     }
 
-    const { password } = req.body || {};
-    if (!password || String(password).length < 8) {
-      return res.status(400).json({ error: "La contraseña debe tener al menos 8 caracteres" });
-    }
-
-    // Buscar usuario en auth.users por email
     const normalizedEmail = String(invitation.email).toLowerCase();
-    const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
-    let authUser = authList?.users?.find(
-      (u) => String(u.email || "").toLowerCase() === normalizedEmail
-    );
+    let authUser = await findAuthUserByEmail(normalizedEmail);
 
-    if (!authUser) {
+    if (authUser) {
+      // El correo ya tiene cuenta: NUNCA se le asigna una contraseña desde acá
+      // (antes se le fijaba a cuentas solo-Google). Solo la propia persona,
+      // con su sesión, puede aceptar: el Bearer debe ser del mismo usuario.
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(409).json({
+          error: "Este correo ya tiene una cuenta en Orbyx. Inicia sesión para aceptar la invitación.",
+          requires_login: true,
+          email: normalizedEmail,
+        });
+      }
+
+      const { data: sessionData, error: sessionError } = await getUserCached(
+        authHeader.split(" ")[1]
+      );
+      const sessionUser = sessionData?.user;
+      if (sessionError || !sessionUser) {
+        return res.status(401).json({
+          error: "Tu sesión expiró. Inicia sesión de nuevo para aceptar la invitación.",
+          requires_login: true,
+          email: normalizedEmail,
+        });
+      }
+      if (
+        sessionUser.id !== authUser.id ||
+        String(sessionUser.email || "").toLowerCase() !== normalizedEmail
+      ) {
+        return res.status(403).json({
+          error: `Esta invitación es para ${normalizedEmail}. Cierra sesión e inicia con ese correo.`,
+          requires_login: true,
+          email: normalizedEmail,
+        });
+      }
+    } else {
+      const { password } = req.body || {};
+      if (!password || String(password).length < 8) {
+        return res.status(400).json({ error: "La contraseña debe tener al menos 8 caracteres" });
+      }
+
       // No existe cuenta todavía: la creamos ya confirmada (el click en el link
       // de invitación ya validó la identidad, no hace falta doble confirmación).
       const { data: created, error: createError } = await supabase.auth.admin.createUser({
@@ -24692,36 +24828,22 @@ app.post("/invitations/accept/:token", async (req, res) => {
       });
 
       if (createError) {
-        // Carrera: puede haberse creado entre el listUsers y este createUser.
-        const { data: retryList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
-        authUser = retryList?.users?.find(
-          (u) => String(u.email || "").toLowerCase() === normalizedEmail
-        );
-        if (!authUser) {
-          console.error("invitations/accept createUser error:", createError.message);
-          return res.status(500).json({ error: "Error creando la cuenta", detail: createError.message });
+        // Carrera: puede haberse creado entre la búsqueda y este createUser. Si
+        // ahora existe, no es una cuenta creada por esta solicitud: debe
+        // iniciar sesión.
+        const racedUser = await findAuthUserByEmail(normalizedEmail);
+        if (racedUser) {
+          return res.status(409).json({
+            error: "Este correo ya tiene una cuenta en Orbyx. Inicia sesión para aceptar la invitación.",
+            requires_login: true,
+            email: normalizedEmail,
+          });
         }
-      } else {
-        authUser = created.user;
+        console.error("invitations/accept createUser error:", createError.message);
+        return res.status(500).json({ error: "Error creando la cuenta" });
       }
-    } else {
-      // El usuario ya existía. Si solo tiene login OAuth (ej. Google) y no un
-      // identity "email", le agregamos el proveedor email/password para que
-      // también pueda entrar con email+contraseña (no afecta su login OAuth).
-      // Si ya tiene un identity "email" (con password propio, ej. invitado a
-      // otro tenant), no tocamos su password actual.
-      const hasEmailIdentity = (authUser.identities || []).some(
-        (identity) => identity.provider === "email"
-      );
-      if (!hasEmailIdentity) {
-        const { error: updatePasswordError } = await supabase.auth.admin.updateUserById(
-          authUser.id,
-          { password: String(password) }
-        );
-        if (updatePasswordError) {
-          console.error("invitations/accept updateUserById error:", updatePasswordError.message);
-        }
-      }
+
+      authUser = created.user;
     }
 
     // Verificar que no sea ya miembro activo
@@ -24805,7 +24927,7 @@ app.post("/invitations/accept/:token", async (req, res) => {
    ✅ INVITACIONES — GET /invitations/token/:token
    Endpoint público para leer una invitación pendiente por token.
 ====================================================== */
-app.get("/invitations/token/:token", async (req, res) => {
+app.get("/invitations/token/:token", invitationTokenLimiter, async (req, res) => {
   try {
     const { token } = req.params;
     const { data, error } = await supabase
@@ -24829,10 +24951,13 @@ app.get("/invitations/token/:token", async (req, res) => {
       .eq("id", data.tenant_id)
       .single();
 
+    const existingAuthUser = await findAuthUserByEmail(data.email);
+
     return res.json({
       ...data,
       tenant_name: tenant?.name ?? "el negocio",
       tenant_slug: tenant?.slug ?? null,
+      account_exists: Boolean(existingAuthUser),
     });
   } catch (err) {
     console.error("GET /invitations/token/:token error:", err.message);
