@@ -1,0 +1,64 @@
+-- =============================================================================
+-- Migración: quitar el DEFAULT 'generic' de tenants.business_category
+-- Fecha: 2026-09-05
+-- Propósito: el gate de onboarding (middleware.ts, login/page.tsx) decide
+--            "este tenant nunca completó onboarding" únicamente cuando
+--            business_category IS NULL. Confirmado en vivo por Camilo
+--            (information_schema.columns) que la columna tiene
+--            column_default = 'generic'::text -- ningún INSERT de tenants
+--            especifica este campo (ver provisionTenantCore en server.js,
+--            usada tanto por /tenants/provision como por el signup pagado),
+--            así que Postgres siempre aplicaba el default y el campo nunca
+--            quedaba NULL de verdad. Por eso el onboarding se saltaba
+--            SIEMPRE para tenants nuevos, en los dos planes -- no era un bug
+--            de la lógica de redirect (ya verificada simétrica entre
+--            Starter y pago), sino del esquema.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- Auditoría hecha antes de escribir este ALTER (pedida explícitamente antes
+-- de tocar esto, porque 'generic' es también una categoría real y
+-- seleccionable, no solo un placeholder):
+-- -----------------------------------------------------------------------------
+--
+-- 1) Único otro INSERT en tenants que tampoco especifica business_category:
+--    POST /onboarding/setup (server.js, ~línea 16559), usado por
+--    orbyx-web/app/start/page.tsx. Verificado que NINGUNA página actual del
+--    frontend enlaza ni redirige a /start (sin href, sin router.push en todo
+--    orbyx-web) -- es una ruta huérfana de un diseño de onboarding anterior,
+--    reemplazada por el flujo actual (/signup, /checkout-premium +
+--    /onboarding). Si algún día se la vuelve a usar, el tenant que cree
+--    quedaría con business_category = NULL en vez de 'generic' -- lo cual es
+--    MÁS correcto (ese tenant tampoco pasó por el wizard real de categoría),
+--    no un riesgo.
+--
+-- 2) El wizard real de onboarding (orbyx-web/app/onboarding/page.tsx,
+--    handleStep1, línea ~358-367) SIEMPRE manda business_category de forma
+--    explícita en el PATCH /tenants/:id al completarse -- incluso cuando el
+--    usuario elige "Otro tipo de negocio" manda explícitamente
+--    business_category: "generic" (selectedCat?.category ?? "generic").
+--    Nunca depende del default de la columna. Por lo tanto, un tenant que
+--    genuinamente eligió "genérico" en el wizard SIEMPRE tiene ese valor
+--    escrito de forma explícita en el momento de completar onboarding --
+--    exactamente igual después de este cambio que antes. La única diferencia
+--    real es que un tenant recién creado (antes de pasar por el wizard) ya
+--    no queda con 'generic' "gratis" por el default, sino con NULL, que es
+--    el estado que el resto del sistema ya espera para "pendiente".
+--
+-- 3) PATCH /tenants/:id (server.js) solo escribe business_category cuando
+--    el campo viene explícito en el body (spread condicional) -- nunca lo
+--    deja en blanco esperando que la base rellene un default.
+--
+-- Conclusión: no se encontró ningún punto del código que dependa de que el
+-- default de la columna sea 'generic'. Es seguro quitarlo.
+-- -----------------------------------------------------------------------------
+
+ALTER TABLE tenants ALTER COLUMN business_category DROP DEFAULT;
+
+-- -----------------------------------------------------------------------------
+-- Nota: esto NO toca las filas ya existentes. Cualquier tenant que ya tenga
+-- business_category = 'generic' en la base (haya elegido "genérico" de
+-- verdad en el wizard, o lo haya recibido "gratis" del default antes de este
+-- fix) queda exactamente igual que está hoy -- este ALTER solo cambia el
+-- comportamiento de INSERTs futuros que omitan la columna.
+-- -----------------------------------------------------------------------------

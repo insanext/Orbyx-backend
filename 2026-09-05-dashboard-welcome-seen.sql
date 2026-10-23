@@ -1,0 +1,43 @@
+-- =============================================================================
+-- Migración: modal de bienvenida del dashboard (una sola vez por tenant)
+-- Fecha: 2026-09-05
+-- Propósito: trackear si un tenant ya vio el modal de bienvenida que aparece
+--            la primera vez que llega al dashboard principal con la
+--            configuración inicial (onboarding) ya terminada. Persistido en
+--            la base -- no localStorage -- para que no vuelva a aparecer al
+--            borrar datos del navegador ni entrando desde otro dispositivo.
+--            Aplica igual sin importar el plan/flujo de origen (Starter,
+--            Business, Premium): el disparador es solo esta columna, no de
+--            dónde vino el tenant.
+-- =============================================================================
+
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dashboard_welcome_seen_at timestamptz NULL;
+
+-- -----------------------------------------------------------------------------
+-- Notas de implementación
+-- -----------------------------------------------------------------------------
+--
+-- NULL (default, para tenants nuevos y existentes por igual) = todavía no
+-- vio el modal. GET /billing/account-status expone esto como
+-- dashboard_welcome_seen (boolean) -- el dashboard lo muestra cuando es
+-- false. POST /tenants/:id/dashboard-welcome-seen (server.js) marca la
+-- columna con la fecha actual la primera vez que se cierra el modal; llamadas
+-- repetidas son no-op (WHERE dashboard_welcome_seen_at IS NULL) y nunca pisan
+-- el timestamp original.
+--
+-- Importante para tenants YA EXISTENTES (Sonex, Taller Camilo, Santuario
+-- Fit, etc.): esta columna nace NULL para ellos también, así que la primera
+-- vez que alguien de esos negocios entre al dashboard después de este
+-- deploy, verá el modal de bienvenida una vez -- no hay forma de
+-- distinguir "tenant viejo" de "tenant nuevo" solo con esta columna. Si no
+-- quieres que los tenants ya existentes vean el modal retroactivamente,
+-- corre esto ANTES o INMEDIATAMENTE DESPUÉS del ALTER de arriba, para
+-- marcarlos como ya vistos:
+--
+-- UPDATE tenants
+-- SET dashboard_welcome_seen_at = now()
+-- WHERE dashboard_welcome_seen_at IS NULL;
+--
+-- (Este UPDATE es opcional -- coméntalo/bórralo si SÍ quieres que los
+-- tenants existentes vean el modal también.)
+-- -----------------------------------------------------------------------------
