@@ -1,0 +1,130 @@
+name: Respaldo diario de la base de datos
+
+# Corre todos los días ~04:30 hora de Chile (el cron de GitHub es en UTC:
+# 07:30 UTC = 04:30 con horario de verano de Chile, 03:30 con horario de
+# invierno) y también a mano desde Actions > "Respaldo diario de la base de
+# datos" > Run workflow.
+#
+# Qué respalda (todo en UN archivo cifrado):
+#   - public.sql      esquema + datos del schema public (tablas, funciones, RLS, datos)
+#   - auth-data.sql   datos del schema auth (usuarios, identidades, factores MFA)
+#                     para poder restaurar los inicios de sesión
+#   - MANIFIESTO.txt  fecha, versiones y conteos de control
+# NO incluye los archivos de Supabase Storage (ver docs/RESTORE.md).
+#
+# Si cualquier paso falla, el workflow falla y GitHub manda correo.
+# Cómo restaurar: docs/RESTORE.md
+
+on:
+  schedule:
+    - cron: "30 7 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+    steps:
+      - name: Verificar secrets
+        run: |
+          set -euo pipefail
+          if [ -z "${SUPABASE_DB_URL}" ]; then echo "::error::Falta el secret SUPABASE_DB_URL"; exit 1; fi
+          if [ -z "${BACKUP_PASSPHRASE}" ]; then echo "::error::Falta el secret BACKUP_PASSPHRASE"; exit 1; fi
+          if [ "${#BACKUP_PASSPHRASE}" -lt 16 ]; then echo "::error::BACKUP_PASSPHRASE debe tener al menos 16 caracteres"; exit 1; fi
+
+      - name: Instalar cliente de PostgreSQL 17
+        run: |
+          set -euo pipefail
+          # pg_dump debe ser de versión igual o mayor que la del servidor.
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          /usr/lib/postgresql/17/bin/pg_dump --version
+
+      - name: Generar respaldo
+        run: |
+          set -euo pipefail
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          mkdir -p work
+          cd work
+
+          SERVER_VERSION="$(psql "$SUPABASE_DB_URL" -Atc 'show server_version')"
+          echo "Versión del servidor: ${SERVER_VERSION}"
+
+          # 1) Schema public: estructura + datos.
+          pg_dump "$SUPABASE_DB_URL" \
+            --schema=public \
+            --no-owner \
+            --file=public.sql
+
+          # 2) Schema auth: solo los datos (la estructura la crea Supabase en
+          #    cada proyecto nuevo). Se excluyen datos transitorios que no
+          #    sirven para restaurar (sesiones, tokens, logs).
+          pg_dump "$SUPABASE_DB_URL" \
+            --schema=auth \
+            --data-only \
+            --no-owner \
+            --exclude-table-data='auth.audit_log_entries' \
+            --exclude-table-data='auth.sessions' \
+            --exclude-table-data='auth.refresh_tokens' \
+            --exclude-table-data='auth.flow_state' \
+            --exclude-table-data='auth.one_time_tokens' \
+            --exclude-table-data='auth.mfa_challenges' \
+            --exclude-table-data='auth.mfa_amr_claims' \
+            --file=auth-data.sql
+
+          # 3) Chequeos de que el respaldo realmente tiene lo importante.
+          test -s public.sql
+          test -s auth-data.sql
+          grep -q 'CREATE TABLE public.tenants ' public.sql || { echo "::error::public.sql no contiene la tabla tenants"; exit 1; }
+          grep -q 'CREATE TABLE public.appointments ' public.sql || { echo "::error::public.sql no contiene la tabla appointments"; exit 1; }
+          grep -q 'COPY auth.users ' auth-data.sql || { echo "::error::auth-data.sql no contiene auth.users"; exit 1; }
+
+          {
+            echo "Respaldo Orbyx"
+            echo "Fecha (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Servidor PostgreSQL: ${SERVER_VERSION}"
+            echo "pg_dump: $(pg_dump --version)"
+            echo "Usuarios en auth.users: $(psql "$SUPABASE_DB_URL" -Atc 'select count(*) from auth.users')"
+            echo "Negocios (tenants): $(psql "$SUPABASE_DB_URL" -Atc 'select count(*) from public.tenants')"
+            echo "Reservas (appointments): $(psql "$SUPABASE_DB_URL" -Atc 'select count(*) from public.appointments')"
+          } > MANIFIESTO.txt
+          cat MANIFIESTO.txt
+
+      - name: Comprimir y cifrar
+        run: |
+          set -euo pipefail
+          STAMP="$(date -u +%Y-%m-%d_%H%M)"
+          OUT="orbyx-backup-${STAMP}.tar.gz.gpg"
+
+          tar -C work -czf work.tar.gz public.sql auth-data.sql MANIFIESTO.txt
+          printf '%s' "$BACKUP_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-fd 0 --symmetric --cipher-algo AES256 \
+            --output "$OUT" work.tar.gz
+
+          # Prueba de ida y vuelta: se descifra y se lista el contenido, para
+          # asegurar que la passphrase del secret realmente abre el archivo.
+          printf '%s' "$BACKUP_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-fd 0 --decrypt "$OUT" | tar -tz > /dev/null
+
+          # Se borra todo lo que quedó sin cifrar.
+          rm -rf work work.tar.gz
+          ls -l "$OUT"
+          echo "BACKUP_FILE=$OUT" >> "$GITHUB_ENV"
+
+      - name: Guardar respaldo cifrado (30 días)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BACKUP_FILE }}
+          path: ${{ env.BACKUP_FILE }}
+          retention-days: 30
+          if-no-files-found: error

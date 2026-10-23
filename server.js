@@ -1885,8 +1885,6 @@ const corsOptions = {
 
     if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
 
-    if (/^https:\/\/orbyx[\w-]*\.vercel\.app$/.test(origin)) return cb(null, true);
-
     return cb(new Error("Not allowed by CORS: " + origin));
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -1994,21 +1992,6 @@ function getClientIp(req) {
   }
 
   return fallbackIp;
-}
-
-// Diagnóstico temporal: deja en los logs de Render, para las primeras
-// reservas tras cada arranque, qué IP vio el servidor y cuál se usó para los
-// límites (sirve para confirmar si api.orbyx.cl pasa por un proxy extra).
-// Quitar cuando se haya confirmado.
-let clientIpDebugLogsLeft = 5;
-function logClientIpDebug(req, res, next) {
-  if (clientIpDebugLogsLeft > 0) {
-    clientIpDebugLogsLeft--;
-    console.log(
-      `[IP-DEBUG] req.ip=${req.ip} xff=${req.headers["x-forwarded-for"] || "-"} cf=${req.headers["cf-connecting-ip"] || "-"} orbyx_ip=${req.headers["x-orbyx-client-ip"] || "-"} secret_sent=${Boolean(req.headers["x-orbyx-proxy-secret"])} resolved=${getClientIp(req)}`
-    );
-  }
-  next();
 }
 
 // Cupo por IP real (ver getClientIp). Valores generosos: una carga de la
@@ -7211,7 +7194,6 @@ async function checkPublicBookingAbuse({ tenantId, normalizedEmail, normalizedPh
 
 app.post(
   "/appointments/slot",
-  logClientIpDebug,
   publicLimiter,
   publicBookingBurstLimiter,
   publicBookingDailyLimiter,
