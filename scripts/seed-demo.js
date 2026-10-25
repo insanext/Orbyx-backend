@@ -466,9 +466,18 @@ const INSURANCE = ["Fonasa", "Fonasa", "Fonasa", "Isapre", "Isapre", "Particular
 // ─── Supabase ────────────────────────────────────────────────────────────────
 
 function getSupabase() {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  // Acepta la URL tal como la copia el dashboard de Supabase: sin espacios,
+  // sin "/" final y sin el sufijo "/rest/v1" (el cliente lo agrega solo).
+  const url = String(process.env.SUPABASE_URL || "")
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/rest\/v1$/i, "")
+    .replace(/\/+$/, "");
+  const key = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
   if (!url || !key) fail("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el .env.");
+  if (!/^https:\/\/[a-z0-9-]+\.supabase\.co$/i.test(url)) {
+    console.warn("⚠ SUPABASE_URL no tiene la forma https://<ref>.supabase.co; se usa tal cual.");
+  }
   return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
 }
 
@@ -516,7 +525,8 @@ async function preflight(supabase) {
   if (problems.length) {
     fail(
       `El esquema no calza con lo que el script necesita (no se escribió nada):\n${problems.join("\n")}\n` +
-        "¿Aplicaste 2026-10-24-demo-tenants.sql en este proyecto de Supabase?"
+        "Si dice 'Invalid path' o 'Invalid API key', revisa los secrets SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY.\n" +
+        "Si menciona la columna is_demo, falta aplicar 2026-10-24-demo-tenants.sql en este proyecto."
     );
   }
 }
