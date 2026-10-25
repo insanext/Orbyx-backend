@@ -947,15 +947,18 @@ async function seedTenant(supabase, def, password) {
   });
   await insertRows(supabase, "staff", staffRows);
 
+  // staff_hours admite UN bloque por profesional y día (staff_hours_unique):
+  // se guarda el turno completo (primer inicio → último término). La colación
+  // entre bloques se respeta igual porque ahí no se agendan citas.
   const staffHours = [];
   for (const s of def.staff) {
     for (const [day, blocks] of Object.entries(s.hours)) {
       const businessBlocks = def.businessHours[day] || [];
-      blocks.forEach(([start, end], index) => {
-        const inside = businessBlocks.some(([bs, be]) => hm(start) >= hm(bs) && hm(end) <= hm(be));
-        if (!inside) throw new Error(`${def.name}: horario de ${s.name} (${day} ${start}-${end}) fuera del horario del negocio`);
-        staffHours.push({ tenant_id: def.tenantId, branch_id: branchId, staff_id: staffIds[s.key], day_of_week: Number(day), block_order: index + 1, enabled: true, start_time: toTime(hm(start)), end_time: toTime(hm(end)) });
-      });
+      const start = Math.min(...blocks.map(([a]) => hm(a)));
+      const end = Math.max(...blocks.map(([, b]) => hm(b)));
+      const inside = businessBlocks.some(([bs, be]) => start >= hm(bs) && end <= hm(be));
+      if (!inside) throw new Error(`${def.name}: horario de ${s.name} (día ${day}) fuera del horario del negocio`);
+      staffHours.push({ tenant_id: def.tenantId, branch_id: branchId, staff_id: staffIds[s.key], day_of_week: Number(day), block_order: 1, enabled: true, start_time: toTime(start), end_time: toTime(end) });
     }
   }
   await insertRows(supabase, "staff_hours", staffHours);
