@@ -360,6 +360,8 @@ Optional add-ons a customer adds to a service when booking (e.g. "Lavado +$2.000
 - **Staff picker**: `StaffCarousel` (stories style: round avatar/photo or initial, name + role, first item "Cualquiera" selected by default, `ring-indigo-600` when selected; `role="radiogroup"`), rendered right above the days row (below week selector + service chip). The old vertical list in the side column and every "Especialista en …" text were removed. The public page has no per-tenant color: indigo is the brand color everywhere.
 - **Staff by service**: `GET /public/services/:slug` now also returns `staff` (active staff of the branch: id, name, role, color, photo_url) and `services[].staff_ids` (active staff linked via `staff_services`). Without a service the catalog panel shows all staff ("Nuestro equipo"); with a service, `staffOptions` (from `/public/staff/:slug/:service_id`). `selectCatalogService` keeps the chosen professional only if `service.staff_ids` includes it, otherwise back to "Cualquiera" (old backends without `staff_ids` → always "Cualquiera").
 - Slots were already filtered by professional (`staff_id` → `/public/slots`), unchanged.
+- Staff photos on the public page are square with `rounded-lg` corners (carousel, catalog team strip, side panel) — not circles.
+- Catalog on mobile: compact category tabs (`text-xs`, `py-1.5`) and a horizontal "Nuestro equipo" strip inside `CatalogSidebar` (`lg:hidden`); the side `ProfessionalsPanel` is desktop-only (`hidden lg:block`). `CatalogSidebar` root needs `min-w-0` (grid item) or the strip widens the page.
 - Verified headless at 380px (Chromium from npm `@sparticuz/chromium` + `puppeteer-core`, mock backend): no page horizontal scroll, carousel scrolls inside.
 
 ## Business Categories
