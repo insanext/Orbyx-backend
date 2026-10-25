@@ -7274,6 +7274,7 @@ const {
   notes,
   next_control_at,
 
+  extra_ids,
 } = req.body;
 
     function isValidEmail(email) {
@@ -7484,6 +7485,7 @@ let isGroup = false;
 let capacity = 1;
 let customerInstructions = null;
 let serviceRequiresDeposit = false;
+let servicePrice = null;
 
 if (service_id) {
   const { data: service, error: serviceErr } = await supabase
@@ -7508,7 +7510,23 @@ if (service_id) {
   capacity = Number(service.capacity || 1);
   customerInstructions = service.customer_instructions || null;
   serviceRequiresDeposit = Boolean(service.requires_deposit);
+  servicePrice = service.price === null || service.price === undefined ? null : Number(service.price);
 }
+
+// Extras elegidos: se validan contra el catálogo de la sucursal y sus
+// minutos alargan la cita (disponibilidad, choques y end_at). El precio y
+// los minutos salen del catálogo, nunca del body.
+const bookingExtras = await resolveBookingExtras({
+  tenant_id: cal.tenant_id,
+  branch_id: resolvedBranchId,
+  service_id,
+  rawExtraIds: extra_ids,
+  isGroup,
+});
+if (!bookingExtras.ok) {
+  return res.status(bookingExtras.status).json({ error: bookingExtras.error });
+}
+const extrasMinutes = bookingExtras.minutes;
 
 // El interruptor maestro del tenant (tenantRequiresDeposit, que ya exige
 // ficha bancaria completa — ver arriba) habilita el sistema completo, pero
@@ -7619,7 +7637,7 @@ if (!isGroup) {
       }
     }
 
-    const totalMinutes = duration + bufferBefore + bufferAfter;
+    const totalMinutes = duration + extrasMinutes + bufferBefore + bufferAfter;
 
 const slotDateStr = String(date).slice(0, 10);
 
@@ -7722,7 +7740,7 @@ const slotDateStr = String(date).slice(0, 10);
     }
 
     const end = new Date(
-      start.getTime() + (duration + bufferBefore + bufferAfter) * 60 * 1000
+      start.getTime() + (duration + extrasMinutes + bufferBefore + bufferAfter) * 60 * 1000
     );
 
 const customer = await upsertCustomerFromAppointment({
@@ -7755,6 +7773,13 @@ if ((overlappingAppointments || []).length > 0) {
 }
 
     const cancelToken = crypto.randomBytes(24).toString("hex");
+
+    const appointmentExtrasColumnsReady = await hasAppointmentExtrasColumns();
+    if (bookingExtras.extras.length > 0 && !appointmentExtrasColumnsReady) {
+      return res.status(503).json({
+        error: "Los extras todavía no están habilitados. Intenta reservar sin extras.",
+      });
+    }
 
     // Depósito previo: la cita se crea "booked" igual que cualquier otra (así
     // bloquea el horario usando toda la lógica de disponibilidad existente,
@@ -7791,6 +7816,17 @@ next_control_at: next_control_at || null,
         ...(appointmentRequiresDeposit && {
           deposit_status: "pending",
           deposit_hold_expires_at: depositHoldExpiresAt,
+        }),
+        // Snapshot de extras y precio (solo si la migración de extras ya
+        // está aplicada; sin ella el insert queda igual que antes).
+        ...(appointmentExtrasColumnsReady && {
+          extras: bookingExtras.extras.length ? bookingExtras.extras : null,
+          extras_minutes: extrasMinutes,
+          extras_price: bookingExtras.price,
+          price_snapshot:
+            servicePrice === null && bookingExtras.price === 0
+              ? null
+              : (servicePrice || 0) + bookingExtras.price,
         }),
       })
       .select("*");
@@ -20274,6 +20310,402 @@ app.delete('/service-groups/:id', tenantAuthWrite, async (req, res) => {
   }
 })
 
+/* ======================================================
+   ✅ Extras de servicios (2026-10-25, migración 2026-10-25-service-extras.sql)
+   Agregados opcionales que el cliente suma a un servicio al reservar
+   (ej. "Lavado +$2.000 +15 min"). Catálogo por sucursal (service_extras) y
+   qué extras ofrece cada servicio (service_extra_links, muchos a muchos).
+   Precio y minutos SIEMPRE se recalculan acá desde el catálogo: nunca se
+   confía en lo que mande el navegador. Si la migración todavía no está
+   aplicada, todo se comporta como antes (sin extras).
+====================================================== */
+
+const SERVICE_EXTRA_LIMITS = {
+  nameMax: 80,
+  descriptionMax: 300,
+  priceMax: 10000000,
+  minutesMax: 240,
+  perBooking: 10,
+};
+
+function normalizeExtraIds(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : typeof raw === "string"
+      ? raw.split(",")
+      : [];
+  const uuidLike = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return [...new Set(list.map((v) => String(v || "").trim()).filter((v) => uuidLike.test(v)))];
+}
+
+function parseServiceExtraPayload(body, { partial = false } = {}) {
+  const out = {};
+  if (!partial || body.name !== undefined) {
+    const name = String(body.name || "").trim();
+    if (!name) return { error: "El nombre del extra es obligatorio" };
+    if (name.length > SERVICE_EXTRA_LIMITS.nameMax) {
+      return { error: `El nombre del extra admite hasta ${SERVICE_EXTRA_LIMITS.nameMax} caracteres` };
+    }
+    out.name = name;
+  }
+  if (!partial || body.price !== undefined) {
+    const price = Number(body.price ?? 0);
+    if (!Number.isFinite(price) || price < 0 || price > SERVICE_EXTRA_LIMITS.priceMax) {
+      return { error: "El precio del extra no es válido" };
+    }
+    out.price = Math.round(price);
+  }
+  if (!partial || body.duration_minutes !== undefined) {
+    const minutes = Number(body.duration_minutes ?? 0);
+    if (!Number.isInteger(minutes) || minutes < 0 || minutes > SERVICE_EXTRA_LIMITS.minutesMax) {
+      return { error: `Los minutos del extra deben ser un número entero entre 0 y ${SERVICE_EXTRA_LIMITS.minutesMax}` };
+    }
+    out.duration_minutes = minutes;
+  }
+  if (body.description !== undefined) {
+    const description = String(body.description || "").trim();
+    if (description.length > SERVICE_EXTRA_LIMITS.descriptionMax) {
+      return { error: `La descripción admite hasta ${SERVICE_EXTRA_LIMITS.descriptionMax} caracteres` };
+    }
+    out.description = description || null;
+  }
+  if (body.active !== undefined) out.active = Boolean(body.active);
+  return { value: out };
+}
+
+// Extras activos que ofrece cada servicio, para varios servicios a la vez.
+// Devuelve Map<service_id, extra[]>. Sin la migración devuelve un Map vacío.
+async function getActiveExtrasByService({ tenant_id, branch_id, serviceIds }) {
+  const result = new Map();
+  if (!serviceIds || serviceIds.length === 0) return result;
+
+  const { data: links, error: linksError } = await supabase
+    .from("service_extra_links")
+    .select("service_id, extra_id")
+    .eq("tenant_id", tenant_id)
+    .in("service_id", serviceIds);
+  if (linksError) {
+    if (isMissingSchemaError(linksError)) return result;
+    throw linksError;
+  }
+  if (!links || links.length === 0) return result;
+
+  const extraIds = [...new Set(links.map((l) => l.extra_id))];
+  let extrasQuery = supabase
+    .from("service_extras")
+    .select("id, name, description, price, duration_minutes, sort_order")
+    .eq("tenant_id", tenant_id)
+    .in("id", extraIds)
+    .eq("active", true)
+    .is("deleted_at", null);
+  if (branch_id) extrasQuery = extrasQuery.eq("branch_id", branch_id);
+  const { data: extras, error: extrasError } = await extrasQuery;
+  if (extrasError) {
+    if (isMissingSchemaError(extrasError)) return result;
+    throw extrasError;
+  }
+
+  const byId = new Map((extras || []).map((e) => [e.id, e]));
+  for (const link of links) {
+    const extra = byId.get(link.extra_id);
+    if (!extra) continue;
+    if (!result.has(link.service_id)) result.set(link.service_id, []);
+    result.get(link.service_id).push({
+      id: extra.id,
+      name: extra.name,
+      description: extra.description || null,
+      price: Number(extra.price) || 0,
+      duration_minutes: Number(extra.duration_minutes) || 0,
+      sort_order: Number(extra.sort_order) || 0,
+    });
+  }
+  for (const list of result.values()) {
+    list.sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name, "es"));
+  }
+  return result;
+}
+
+// Valida los extras pedidos para UNA reserva y devuelve el snapshot. Cada id
+// debe ser un extra activo de esa sucursal y estar vinculado a ese servicio.
+// { ok, extras, minutes, price } o { ok: false, status, error }.
+async function resolveBookingExtras({ tenant_id, branch_id, service_id, rawExtraIds, isGroup }) {
+  const extraIds = normalizeExtraIds(rawExtraIds);
+  if (extraIds.length === 0) return { ok: true, extras: [], minutes: 0, price: 0 };
+  if (!service_id) {
+    return { ok: false, status: 400, error: "Los extras requieren un servicio" };
+  }
+  if (isGroup) {
+    return { ok: false, status: 400, error: "Los servicios grupales no admiten extras" };
+  }
+  if (extraIds.length > SERVICE_EXTRA_LIMITS.perBooking) {
+    return { ok: false, status: 400, error: `Máximo ${SERVICE_EXTRA_LIMITS.perBooking} extras por reserva` };
+  }
+
+  const byService = await getActiveExtrasByService({ tenant_id, branch_id, serviceIds: [service_id] });
+  const available = new Map((byService.get(service_id) || []).map((e) => [e.id, e]));
+  const chosen = [];
+  for (const id of extraIds) {
+    const extra = available.get(id);
+    if (!extra) {
+      return {
+        ok: false,
+        status: 409,
+        error: "Uno de los extras elegidos ya no está disponible. Actualiza la página e intenta de nuevo.",
+      };
+    }
+    chosen.push({
+      id: extra.id,
+      name: extra.name,
+      price: extra.price,
+      duration_minutes: extra.duration_minutes,
+    });
+  }
+  return {
+    ok: true,
+    extras: chosen,
+    minutes: chosen.reduce((sum, e) => sum + e.duration_minutes, 0),
+    price: chosen.reduce((sum, e) => sum + e.price, 0),
+  };
+}
+
+// ¿appointments ya tiene las columnas de extras? Se consulta una vez y se
+// recuerda (si faltan, se reintenta cada 60 s por si se aplica la migración).
+let appointmentExtrasColumnsCache = { value: false, checkedAt: 0 };
+async function hasAppointmentExtrasColumns() {
+  if (appointmentExtrasColumnsCache.value) return true;
+  if (Date.now() - appointmentExtrasColumnsCache.checkedAt < 60 * 1000) return false;
+  const { error } = await supabase
+    .from("appointments")
+    .select("extras, extras_minutes, extras_price, price_snapshot")
+    .limit(1);
+  appointmentExtrasColumnsCache = { value: !error, checkedAt: Date.now() };
+  return !error;
+}
+
+async function getOwnedServiceExtra(tenant_id, id) {
+  const { data, error } = await supabase
+    .from("service_extras")
+    .select("id, tenant_id, branch_id")
+    .eq("id", id)
+    .eq("tenant_id", tenant_id)
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+function extrasSchemaMissingResponse(res) {
+  return res.status(503).json({
+    error: "Los extras todavía no están habilitados (falta aplicar la migración 2026-10-25-service-extras.sql).",
+    code: "extras_unavailable",
+  });
+}
+
+// Catálogo de la sucursal + qué extras tiene cada servicio.
+app.get("/service-extras", tenantAuth, async (req, res) => {
+  try {
+    const tenant_id = req.authenticatedUser.tenant_id;
+    const { branch_id } = req.query;
+    if (!branch_id) return res.status(400).json({ error: "branch_id es obligatorio" });
+    const resolvedBranchId = await resolveBranchId({ tenant_id, branch_id });
+
+    const { data: extras, error } = await supabase
+      .from("service_extras")
+      .select("id, name, description, price, duration_minutes, active, sort_order, created_at")
+      .eq("tenant_id", tenant_id)
+      .eq("branch_id", resolvedBranchId)
+      .is("deleted_at", null)
+      .order("sort_order", { ascending: true })
+      .order("created_at", { ascending: true });
+    if (error) {
+      if (isMissingSchemaError(error)) return res.json({ available: false, extras: [], links: [] });
+      throw error;
+    }
+
+    const { data: links, error: linksError } = await supabase
+      .from("service_extra_links")
+      .select("service_id, extra_id")
+      .eq("tenant_id", tenant_id)
+      .eq("branch_id", resolvedBranchId);
+    if (linksError) throw linksError;
+
+    return res.json({ available: true, extras: extras || [], links: links || [] });
+  } catch (err) {
+    console.error("GET /service-extras error:", err.message);
+    return res.status(500).json({ error: "Error obteniendo los extras" });
+  }
+});
+
+app.post("/service-extras", tenantAuthWrite, async (req, res) => {
+  try {
+    const tenant_id = req.authenticatedUser.tenant_id;
+    const { branch_id } = req.body || {};
+    if (!branch_id) return res.status(400).json({ error: "branch_id es obligatorio" });
+    const resolvedBranchId = await resolveBranchId({ tenant_id, branch_id });
+
+    const parsed = parseServiceExtraPayload(req.body || {});
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    const { data: last, error: lastError } = await supabase
+      .from("service_extras")
+      .select("sort_order")
+      .eq("tenant_id", tenant_id)
+      .eq("branch_id", resolvedBranchId)
+      .order("sort_order", { ascending: false })
+      .limit(1);
+    if (lastError) {
+      if (isMissingSchemaError(lastError)) return extrasSchemaMissingResponse(res);
+      throw lastError;
+    }
+
+    const { data, error } = await supabase
+      .from("service_extras")
+      .insert({
+        tenant_id,
+        branch_id: resolvedBranchId,
+        ...parsed.value,
+        sort_order: last?.[0] ? Number(last[0].sort_order || 0) + 1 : 0,
+      })
+      .select("id, name, description, price, duration_minutes, active, sort_order, created_at")
+      .single();
+    if (error) throw error;
+    return res.status(201).json({ ok: true, extra: data });
+  } catch (err) {
+    console.error("POST /service-extras error:", err.message);
+    return res.status(500).json({ error: "Error creando el extra" });
+  }
+});
+
+app.put("/service-extras/links", tenantAuthWrite, async (req, res) => {
+  try {
+    const tenant_id = req.authenticatedUser.tenant_id;
+    const { branch_id, service_id } = req.body || {};
+    if (!branch_id || !service_id) {
+      return res.status(400).json({ error: "branch_id y service_id son obligatorios" });
+    }
+    const resolvedBranchId = await resolveBranchId({ tenant_id, branch_id });
+    const extraIds = normalizeExtraIds(req.body?.extra_ids);
+
+    const { data: service, error: serviceError } = await supabase
+      .from("services")
+      .select("id, is_group")
+      .eq("id", service_id)
+      .eq("tenant_id", tenant_id)
+      .eq("branch_id", resolvedBranchId)
+      .is("deleted_at", null)
+      .maybeSingle();
+    if (serviceError) throw serviceError;
+    if (!service) return res.status(404).json({ error: "Servicio no encontrado" });
+    if (service.is_group && extraIds.length > 0) {
+      return res.status(400).json({ error: "Los servicios grupales no admiten extras" });
+    }
+
+    if (extraIds.length > 0) {
+      const { data: owned, error: ownedError } = await supabase
+        .from("service_extras")
+        .select("id")
+        .eq("tenant_id", tenant_id)
+        .eq("branch_id", resolvedBranchId)
+        .is("deleted_at", null)
+        .in("id", extraIds);
+      if (ownedError) {
+        if (isMissingSchemaError(ownedError)) return extrasSchemaMissingResponse(res);
+        throw ownedError;
+      }
+      if ((owned || []).length !== extraIds.length) {
+        return res.status(400).json({ error: "Uno de los extras no pertenece a esta sucursal" });
+      }
+    }
+
+    const { error: deleteError } = await supabase
+      .from("service_extra_links")
+      .delete()
+      .eq("tenant_id", tenant_id)
+      .eq("service_id", service_id);
+    if (deleteError) {
+      if (isMissingSchemaError(deleteError)) {
+        return extraIds.length ? extrasSchemaMissingResponse(res) : res.json({ ok: true, extra_ids: [] });
+      }
+      throw deleteError;
+    }
+
+    if (extraIds.length > 0) {
+      const { error: insertError } = await supabase.from("service_extra_links").insert(
+        extraIds.map((extra_id) => ({
+          service_id,
+          extra_id,
+          tenant_id,
+          branch_id: resolvedBranchId,
+        }))
+      );
+      if (insertError) throw insertError;
+    }
+
+    return res.json({ ok: true, extra_ids: extraIds });
+  } catch (err) {
+    console.error("PUT /service-extras/links error:", err.message);
+    return res.status(500).json({ error: "Error guardando los extras del servicio" });
+  }
+});
+
+app.patch("/service-extras/:id", tenantAuthWrite, async (req, res) => {
+  try {
+    const tenant_id = req.authenticatedUser.tenant_id;
+    const existing = await getOwnedServiceExtra(tenant_id, req.params.id);
+    if (!existing) return res.status(404).json({ error: "Extra no encontrado" });
+
+    const parsed = parseServiceExtraPayload(req.body || {}, { partial: true });
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    if (Object.keys(parsed.value).length === 0) {
+      return res.status(400).json({ error: "No hay cambios que guardar" });
+    }
+
+    const { data, error } = await supabase
+      .from("service_extras")
+      .update({ ...parsed.value, updated_at: new Date().toISOString() })
+      .eq("id", existing.id)
+      .eq("tenant_id", tenant_id)
+      .select("id, name, description, price, duration_minutes, active, sort_order, created_at")
+      .single();
+    if (error) throw error;
+    return res.json({ ok: true, extra: data });
+  } catch (err) {
+    if (isMissingSchemaError(err)) return extrasSchemaMissingResponse(res);
+    console.error("PATCH /service-extras/:id error:", err.message);
+    return res.status(500).json({ error: "Error actualizando el extra" });
+  }
+});
+
+// Borrado lógico: las citas ya hechas conservan su snapshot; el extra deja de
+// ofrecerse en todos los servicios.
+app.delete("/service-extras/:id", tenantAuthWrite, async (req, res) => {
+  try {
+    const tenant_id = req.authenticatedUser.tenant_id;
+    const existing = await getOwnedServiceExtra(tenant_id, req.params.id);
+    if (!existing) return res.status(404).json({ error: "Extra no encontrado" });
+
+    const { error: linksError } = await supabase
+      .from("service_extra_links")
+      .delete()
+      .eq("tenant_id", tenant_id)
+      .eq("extra_id", existing.id);
+    if (linksError) throw linksError;
+
+    const now = new Date().toISOString();
+    const { error } = await supabase
+      .from("service_extras")
+      .update({ deleted_at: now, active: false, updated_at: now })
+      .eq("id", existing.id)
+      .eq("tenant_id", tenant_id);
+    if (error) throw error;
+    return res.json({ ok: true });
+  } catch (err) {
+    if (isMissingSchemaError(err)) return extrasSchemaMissingResponse(res);
+    console.error("DELETE /service-extras/:id error:", err.message);
+    return res.status(500).json({ error: "Error eliminando el extra" });
+  }
+});
+
 app.patch('/services/reorder', tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, order } = req.body
@@ -20882,12 +21314,29 @@ const filteredServices = (services || []).filter((s) =>
       return res.status(500).json({ error: servicesError.message });
     }
 
+    // Extras que ofrece cada servicio (campo aditivo; sin la migración o ante
+    // un error queda [] y la reserva funciona igual que antes).
+    let extrasByService = new Map();
+    try {
+      extrasByService = await getActiveExtrasByService({
+        tenant_id: tenant.id,
+        branch_id: resolvedBranchId,
+        serviceIds: filteredServices.filter((s) => !s.is_group).map((s) => s.id),
+      });
+    } catch (extrasErr) {
+      console.warn("public/services: no se pudieron leer los extras:", extrasErr.message);
+    }
+    const servicesWithExtras = filteredServices.map((s) => ({
+      ...s,
+      extras: (extrasByService.get(s.id) || []).map(({ sort_order, ...extra }) => extra),
+    }));
+
     return res.json({
       business: toPublicTenant(tenant),
       branch: withEffectiveFullAddress(branch, tenant),
       branches: (activeBranches || []).map((b) => withEffectiveFullAddress(b, tenant)),
       calendar_id: calendar.id,
-      services: filteredServices,
+      services: servicesWithExtras,
       service_groups: serviceGroups || [],
       business_hours: businessHours,
     });
@@ -21288,6 +21737,21 @@ app.get("/public/slots/:slug/:service_id", publicLimiter, async (req, res) => {
 const isGroup = Boolean(service.is_group);
 const capacity = Number(service.capacity || 1);
 
+// Extras elegidos (?extra_ids=a,b): suman sus minutos a la duración que se
+// usa para ver qué horarios caben. Se validan contra el catálogo (mismo
+// helper que POST /appointments/slot), así lo que se muestra calza con lo
+// que después se reserva.
+const slotExtras = await resolveBookingExtras({
+  tenant_id: tenant.id,
+  branch_id: resolvedBranchId,
+  service_id,
+  rawExtraIds: req.query.extra_ids,
+  isGroup,
+});
+if (!slotExtras.ok) {
+  return res.status(slotExtras.status).json({ error: slotExtras.error });
+}
+
 async function attachCapacityToSlots(slotsToCheck) {
   if (!isGroup || !slotsToCheck.length) {
     return slotsToCheck.map((slot) => ({
@@ -21425,7 +21889,8 @@ if (!candidateStaffIds.length) {
       const totalMinutes =
         (service.duration_minutes || 0) +
         (service.buffer_before_minutes || 0) +
-        (service.buffer_after_minutes || 0);
+        (service.buffer_after_minutes || 0) +
+        slotExtras.minutes;
       const visibleStepMinutes = Math.max(
         baseSlotMinutes,
         totalMinutes || baseSlotMinutes
@@ -21488,6 +21953,8 @@ return res.json({
       branch,
       calendar_id: calendar.id,
       service,
+      extras: slotExtras.extras,
+      extras_minutes: slotExtras.minutes,
       date,
       total: slots.length,
       slots,

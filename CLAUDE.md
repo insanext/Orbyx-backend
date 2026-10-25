@@ -339,6 +339,18 @@ Applies only to public bookings (`POST /appointments/slot` without `booking_orig
 - Known: admin stats/directory still list demo tenants (not filtered by `is_demo`).
 - **From the phone**: GitHub Actions workflow `.github/workflows/seed-demo.yml` (manual only, input `modo`: `crear` | `resetear`) runs the same script with repo secrets `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DEMO_PASSWORD`.
 
+## Service Extras (2026-10-25, round 1 of 3)
+
+Optional add-ons a customer adds to a service when booking (e.g. "Lavado +$2.000 +15 min"). Migration `2026-10-25-service-extras.sql`.
+
+- **Model**: `service_extras` = catalog **per branch** (name, price, `duration_minutes` 0-240, `active`, soft delete `deleted_at`). `service_extra_links` (PK `service_id, extra_id`) = which extras each service offers; one extra can be in many services. Both tables are service-role only (RLS on, no grants). Group services never have extras.
+- **Snapshot on the appointment**: `appointments.extras` (jsonb `[{id,name,price,duration_minutes}]`), `extras_minutes`, `extras_price`, `price_snapshot` (service price + extras). `duration_minutes_snapshot` stays the service's own duration. Written only when `hasAppointmentExtrasColumns()` (cached probe) is true, so the insert is unchanged before the migration.
+- **Single source of truth**: `resolveBookingExtras()` (server.js, "Extras de servicios" block): validates ids (active, same tenant+branch, linked to that service, max 10) and returns minutes/price from the catalog. Never trust client prices/minutes.
+- **Availability**: extras minutes are added to the service total in exactly 2 places that must stay in sync: `GET /public/slots/:slug/:service_id` (`?extra_ids=a,b`) and `POST /appointments/slot` (`extra_ids` in body; also extends `end_at`, overlap checks and the booking guard). The legacy `GET /slots` is unused by the frontend and does not know extras.
+- **Endpoints** (`/service` write rule → module `servicios`): `GET /service-extras?tenant_id&branch_id` → `{ available, extras, links }` (`available:false` if the migration is missing), `POST /service-extras`, `PATCH /service-extras/:id`, `DELETE /service-extras/:id` (soft, removes links), `PUT /service-extras/links` `{ service_id, extra_ids }` (replaces). `GET /public/services/:slug` adds `services[].extras` (active, linked).
+- **Panel Servicios** (`orbyx-web`): form "Crear servicio" now opens with a button (closed by default, closes after saving / on branch change). Catalog card `components/services/ServiceExtrasManager.tsx`; checkboxes `ServiceExtrasPicker` in create/edit forms; row badge "N extras". Everything hides when `available` is false.
+- **Pending rounds**: (2) public booking page + Agenda manual booking send `extra_ids` (the Next proxies `app/api/public-slots/...` and `app/api/appointments/slot` must forward them); (3) show extras in appointment detail, confirmation email, and use `price_snapshot` in Indicadores. WhatsApp template can't show extras without a new Meta-approved template.
+
 ## Business Categories
 
 Known categories:
