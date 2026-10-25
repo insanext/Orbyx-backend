@@ -20648,6 +20648,59 @@ app.put("/service-extras/links", tenantAuthWrite, async (req, res) => {
   }
 });
 
+// Asigna un extra a varios servicios de una vez (desde el formulario del
+// extra). Reemplaza la lista completa de servicios de ese extra.
+app.put("/service-extras/:id/services", tenantAuthWrite, async (req, res) => {
+  try {
+    const tenant_id = req.authenticatedUser.tenant_id;
+    const existing = await getOwnedServiceExtra(tenant_id, req.params.id);
+    if (!existing) return res.status(404).json({ error: "Extra no encontrado" });
+    const serviceIds = normalizeExtraIds(req.body?.service_ids);
+
+    if (serviceIds.length > 0) {
+      const { data: owned, error: ownedError } = await supabase
+        .from("services")
+        .select("id, is_group")
+        .eq("tenant_id", tenant_id)
+        .eq("branch_id", existing.branch_id)
+        .is("deleted_at", null)
+        .in("id", serviceIds);
+      if (ownedError) throw ownedError;
+      if ((owned || []).length !== serviceIds.length) {
+        return res.status(400).json({ error: "Uno de los servicios no pertenece a esta sucursal" });
+      }
+      if ((owned || []).some((s) => s.is_group)) {
+        return res.status(400).json({ error: "Los servicios grupales no admiten extras" });
+      }
+    }
+
+    const { error: deleteError } = await supabase
+      .from("service_extra_links")
+      .delete()
+      .eq("tenant_id", tenant_id)
+      .eq("extra_id", existing.id);
+    if (deleteError) throw deleteError;
+
+    if (serviceIds.length > 0) {
+      const { error: insertError } = await supabase.from("service_extra_links").insert(
+        serviceIds.map((service_id) => ({
+          service_id,
+          extra_id: existing.id,
+          tenant_id,
+          branch_id: existing.branch_id,
+        }))
+      );
+      if (insertError) throw insertError;
+    }
+
+    return res.json({ ok: true, service_ids: serviceIds });
+  } catch (err) {
+    if (isMissingSchemaError(err)) return extrasSchemaMissingResponse(res);
+    console.error("PUT /service-extras/:id/services error:", err.message);
+    return res.status(500).json({ error: "Error asignando el extra a los servicios" });
+  }
+});
+
 app.patch("/service-extras/:id", tenantAuthWrite, async (req, res) => {
   try {
     const tenant_id = req.authenticatedUser.tenant_id;
