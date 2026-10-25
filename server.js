@@ -1611,7 +1611,8 @@ async function sendBookingConfirmations({
   petId,
 }) {
   // Tenants demo: nunca envían confirmaciones (ni email ni WhatsApp).
-  if (await isDemoTenant(tenantId)) return;
+  // Debe devolver el mismo objeto: los llamadores desestructuran el resultado.
+  if (await isDemoTenant(tenantId)) return { waConfirmationSent: false };
 
   const start = startAt instanceof Date ? startAt : new Date(startAt);
 
