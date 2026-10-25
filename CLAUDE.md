@@ -337,6 +337,7 @@ Applies only to public bookings (`POST /appointments/slot` without `booking_orig
 - **No usage counters / billing**: `incrementMonthlyUsage`, `consumeResourceUsage`, `trackWhatsAppMessage` no-op for demo tenants; `app.use("/billing")` returns 403 on POST/PATCH/PUT for a demo `tenant_id`; `GET /billing/account-status` reports them as `active`. Data side: `plan_slug = premium`, `is_trial = false`, `trial_ends_at = null`, `billing_cycle_end = 2099-12-31` (never blocked by `computeBillingAccessState` / `lib/dashboard-access.ts`).
 - **Data shape**: dates relative to today (Santiago): 3 weeks of history (completed / canceled / no_show) and 3 weeks of future agenda (~75-85% occupancy Mon-Fri) inside each staff member's `staff_hours`, no overlaps. Vet: pets + `clinical_notes` (pet_id). Clinic (`clinica` / `salud_general`): patients are `customers` (pet_id null) with RUT/previsión and `clinical_notes` with `extra_fields` peso/talla/IMC. ~15% of customers carry `imported_last_visit_at` so the En riesgo / Inactivo categories show up.
 - Known: admin stats/directory still list demo tenants (not filtered by `is_demo`).
+- **From the phone**: GitHub Actions workflow `.github/workflows/seed-demo.yml` (manual only, input `modo`: `crear` | `resetear`) runs the same script with repo secrets `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DEMO_PASSWORD`.
 
 ## Business Categories
 

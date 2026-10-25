@@ -1,0 +1,65 @@
+name: Tenants demo (seed)
+
+# Crea o regenera los 4 tenants DEMO (scripts/seed-demo.js) sin necesitar un
+# computador: Actions > "Tenants demo (seed)" > Run workflow.
+#   - crear:   crea los tenants demo que falten (no toca los que ya existen)
+#   - resetear: borra SOLO los tenants con is_demo = true y slug demo-* y los
+#               vuelve a crear con fechas relativas a hoy
+# Nunca corre solo: únicamente a mano.
+#
+# Secrets requeridos (Settings > Secrets and variables > Actions):
+#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DEMO_PASSWORD
+# Requiere la migración 2026-10-24-demo-tenants.sql aplicada.
+
+on:
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "crear = solo los que faltan · resetear = borrar demos y regenerar"
+        required: true
+        default: crear
+        type: choice
+        options:
+          - crear
+          - resetear
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seed-demo
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DEMO_PASSWORD: ${{ secrets.DEMO_PASSWORD }}
+    steps:
+      - name: Verificar secrets
+        run: |
+          set -euo pipefail
+          for v in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY DEMO_PASSWORD; do
+            if [ -z "${!v}" ]; then echo "::error::Falta el secret $v"; exit 1; fi
+          done
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Correr seed (${{ inputs.modo }})
+        run: |
+          if [ "${{ inputs.modo }}" = "resetear" ]; then
+            npm run seed:demo:reset
+          else
+            npm run seed:demo
+          fi
