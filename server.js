@@ -28,6 +28,7 @@ const {
   sendPasswordResetEmail,
   sendWelcomeAccessEmail,
   sendAddonExpiryReminderEmail,
+  isDemoEmailRecipient,
 } = require("./email");
 const {
   sendWhatsAppTemplate,
@@ -1153,6 +1154,35 @@ async function isStarterTenantInTrial(tenant_id) {
   return true;
 }
 
+// Tenants DEMO (tenants.is_demo, migración 2026-10-24-demo-tenants.sql):
+// datos ficticios para videos y demos (scripts/seed-demo.js). Nunca envían
+// WhatsApp ni correos, no suman a los contadores de uso y no pasan por
+// Flow. Cache de 60 s para no consultar en cada envío. Si la columna todavía
+// no existe (migración sin correr) la consulta falla y se asume "ningún
+// demo": el código funciona igual que antes hasta aplicar la migración.
+const DEMO_TENANT_CACHE_MS = 60 * 1000;
+let demoTenantIdsCache = { ids: new Set(), loadedAt: 0 };
+async function getDemoTenantIds() {
+  if (Date.now() - demoTenantIdsCache.loadedAt < DEMO_TENANT_CACHE_MS) {
+    return demoTenantIdsCache.ids;
+  }
+  try {
+    const { data, error } = await supabase.from("tenants").select("id").eq("is_demo", true);
+    if (error) throw error;
+    demoTenantIdsCache = { ids: new Set((data || []).map((row) => String(row.id))), loadedAt: Date.now() };
+  } catch (err) {
+    // Se deja el último valor conocido y se reintenta en el próximo ciclo.
+    demoTenantIdsCache = { ids: demoTenantIdsCache.ids, loadedAt: Date.now() };
+  }
+  return demoTenantIdsCache.ids;
+}
+
+async function isDemoTenant(tenantId) {
+  if (!tenantId) return false;
+  const ids = await getDemoTenantIds();
+  return ids.has(String(tenantId));
+}
+
 async function checkMonthlyUsage(tenant_id, resource) {
   const plan = await getPlan(tenant_id);
   const isTrial = plan === "starter" ? await isStarterTenantInTrial(tenant_id) : false;
@@ -1218,6 +1248,8 @@ async function checkMonthlyUsage(tenant_id, resource) {
 }
 
 async function incrementMonthlyUsage(tenant_id, resource, amount = 1) {
+  // Tenants demo: no suman a los contadores de uso.
+  if (await isDemoTenant(tenant_id)) return;
   const period = new Date().toISOString().slice(0, 7);
   try {
     const { data: existing } = await supabase
@@ -1294,6 +1326,8 @@ async function decrementAddonBalance(tenant_id, resource, amount) {
 // POST /campaigns/send-whatsapp, que las manda por Twilio real) y
 // emails_campana (POST /campaigns/send-email, se descuenta en el momento).
 async function consumeResourceUsage(tenant_id, resource, amount = 1) {
+  // Tenants demo: no consumen cupo de plan ni saldo de add-ons.
+  if (await isDemoTenant(tenant_id)) return { fromPlan: 0, fromAddon: 0 };
   const plan = await getPlan(tenant_id);
   // Mismo bug real que checkMonthlyUsage (auditoría 2026-09-20): sin
   // is_trial, un consumo durante el trial de Starter se descontaba del
@@ -1335,6 +1369,7 @@ async function consumeResourceUsage(tenant_id, resource, amount = 1) {
 // intento de envío — un intento que termina failed/undelivered (ej. error
 // 63016) no debe consumir cupo real.
 async function trackWhatsAppMessage({ messageSid, tenantId, resource }) {
+  if (await isDemoTenant(tenantId)) return;
   try {
     await supabase
       .from("whatsapp_message_log")
@@ -1575,6 +1610,9 @@ async function sendBookingConfirmations({
   staffId,
   petId,
 }) {
+  // Tenants demo: nunca envían confirmaciones (ni email ni WhatsApp).
+  if (await isDemoTenant(tenantId)) return;
+
   const start = startAt instanceof Date ? startAt : new Date(startAt);
 
   // Profesional asignado a la cita (con "cualquiera disponible" la página
@@ -1927,6 +1965,19 @@ app.use(jsonUnlessFlowInbound);
 // el servicio tras ~15 min sin tráfico) y para monitoreo básico de uptime.
 app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok" });
+});
+
+// Tenants demo (tenants.is_demo): sin cobros ni Flow. Rechaza las escrituras
+// de /billing (plan, add-ons, tarjeta, suscripción, pago) cuando el
+// tenant_id del body o query es demo. Los webhooks/callbacks de Flow no
+// traen tenant_id y pasan igual. Solo puede bloquear, nunca habilita nada.
+app.use("/billing", async (req, res, next) => {
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
+  const tenantId = req.body?.tenant_id || req.query?.tenant_id;
+  if (tenantId && (await isDemoTenant(tenantId))) {
+    return res.status(403).json({ error: "Cuenta demo: la facturación está deshabilitada." });
+  }
+  return next();
 });
 
 // --- INSTRUMENTACIÓN TEMPORAL DE PERFORMANCE (diagnóstico 2026-09-06) ---
@@ -4310,7 +4361,13 @@ async function sendCampaignEmail({
   html,
   text,
   headers = null,
+  tenantId = null,
 }) {
+  // Tenants demo: la campaña se "envía" sin mandar nada real.
+  if (isDemoEmailRecipient(to) || (await isDemoTenant(tenantId))) {
+    return { id: "demo-skipped" };
+  }
+
   const resendApiKey = process.env.RESEND_API_KEY;
   const fromEmail =
     process.env.RESEND_FROM_EMAIL ||
@@ -12008,6 +12065,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
             html: template.html,
             text: template.text,
             headers: unsubscribeParts.headers,
+            tenantId: tenant.id,
           });
 
           sent++;
@@ -12222,6 +12280,7 @@ app.post("/campaigns/send-email", tenantAuthSlugWrite, async (req, res) => {
           html: template.html,
           text: template.text,
           headers: unsubscribeParts.headers,
+          tenantId: tenant.id,
         });
 
         sent++;
@@ -12481,11 +12540,14 @@ app.post("/campaigns/send-whatsapp", tenantAuthSlugWrite, async (req, res) => {
         customer_name: name,
       });
 
-      const waResult = await sendWhatsAppTemplate({
-        to: normalizedPhone,
-        contentSid: template.contentSid,
-        variables,
-      });
+      // Tenants demo: nunca envían WhatsApp real.
+      const waResult = (await isDemoTenant(tenant.id))
+        ? { ok: false, reason: "demo_tenant" }
+        : await sendWhatsAppTemplate({
+            to: normalizedPhone,
+            contentSid: template.contentSid,
+            variables,
+          });
 
       if (waResult.ok) {
         remainingBudget--;
@@ -12992,6 +13054,7 @@ async function resolveTenantContactEmail(tenant_id) {
 // pueda revisar todavía.
 async function notifyTenantDepositReceiptUploaded(appt) {
   try {
+    if (await isDemoTenant(appt.tenant_id)) return;
     const { data: tenant } = await supabase
       .from("tenants")
       .select("name, slug")
@@ -15052,7 +15115,11 @@ app.get("/billing/account-status", tenantAuth, async (req, res) => {
       .limit(1)
       .maybeSingle();
 
-    const subscriptionStatus = subscription?.status || "none";
+    // Tenants demo: se muestran como plan activo (sin trial, sin aviso de
+    // pago ni vencimiento).
+    const subscriptionStatus = (await isDemoTenant(tenant_id))
+      ? "active"
+      : subscription?.status || "none";
 
     const now = new Date();
     const trialEndsAt = tenant.trial_ends_at ? new Date(tenant.trial_ends_at) : null;
@@ -15839,6 +15906,10 @@ async function sendOneTimeAddonExpiryReminders() {
   let sent = 0;
   let skipped = 0;
   for (const [tenantId, tenantRows] of Object.entries(byTenant)) {
+    if (await isDemoTenant(tenantId)) {
+      skipped += tenantRows.length;
+      continue;
+    }
     const { data: tenant } = await supabase
       .from("tenants")
       .select("name, slug, is_active")
@@ -16956,6 +17027,7 @@ app.get("/billing/flow/register-card-callback", publicLimiter, handleRegisterCar
 // computeBillingAccessState con status 'error'). Nunca lanza.
 async function notifySubscriptionPaymentFailed(tenant_id) {
   try {
+    if (await isDemoTenant(tenant_id)) return;
     const { data: tenant } = await supabase
       .from("tenants")
       .select("name, slug, is_trial, trial_ends_at, billing_cycle_end")
@@ -21757,6 +21829,12 @@ async function sendEmailReminders() {
       continue;
     }
 
+    // Tenants demo: nunca envían recordatorios.
+    if (await isDemoTenant(appt.tenant_id)) {
+      skipped++;
+      continue;
+    }
+
     // Agendada con menos de ~23 h de anticipación: no se manda recordatorio.
     if (
       appt.created_at &&
@@ -21947,6 +22025,8 @@ async function sendWhatsAppReminders() {
       .single();
 
     if (!tenantInfo?.wa_reminder_enabled) continue;
+    // Tenants demo: nunca envían WhatsApp.
+    if (await isDemoTenant(appt.tenant_id)) continue;
 
     const reminderHours = [1, 2].includes(Number(tenantInfo.wa_reminder_hours_before))
       ? Number(tenantInfo.wa_reminder_hours_before)

@@ -5,6 +5,28 @@ const resend = process.env.RESEND_API_KEY
   ? new Resend(process.env.RESEND_API_KEY)
   : null;
 
+// Tenants DEMO (scripts/seed-demo.js): todos sus correos ficticios son
+// @demo.orbyx.cl. Nunca se les envía nada: se filtran acá, en el único
+// punto por el que pasan todos los envíos de este archivo, y se responde
+// como envío exitoso para que ningún flujo lo trate como error.
+const DEMO_EMAIL_DOMAIN = "@demo.orbyx.cl";
+function isDemoEmailRecipient(address) {
+  return String(address || "").trim().toLowerCase().endsWith(DEMO_EMAIL_DOMAIN);
+}
+if (resend) {
+  const originalSend = resend.emails.send.bind(resend.emails);
+  resend.emails.send = async (payload, ...rest) => {
+    const recipients = Array.isArray(payload?.to) ? payload.to : [payload?.to];
+    const realRecipients = recipients.filter((to) => to && !isDemoEmailRecipient(to));
+    if (realRecipients.length === 0) {
+      console.log("[DEMO] correo omitido (destinatario demo)");
+      return { data: { id: "demo-skipped" }, error: null };
+    }
+    const to = Array.isArray(payload.to) ? realRecipients : realRecipients[0];
+    return originalSend({ ...payload, to }, ...rest);
+  };
+}
+
 function formatDate(dateString) {
   const date = new Date(dateString);
 
@@ -2061,4 +2083,5 @@ module.exports = {
   sendPasswordResetEmail,
   sendWelcomeAccessEmail,
   sendAddonExpiryReminderEmail,
+  isDemoEmailRecipient,
 };

@@ -327,6 +327,17 @@ Applies only to public bookings (`POST /appointments/slot` without `booking_orig
 - CORS no longer accepts arbitrary `orbyx*.vercel.app`: only `ALLOWED_ORIGINS` in `server.js`. `keep-alive.yml` removed (Render is on a paid plan).
 - `app/not-found.tsx`, `app/robots.ts`, `app/sitemap.ts` added. Deposit-pending appointments have their own amber status color (`deposit_pending` in `lib/appointment-status-colors.ts`).
 
+## Demo Tenants (2026-10-24)
+
+4 tenants with fictitious data for videos and in-person demos, created by `scripts/seed-demo.js` (`npm run seed:demo`, `npm run seed:demo:reset`). Inserts directly into Supabase with the service role key from `.env` (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DEMO_PASSWORD`).
+
+- **Flag**: `tenants.is_demo` (migration `2026-10-24-demo-tenants.sql`). Slugs `demo-*`, logins `demo-<rubro>@demo.orbyx.cl`, all customer emails `@demo.orbyx.cl`, all phones `+56900000xxx`.
+- **Reset** deletes only tenants with `is_demo = true` AND slug `demo-*` (plus everything under them, same table order as `delete_tenant_cascade`) and regenerates them; auth users are kept and get `DEMO_PASSWORD` again. Without `--reset` an existing demo tenant is left as is; a non-demo tenant with the same slug aborts the run.
+- **Never sends anything**: `email.js` wraps `resend.emails.send` and drops `@demo.orbyx.cl` recipients; `whatsapp.js` skips `+56900000…`; `server.js` `isDemoTenant()` (60 s cached list, tolerates the column not existing yet) skips `sendBookingConfirmations`, reminders (email and WA), campaign email/WA sends, deposit/add-on/payment-failed notices.
+- **No usage counters / billing**: `incrementMonthlyUsage`, `consumeResourceUsage`, `trackWhatsAppMessage` no-op for demo tenants; `app.use("/billing")` returns 403 on POST/PATCH/PUT for a demo `tenant_id`; `GET /billing/account-status` reports them as `active`. Data side: `plan_slug = premium`, `is_trial = false`, `trial_ends_at = null`, `billing_cycle_end = 2099-12-31` (never blocked by `computeBillingAccessState` / `lib/dashboard-access.ts`).
+- **Data shape**: dates relative to today (Santiago): 3 weeks of history (completed / canceled / no_show) and 3 weeks of future agenda (~75-85% occupancy Mon-Fri) inside each staff member's `staff_hours`, no overlaps. Vet: pets + `clinical_notes` (pet_id). Clinic (`clinica` / `salud_general`): patients are `customers` (pet_id null) with RUT/previsión and `clinical_notes` with `extra_fields` peso/talla/IMC. ~15% of customers carry `imported_last_visit_at` so the En riesgo / Inactivo categories show up.
+- Known: admin stats/directory still list demo tenants (not filtered by `is_demo`).
+
 ## Business Categories
 
 Known categories:

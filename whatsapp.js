@@ -47,8 +47,15 @@ const STATUS_CALLBACK_URL = "https://api.orbyx.cl/whatsapp/status-callback";
 // `to` debe venir en formato E.164 con "+" (ej: +56912345678). Nunca lanza:
 // siempre devuelve { ok, reason } para que el flujo que llama (creación de
 // cita, cron de recordatorios) jamás se rompa por un fallo de Twilio.
+// Teléfonos ficticios de los tenants DEMO (scripts/seed-demo.js):
+// +56900000xxx. Nunca se les envía nada.
+const DEMO_PHONE_PREFIX = "+56900000";
+
 async function sendWhatsAppTemplate({ to, contentSid, variables }) {
   try {
+    if (String(to || "").replace(/^whatsapp:/, "").trim().startsWith(DEMO_PHONE_PREFIX)) {
+      return { ok: false, reason: "demo_recipient" };
+    }
     if (!twilioClient) {
       console.warn("⚠️ Twilio no configurado (faltan credenciales). WhatsApp omitido.");
       return { ok: false, reason: "not_configured" };
