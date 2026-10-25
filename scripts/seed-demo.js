@@ -234,6 +234,12 @@ const TENANTS = [
       { key: "perfilado", name: "Perfilado de cejas y contorno", duration: 30, price: 5000, weight: 6, staff: "*" },
       { key: "corte_nino", name: "Corte niño (hasta 12 años)", duration: 30, price: 8000, weight: 10, staff: ["matias", "diego"] },
     ],
+    extras: [
+      { name: "Lavado de pelo", price: 3000, minutes: 15, services: ["corte", "corte_barba", "fade"] },
+      { name: "Toalla caliente", price: 4000, minutes: 15, services: ["corte_barba", "barba"] },
+      { name: "Diseño / líneas", price: 3000, minutes: 0, services: ["corte", "fade", "corte_nino"] },
+      { name: "Perfilado de cejas", price: 3000, minutes: 15, services: ["corte", "corte_barba", "fade"] },
+    ],
   },
   {
     key: "nails",
@@ -280,6 +286,12 @@ const TENANTS = [
       { key: "lifting", name: "Lifting de pestañas", duration: 60, price: 22000, weight: 12, staff: ["fernanda"] },
       { key: "cejas", name: "Perfilado de cejas", duration: 30, price: 8000, weight: 14, staff: ["fernanda", "valentina"] },
       { key: "facial", name: "Limpieza facial profunda", duration: 90, price: 30000, weight: 8, staff: ["fernanda"] },
+    ],
+    extras: [
+      { name: "Retiro de esmaltado anterior", price: 3000, minutes: 15, services: ["manicure", "pedicure", "permanente", "acrilicas"] },
+      { name: "Diseño nail art (2 uñas)", price: 2000, minutes: 15, services: ["permanente", "acrilicas"] },
+      { name: "Parafina para manos", price: 4000, minutes: 15, services: ["manicure", "permanente"] },
+      { name: "Tinte de cejas", price: 5000, minutes: 15, services: ["cejas", "lifting"] },
     ],
   },
   {
@@ -997,6 +1009,31 @@ async function seedTenant(supabase, def, password) {
   }
   await insertRows(supabase, "staff_services", staffServices);
 
+  // 4b. Extras (si la migración de extras está aplicada; si no, se omiten).
+  let extrasCount = 0;
+  if (def.extras?.length) {
+    const { error: extrasProbe } = await supabase.from("service_extras").select("id").limit(1);
+    if (extrasProbe && isMissingRelationError(extrasProbe)) {
+      console.log("  (sin tablas de extras en este proyecto: se omiten los extras)");
+    } else if (extrasProbe) {
+      throw new Error(`leyendo service_extras: ${extrasProbe.message}`);
+    } else {
+      const extraRows = [];
+      const linkRows = [];
+      def.extras.forEach((extra, index) => {
+        const id = crypto.randomUUID();
+        extraRows.push({ id, tenant_id: def.tenantId, branch_id: branchId, name: extra.name, price: extra.price, duration_minutes: extra.minutes, active: true, sort_order: index });
+        for (const key of extra.services) {
+          if (!serviceIds[key]) throw new Error(`${def.name}: el extra "${extra.name}" apunta a un servicio inexistente (${key})`);
+          linkRows.push({ service_id: serviceIds[key], extra_id: id, tenant_id: def.tenantId, branch_id: branchId });
+        }
+      });
+      await insertRows(supabase, "service_extras", extraRows);
+      await insertRows(supabase, "service_extra_links", linkRows);
+      extrasCount = extraRows.length;
+    }
+  }
+
   // 5. Clientes (y mascotas en la veterinaria).
   const customers = generateCustomers(rng, def);
   const pets = def.kind === "vet" ? generatePets(rng, def, customers) : [];
@@ -1165,6 +1202,7 @@ async function seedTenant(supabase, def, password) {
     email,
     staff: def.staff.length,
     services: def.services.length,
+    extras: extrasCount,
     customers: customers.length,
     pets: pets.length,
     appointments: appointments.length,
@@ -1221,6 +1259,7 @@ async function main() {
         login: r.email,
         staff: r.staff,
         servicios: r.services,
+        extras: r.extras || "-",
         clientes: r.customers,
         mascotas: r.pets || "-",
         citas: r.appointments,
