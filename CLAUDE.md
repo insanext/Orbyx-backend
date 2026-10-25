@@ -352,6 +352,16 @@ Optional add-ons a customer adds to a service when booking (e.g. "Lavado +$2.000
 - **Public booking (round 2, done 2026-10-25)**: `app/[Slug]/page.tsx` shows `ServiceExtrasChooser` under the selected service in the catalog (chips + total); `selectedExtraIds` resets on service/branch change; slots are requested with `extra_ids` (`extraIdsKey` is in the slots effect deps) and the booking body sends `extra_ids`; summary, side panel and success screen show "service + extras" and the total. Both Next proxies forward `extra_ids`.
 - **Pending**: Agenda manual booking (`agenda/page.tsx`) does not send `extra_ids` yet; (3) show extras in appointment detail, confirmation email, and use `price_snapshot` in Indicadores. WhatsApp template can't show extras without a new Meta-approved template.
 
+## Public Booking UI: staff carousel (2026-10-25)
+
+`orbyx-web/app/[Slug]/page.tsx`, UI only except one additive backend field.
+
+- **Description**: `BusinessDescription` = `text-sm md:text-base`, compact leading, `text-slate-500`, `line-clamp-3`; "Ver más/Ver menos" only when the paragraph is really truncated (scrollHeight vs clientHeight + ResizeObserver).
+- **Staff picker**: `StaffCarousel` (stories style: round avatar/photo or initial, name + role, first item "Cualquiera" selected by default, `ring-indigo-600` when selected; `role="radiogroup"`), rendered right above the days row (below week selector + service chip). The old vertical list in the side column and every "Especialista en …" text were removed. The public page has no per-tenant color: indigo is the brand color everywhere.
+- **Staff by service**: `GET /public/services/:slug` now also returns `staff` (active staff of the branch: id, name, role, color, photo_url) and `services[].staff_ids` (active staff linked via `staff_services`). Without a service the catalog panel shows all staff ("Nuestro equipo"); with a service, `staffOptions` (from `/public/staff/:slug/:service_id`). `selectCatalogService` keeps the chosen professional only if `service.staff_ids` includes it, otherwise back to "Cualquiera" (old backends without `staff_ids` → always "Cualquiera").
+- Slots were already filtered by professional (`staff_id` → `/public/slots`), unchanged.
+- Verified headless at 380px (Chromium from npm `@sparticuz/chromium` + `puppeteer-core`, mock backend): no page horizontal scroll, carousel scrolls inside.
+
 ## Business Categories
 
 Known categories:

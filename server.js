@@ -21345,12 +21345,35 @@ app.get("/public/services/:slug", publicLimiter, async (req, res) => {
 // 🔽 obtener relaciones staff-servicio
 const { data: staffRelations, error: staffRelError } = await supabase
   .from("staff_services")
-  .select("service_id")
+  .select("service_id, staff_id")
   .eq("tenant_id", tenant.id)
   .eq("branch_id", resolvedBranchId);
 
 if (staffRelError) {
   return res.status(500).json({ error: staffRelError.message });
+}
+
+// Profesionales activos de la sucursal (campos públicos). La página pública
+// los muestra sin servicio elegido y filtra por servicio con staff_ids.
+const { data: activeStaffRows, error: activeStaffError } = await supabase
+  .from("staff")
+  .select("id, name, role, color, photo_url")
+  .eq("tenant_id", tenant.id)
+  .eq("branch_id", resolvedBranchId)
+  .eq("is_active", true)
+  .order("sort_order", { ascending: true })
+  .order("created_at", { ascending: true });
+
+if (activeStaffError) {
+  return res.status(500).json({ error: activeStaffError.message });
+}
+
+const activeStaffIds = new Set((activeStaffRows || []).map((s) => s.id));
+const staffIdsByService = new Map();
+for (const rel of staffRelations || []) {
+  if (!activeStaffIds.has(rel.staff_id)) continue;
+  if (!staffIdsByService.has(rel.service_id)) staffIdsByService.set(rel.service_id, []);
+  staffIdsByService.get(rel.service_id).push(rel.staff_id);
 }
 
 // 🔽 servicios que tienen al menos 1 staff
@@ -21382,6 +21405,8 @@ const filteredServices = (services || []).filter((s) =>
     const servicesWithExtras = filteredServices.map((s) => ({
       ...s,
       extras: (extrasByService.get(s.id) || []).map(({ sort_order, ...extra }) => extra),
+      // Profesionales activos que realizan el servicio (campo aditivo).
+      staff_ids: staffIdsByService.get(s.id) || [],
     }));
 
     return res.json({
@@ -21390,6 +21415,7 @@ const filteredServices = (services || []).filter((s) =>
       branches: (activeBranches || []).map((b) => withEffectiveFullAddress(b, tenant)),
       calendar_id: calendar.id,
       services: servicesWithExtras,
+      staff: activeStaffRows || [],
       service_groups: serviceGroups || [],
       business_hours: businessHours,
     });
