@@ -19897,7 +19897,10 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
    con el registro del frontend (orbyx-web/lib/public-templates.ts); al
    agregar una plantilla nueva hay que sumarla en AMBOS lados.
 ====================================================== */
-const PUBLIC_TEMPLATE_IDS = ["clasica", "esmeralda", "grafito", "rosa", "oceano", "terracota", "dorado", "bosque"];
+const PUBLIC_TEMPLATE_IDS = [
+  "clasica", "esmeralda", "grafito", "rosa", "oceano", "terracota", "dorado", "bosque",
+  "coral", "lila", "noche", "neon", "medianoche",
+];
 const DEFAULT_PUBLIC_TEMPLATE = "clasica";
 
 function normalizePublicTemplate(value) {
