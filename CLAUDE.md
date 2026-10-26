@@ -375,6 +375,16 @@ Optional add-ons a customer adds to a service when booking (e.g. "Lavado +$2.000
 - List view (compact card): professional on its own line with a staff-color dot (it used to be appended to the service and got truncated).
 - The old "N Agendamientos" week aggregate (`getWeekSlotDisplayGroups`) was removed; the popover (`selectedWeekGroup`) is now only opened by "+N".
 
+## Billing documents / boletas (2026-10-26)
+
+Orbyx's own boletas/facturas to each business, for its plan and add-on charges. Migration `2026-10-26-billing-documents.sql`: table `billing_documents` (service-role only, RLS on, no grants; `tenant_id ON DELETE SET NULL` so tax documents survive a tenant deletion) + private bucket `billing-documents`.
+
+- A document covers one or more Flow charges: `flow_orders text[]` = `flowOrder` values from Flow `customer/getCharges` (charges are not stored locally; they are read live through `getTenantFlowCharges(tenantId, limit)`, also used by `GET /billing/flow/payment-history`). Plan + add-on charged together → one document with both orders.
+- **Admin** (`requireAdminAuth`): `GET /admin/tenants/:id/billing-documents` (Flow charges, limit 50, + documents), `POST /admin/tenants/:id/billing-documents` (multipart `file`, PDF only — checked by the `%PDF-` signature —, max 5 MB, `flow_orders` JSON/CSV, `doc_type` boleta|factura, `folio`, `issued_at` YYYY-MM-DD, `total`), `GET /admin/billing-documents/:docId/download` (signed URL 5 min), `DELETE /admin/billing-documents/:docId` (row + file). Upload/delete are logged with `logAdminTenantAction` (`billing_document_uploaded` / `billing_document_deleted`). UI: section "Pagos y boletas" in `/admin/tenants/[id]` (`components/admin/TenantBillingDocuments.tsx`): charges table with checkboxes (only paid charges without a document), upload form, list with "Ver PDF"/"Eliminar".
+- **Business**: `GET /billing/flow/payment-history` now also returns `documents` (no file path); `GET /billing/documents/:id/download?tenant_id=` (`tenantAuthWrite`, checks the document's tenant) returns a 5-min signed URL. `billing/page.tsx` → "Historial de pagos" is now ONE panel "Pagos y boletas" (plan and add-ons together, grouped by day, Plan/Add-on tag per line). Per day: "Boleta disponible" (all paid charges covered) or "Boleta en proceso"; expanding shows a download button per document. Unpaid charges get no badge.
+- Missing migration: reads return `available:false`/no documents (history still works); uploads answer 503 with a clear message.
+- Agenda week headers: the "N c" badge (canceled count) was removed; the red pending-to-close count stays.
+
 ## Status and Pending (2026-10-25)
 
 - **Infra**: production runs on Render `orbyx-backend-virginia` + Supabase Virginia (`fqmdcbvtrgc…`, us-east-1). The old São Paulo project stays paused as fallback. The mirror was missing some schema; `2026-10-25-schema-repair-virginia.sql` fixed it. If an endpoint fails with "column does not exist" / "relation does not exist", suspect schema drift from the migration first and check prod directly.

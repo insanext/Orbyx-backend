@@ -18112,51 +18112,132 @@ function mapFlowCharge(item) {
    `data` esperado, o falla la llamada, responde charges: [] en vez de
    reventar el endpoint.
 ====================================================== */
+// Cobros de Flow (customer/getCharges) de un tenant. Nunca lanza por Flow:
+// ante un shape inesperado o un error devuelve [] (mismo criterio de siempre).
+async function getTenantFlowCharges(tenantId, limit = 20) {
+  const { data: subscription, error: subErr } = await supabase
+    .from("subscriptions")
+    .select("id, flow_customer_id")
+    .eq("tenant_id", tenantId)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (subErr) throw subErr;
+  if (!subscription || !subscription.flow_customer_id) return [];
+
+  try {
+    const result = await flowApiRequest(
+      "/customer/getCharges",
+      { customerId: subscription.flow_customer_id, limit },
+      "GET"
+    );
+    if (!Array.isArray(result?.data)) {
+      console.error(
+        "getTenantFlowCharges: respuesta de customer/getCharges sin el shape esperado (falta data[]):",
+        JSON.stringify(result)
+      );
+      return [];
+    }
+    return result.data.map(mapFlowCharge);
+  } catch (flowErr) {
+    console.error("getTenantFlowCharges: fallo consultando customer/getCharges", flowErr.message);
+    return [];
+  }
+}
+
+/* ======================================================
+   Boletas / documentos tributarios de Orbyx al negocio
+   (migración 2026-10-26-billing-documents.sql). El Super Admin sube el PDF
+   y marca los cobros de Flow (flowOrder) que cubre; el negocio los ve en
+   su historial de pagos. Tolerante a que la migración aún no esté corrida.
+====================================================== */
+const BILLING_DOCS_BUCKET = "billing-documents";
+const BILLING_DOC_TYPES = ["boleta", "factura"];
+const BILLING_DOC_MAX_BYTES = 5 * 1024 * 1024;
+const uploadBillingDoc = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: BILLING_DOC_MAX_BYTES },
+});
+
+function normalizeFlowOrders(raw) {
+  let list = raw;
+  if (typeof raw === "string") {
+    try {
+      list = JSON.parse(raw);
+    } catch {
+      list = raw.split(",");
+    }
+  }
+  if (!Array.isArray(list)) return [];
+  return [...new Set(list.map((value) => String(value ?? "").trim()).filter((value) => /^\d{1,20}$/.test(value)))].slice(0, 50);
+}
+
+// Lista los documentos de un tenant. { available:false } si falta la tabla.
+async function listBillingDocuments(tenantId, { includeFile = false } = {}) {
+  const columns = includeFile
+    ? "id, doc_type, folio, issued_at, total, flow_orders, file_name, uploaded_by_email, created_at"
+    : "id, doc_type, folio, issued_at, total, flow_orders, created_at";
+  const { data, error } = await supabase
+    .from("billing_documents")
+    .select(columns)
+    .eq("tenant_id", tenantId)
+    .order("created_at", { ascending: false })
+    .limit(200);
+  if (error) {
+    if (isMissingSchemaError(error)) return { available: false, documents: [] };
+    throw error;
+  }
+  return { available: true, documents: data || [] };
+}
+
+async function signBillingDocumentUrl(filePath, fileName) {
+  const { data, error } = await supabase.storage
+    .from(BILLING_DOCS_BUCKET)
+    .createSignedUrl(filePath, 5 * 60, fileName ? { download: fileName } : undefined);
+  if (error || !data?.signedUrl) throw error || new Error("No se pudo generar el enlace");
+  return data.signedUrl;
+}
+
 app.get("/billing/flow/payment-history", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id } = req.query;
-
-    const { data: subscription, error: subErr } = await supabase
-      .from("subscriptions")
-      .select("id, flow_customer_id")
-      .eq("tenant_id", tenant_id)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (subErr) throw subErr;
-
-    if (!subscription || !subscription.flow_customer_id) {
-      return res.json({ charges: [] });
-    }
-
+    const charges = await getTenantFlowCharges(tenant_id, 20);
+    let documents = [];
     try {
-      const result = await flowApiRequest(
-        "/customer/getCharges",
-        { customerId: subscription.flow_customer_id, limit: 20 },
-        "GET"
-      );
-
-      if (!Array.isArray(result?.data)) {
-        console.error(
-          "GET /billing/flow/payment-history: respuesta de customer/getCharges sin el shape esperado (falta data[]):",
-          JSON.stringify(result)
-        );
-        return res.json({ charges: [] });
-      }
-
-      const charges = result.data.map(mapFlowCharge);
-      return res.json({ charges });
-    } catch (flowErr) {
-      console.error(
-        "GET /billing/flow/payment-history: fallo consultando customer/getCharges",
-        flowErr.message
-      );
-      return res.json({ charges: [] });
+      documents = (await listBillingDocuments(tenant_id)).documents;
+    } catch (docErr) {
+      // Las boletas son un extra: si fallan, el historial igual se muestra.
+      console.error("GET /billing/flow/payment-history: no se pudieron leer las boletas:", docErr.message);
     }
+    return res.json({ charges, documents });
   } catch (err) {
     console.error("GET /billing/flow/payment-history error:", err.message);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// Descarga de una boleta por el propio negocio (URL firmada de 5 min).
+app.get("/billing/documents/:id/download", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+    const { data: doc, error } = await supabase
+      .from("billing_documents")
+      .select("id, tenant_id, file_path, file_name")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (error) {
+      if (isMissingSchemaError(error)) return res.status(404).json({ error: "Documento no encontrado" });
+      throw error;
+    }
+    if (!doc || doc.tenant_id !== tenant_id) {
+      return res.status(404).json({ error: "Documento no encontrado" });
+    }
+    const url = await signBillingDocumentUrl(doc.file_path, doc.file_name);
+    return res.json({ url });
+  } catch (err) {
+    console.error("GET /billing/documents/:id/download error:", err.message);
+    return res.status(500).json({ error: "No se pudo descargar el documento" });
   }
 });
 
@@ -24548,6 +24629,165 @@ async function getActiveOwnerEmail(tenantId) {
   const { data: authUser } = await supabase.auth.admin.getUserById(ownerUserId);
   return { ownerUserId, ownerEmail: authUser?.user?.email || null };
 }
+
+/* ======================================================
+   🧾 Boletas del negocio (Super Admin)
+   GET    /admin/tenants/:id/billing-documents  → cobros Flow + boletas
+   POST   /admin/tenants/:id/billing-documents  → subir PDF (multipart "file")
+   GET    /admin/billing-documents/:docId/download
+   DELETE /admin/billing-documents/:docId
+====================================================== */
+app.get("/admin/tenants/:id/billing-documents", requireAdminAuth, async (req, res) => {
+  try {
+    const tenantId = req.params.id;
+    const [charges, docs] = await Promise.all([
+      getTenantFlowCharges(tenantId, 50),
+      listBillingDocuments(tenantId, { includeFile: true }),
+    ]);
+    return res.json({ available: docs.available, charges, documents: docs.documents });
+  } catch (err) {
+    console.error("GET /admin/tenants/:id/billing-documents error:", err.message);
+    return res.status(500).json({ error: "No se pudieron cargar las boletas" });
+  }
+});
+
+app.post(
+  "/admin/tenants/:id/billing-documents",
+  requireAdminAuth,
+  (req, res, next) =>
+    uploadBillingDoc.single("file")(req, res, (err) => {
+      if (err) {
+        const tooBig = err.code === "LIMIT_FILE_SIZE";
+        return res.status(400).json({ error: tooBig ? "El PDF supera los 5 MB" : "Archivo inválido" });
+      }
+      return next();
+    }),
+  async (req, res) => {
+    try {
+      const tenantId = req.params.id;
+      const file = req.file;
+      if (!file?.buffer?.length) {
+        return res.status(400).json({ error: "Adjunta el PDF de la boleta" });
+      }
+      // Solo PDF real (firma %PDF), no basta con el nombre o el mime.
+      if (file.buffer.subarray(0, 5).toString("latin1") !== "%PDF-") {
+        return res.status(400).json({ error: "El archivo debe ser un PDF" });
+      }
+
+      const flowOrders = normalizeFlowOrders(req.body?.flow_orders);
+      if (flowOrders.length === 0) {
+        return res.status(400).json({ error: "Marca al menos un cobro que cubra esta boleta" });
+      }
+      const docType = BILLING_DOC_TYPES.includes(String(req.body?.doc_type || "").toLowerCase())
+        ? String(req.body.doc_type).toLowerCase()
+        : "boleta";
+      const folio = String(req.body?.folio || "").trim().slice(0, 40) || null;
+      const issuedAtRaw = String(req.body?.issued_at || "").trim();
+      const issuedAt = /^\d{4}-\d{2}-\d{2}$/.test(issuedAtRaw) ? issuedAtRaw : null;
+      const totalNum = Number(req.body?.total);
+      const total = Number.isFinite(totalNum) && totalNum >= 0 ? Math.round(totalNum) : null;
+
+      const { data: tenant } = await supabase.from("tenants").select("id, slug").eq("id", tenantId).maybeSingle();
+      if (!tenant) return res.status(404).json({ error: "Tenant no encontrado" });
+
+      const docId = crypto.randomUUID();
+      const filePath = `${tenantId}/${docId}.pdf`;
+      const fileName = `${docType}-${folio || issuedAt || docId.slice(0, 8)}.pdf`.replace(/[^a-zA-Z0-9._-]/g, "_");
+
+      const { error: uploadErr } = await supabase.storage
+        .from(BILLING_DOCS_BUCKET)
+        .upload(filePath, file.buffer, { contentType: "application/pdf", upsert: false });
+      if (uploadErr) {
+        console.error("POST /admin/tenants/:id/billing-documents upload error:", uploadErr.message);
+        return res.status(500).json({ error: "No se pudo guardar el PDF (¿corriste la migración del bucket?)" });
+      }
+
+      const { data: doc, error: insertErr } = await supabase
+        .from("billing_documents")
+        .insert({
+          id: docId,
+          tenant_id: tenantId,
+          doc_type: docType,
+          folio,
+          issued_at: issuedAt,
+          total,
+          flow_orders: flowOrders,
+          file_path: filePath,
+          file_name: fileName,
+          uploaded_by: req.adminUser?.user_id || null,
+          uploaded_by_email: req.adminUser?.email || null,
+        })
+        .select("id, doc_type, folio, issued_at, total, flow_orders, file_name, uploaded_by_email, created_at")
+        .single();
+      if (insertErr) {
+        await supabase.storage.from(BILLING_DOCS_BUCKET).remove([filePath]).catch(() => {});
+        if (isMissingSchemaError(insertErr)) {
+          return res.status(503).json({ error: "Falta correr la migración 2026-10-26-billing-documents.sql" });
+        }
+        throw insertErr;
+      }
+
+      await logAdminTenantAction({
+        tenantId,
+        adminUserId: req.adminUser?.user_id,
+        adminEmail: req.adminUser?.email,
+        actionType: "billing_document_uploaded",
+        details: { document_id: docId, doc_type: docType, folio, flow_orders: flowOrders },
+      });
+
+      return res.json({ ok: true, document: doc });
+    } catch (err) {
+      console.error("POST /admin/tenants/:id/billing-documents error:", err.message);
+      return res.status(500).json({ error: "No se pudo subir la boleta" });
+    }
+  }
+);
+
+app.get("/admin/billing-documents/:docId/download", requireAdminAuth, async (req, res) => {
+  try {
+    const { data: doc, error } = await supabase
+      .from("billing_documents")
+      .select("id, file_path, file_name")
+      .eq("id", req.params.docId)
+      .maybeSingle();
+    if (error && !isMissingSchemaError(error)) throw error;
+    if (!doc) return res.status(404).json({ error: "Documento no encontrado" });
+    return res.json({ url: await signBillingDocumentUrl(doc.file_path, doc.file_name) });
+  } catch (err) {
+    console.error("GET /admin/billing-documents/:docId/download error:", err.message);
+    return res.status(500).json({ error: "No se pudo descargar el documento" });
+  }
+});
+
+app.delete("/admin/billing-documents/:docId", requireAdminAuth, async (req, res) => {
+  try {
+    const { data: doc, error } = await supabase
+      .from("billing_documents")
+      .select("id, tenant_id, file_path, folio, flow_orders")
+      .eq("id", req.params.docId)
+      .maybeSingle();
+    if (error && !isMissingSchemaError(error)) throw error;
+    if (!doc) return res.status(404).json({ error: "Documento no encontrado" });
+
+    const { error: delErr } = await supabase.from("billing_documents").delete().eq("id", doc.id);
+    if (delErr) throw delErr;
+    await supabase.storage.from(BILLING_DOCS_BUCKET).remove([doc.file_path]).catch(() => {});
+
+    if (doc.tenant_id) {
+      await logAdminTenantAction({
+        tenantId: doc.tenant_id,
+        adminUserId: req.adminUser?.user_id,
+        adminEmail: req.adminUser?.email,
+        actionType: "billing_document_deleted",
+        details: { document_id: doc.id, folio: doc.folio, flow_orders: doc.flow_orders },
+      });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /admin/billing-documents/:docId error:", err.message);
+    return res.status(500).json({ error: "No se pudo eliminar el documento" });
+  }
+});
 
 app.post("/admin/tenants/:id/view-session", requireAdminAuth, async (req, res) => {
   try {
