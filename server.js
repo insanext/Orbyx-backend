@@ -2207,7 +2207,7 @@ async function resolveTenantMembership(req, res, tenantId) {
   const __perfTenantUsersStart = Date.now(); // instrumentación temporal, ver arriba
   const { data: membership, error: membershipError } = await supabase
     .from("tenant_users")
-    .select("tenant_id, role, is_active, permissions")
+    .select("tenant_id, role, is_active, permissions, branch_ids")
     .eq("user_id", userId)
     .eq("tenant_id", tenantId)
     .eq("is_active", true)
@@ -2229,9 +2229,64 @@ async function resolveTenantMembership(req, res, tenantId) {
     tenant_id: tenantId,
     role: membership.role,
     permissions: membership.permissions || null,
-    branch_ids: (branchRows || []).map((r) => r.branch_id),
+    // Sucursales permitidas: rol "branch" (branch_access) + las marcadas en
+    // "Acceso por sucursal" al invitar/editar (tenant_users.branch_ids).
+    // Vacío = sin restricción (cuentas antiguas). Ver applyBranchScope.
+    branch_ids: [
+      ...new Set([
+        ...(branchRows || []).map((r) => r.branch_id),
+        ...(Array.isArray(membership.branch_ids) ? membership.branch_ids : []),
+      ].filter(Boolean)),
+    ],
   };
   return membership;
+}
+
+/* Acceso por sucursal (2026-10-26). Antes "Acceso por sucursal" se guardaba
+   pero nada lo aplicaba. Para usuarios internos (no owner/admin) con
+   sucursales asignadas:
+   - Un branch_id en query/body/params que no esté en su lista → 403.
+   - GET sin branch_id en módulos por sucursal (agenda, clientes, reseñas,
+     indicadores) → se acota a su primera sucursal en vez de devolver todo el
+     negocio.
+   - GET /branches solo devuelve sus sucursales (el selector del dashboard
+     se arma con eso).
+   Recursos por :id (p.ej. PATCH /appointments/:id) no se cruzan con la
+   sucursal: el usuario no los ve en la UI, pero no es una barrera dura. */
+const BRANCH_SCOPED_GET_PREFIXES = ["/stats/", "/customers", "/appointments", "/agenda", "/reviews"];
+
+function getRestrictedBranchIds(authUser) {
+  if (!authUser || authUser.role === "owner" || authUser.role === "admin") return null;
+  const ids = Array.isArray(authUser.branch_ids) ? authUser.branch_ids : [];
+  return ids.length > 0 ? ids : null;
+}
+
+function applyBranchScope(req, res) {
+  const allowed = getRestrictedBranchIds(req.authenticatedUser);
+  if (!allowed) return true;
+  const requested = [req.query?.branch_id, req.body?.branch_id, req.params?.branch_id].filter(
+    (value) => typeof value === "string" && value.trim() !== ""
+  );
+  for (const branchId of requested) {
+    if (!allowed.includes(branchId)) {
+      res.status(403).json({ error: "No tienes acceso a esta sucursal" });
+      return false;
+    }
+  }
+  if (
+    req.method === "GET" &&
+    requested.length === 0 &&
+    BRANCH_SCOPED_GET_PREFIXES.some((prefix) => req.path.startsWith(prefix))
+  ) {
+    // Express 5: req.query es un getter; se reemplaza por una propiedad propia.
+    Object.defineProperty(req, "query", {
+      value: { ...req.query, branch_id: allowed[0] },
+      writable: true,
+      configurable: true,
+      enumerable: true,
+    });
+  }
+  return true;
 }
 
 // Verifica que el usuario autenticado sea miembro activo de tenantId.
@@ -2243,7 +2298,7 @@ async function requireTenantMembership(req, res, tenantId) {
     res.status(403).json({ error: "No tienes acceso a este negocio" });
     return false;
   }
-  return true;
+  return applyBranchScope(req, res);
 }
 
 // Misma lógica de permisos por módulo que requireWriteAccess, extraída
@@ -2266,10 +2321,17 @@ function evaluateModuleWriteAccess(authUser, moduleKey) {
 }
 
 // Combina membership + permiso de módulo para endpoints resource-based.
-async function requireTenantWriteAccessForResource(req, res, tenantId, moduleKey) {
+async function requireTenantWriteAccessForResource(req, res, tenantId, moduleKey, resourceBranchId) {
   const membership = await resolveTenantMembership(req, res, tenantId);
   if (!membership) {
     res.status(403).json({ error: "No tienes acceso a este negocio" });
+    return false;
+  }
+  if (!applyBranchScope(req, res)) return false;
+  // Recurso de otra sucursal (p.ej. una reserva por :id): mismo criterio que applyBranchScope.
+  const restrictedBranches = getRestrictedBranchIds(req.authenticatedUser);
+  if (restrictedBranches && resourceBranchId && !restrictedBranches.includes(resourceBranchId)) {
+    res.status(403).json({ error: "No tienes acceso a esta sucursal" });
     return false;
   }
   const result = evaluateModuleWriteAccess(req.authenticatedUser, moduleKey);
@@ -2286,9 +2348,11 @@ const WRITE_ACCESS_MODULE_RULES = [
   { prefix: "/support", access: "always" },
   { prefix: "/billing", access: "owner_admin" },
   { prefix: "/tenants", access: "owner_admin" },
-  { prefix: "/invitations", access: "owner_admin" },
+  // Solo el propietario crea/edita/elimina usuarios (2026-10-26): un usuario
+  // interno, aunque sea admin, no puede crear otros usuarios.
+  { prefix: "/invitations", access: "owner_only" },
   { prefix: "/blocked-contacts", access: "owner_admin" },
-  { prefix: "/members", access: "owner_admin" },
+  { prefix: "/members", access: "owner_only" },
   { prefix: "/upload/campaign-image", module: "campanas" },
   { prefix: "/campaign-images", module: "campanas" },
   { prefix: "/campaigns", module: "campanas" },
@@ -2324,12 +2388,16 @@ function requireWriteAccess(req, res, next) {
     return res.status(403).json({ error: "Tu rol es solo lectura. No puedes realizar esta acción." });
   }
 
+  const rule = getWriteAccessRule(req.path);
+
+  if (rule?.access === "owner_only" && authUser.role !== "owner") {
+    return res.status(403).json({ error: "Solo el propietario del negocio puede gestionar usuarios." });
+  }
+
   // owner y admin siempre tienen acceso total.
   if (authUser.role === "owner" || authUser.role === "admin") {
     return next();
   }
-
-  const rule = getWriteAccessRule(req.path);
 
   if (!rule || rule.access === "always") {
     return next();
@@ -2395,6 +2463,7 @@ async function enforceTenantId(req, res, next) {
   if (!membership) {
     return res.status(403).json({ error: "No tienes acceso a este negocio" });
   }
+  if (!applyBranchScope(req, res)) return;
   next();
 }
 
@@ -2420,6 +2489,7 @@ async function enforceSlugOwnership(req, res, next) {
   if (!membership) {
     return res.status(403).json({ error: "No tienes acceso a este negocio" });
   }
+  if (!applyBranchScope(req, res)) return;
   next();
 }
 
@@ -2432,6 +2502,7 @@ async function enforceTenantIdParam(req, res, next) {
   if (!membership) {
     return res.status(403).json({ error: "No tienes acceso a este negocio" });
   }
+  if (!applyBranchScope(req, res)) return;
   next();
 }
 
@@ -13007,7 +13078,7 @@ next_control_custom_unit = null,
       return res.status(404).json({ error: "Reserva no encontrada" });
     }
 
-    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, appointment.tenant_id, "agenda");
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, appointment.tenant_id, "agenda", appointment.branch_id);
     if (!hasWriteAccess) return;
 
     const { data: tenant, error: tenantError } = await supabase
@@ -13224,7 +13295,7 @@ app.patch("/appointments/:id/status", [dashboardLimiter, requireTenantAuth, requ
       return res.status(404).json({ error: "Appointment no encontrado" });
     }
 
-    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda");
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda", appt.branch_id);
     if (!hasWriteAccess) return;
 
     if (status === "canceled") {
@@ -13436,7 +13507,7 @@ app.get(
 
       const { data: appt, error: apptErr } = await supabase
         .from("appointments")
-        .select("tenant_id, deposit_receipt_path")
+        .select("tenant_id, branch_id, deposit_receipt_path")
         .eq("id", id)
         .single();
 
@@ -13444,7 +13515,7 @@ app.get(
         return res.status(404).json({ error: "Reserva no encontrada" });
       }
 
-      const hasAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda");
+      const hasAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda", appt.branch_id);
       if (!hasAccess) return;
 
       if (!appt.deposit_receipt_path) {
@@ -13485,7 +13556,7 @@ app.post(
         return res.status(404).json({ error: "Reserva no encontrada" });
       }
 
-      const hasAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda");
+      const hasAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda", appt.branch_id);
       if (!hasAccess) return;
 
       if (appt.deposit_status !== "pending") {
@@ -13595,7 +13666,7 @@ app.post(
         return res.status(404).json({ error: "Reserva no encontrada" });
       }
 
-      const hasAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda");
+      const hasAccess = await requireTenantWriteAccessForResource(req, res, appt.tenant_id, "agenda", appt.branch_id);
       if (!hasAccess) return;
 
       if (appt.deposit_status !== "pending") {
@@ -13914,7 +13985,7 @@ app.patch("/appointments/:id", [dashboardLimiter, requireTenantAuth, requireWrit
 
     const { data: existingAppointment, error: existingError } = await supabase
       .from("appointments")
-      .select("id, tenant_id")
+      .select("id, tenant_id, branch_id")
       .eq("id", id)
       .single();
 
@@ -13922,7 +13993,7 @@ app.patch("/appointments/:id", [dashboardLimiter, requireTenantAuth, requireWrit
       return res.status(404).json({ error: "Reserva no encontrada" });
     }
 
-    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, existingAppointment.tenant_id, "agenda");
+    const hasWriteAccess = await requireTenantWriteAccessForResource(req, res, existingAppointment.tenant_id, "agenda", existingAppointment.branch_id);
     if (!hasWriteAccess) return;
 
     const { data, error } = await supabase
@@ -20182,7 +20253,14 @@ app.get("/branches", tenantAuth, async (req, res) => {
       .eq("id", tenant_id)
       .maybeSingle();
 
-    const branchesWithAddress = (data || []).map((b) =>
+    // Usuario interno con "Acceso por sucursal": solo ve sus sucursales
+    // (el selector de sucursal del dashboard se arma con esta lista).
+    const allowedBranchIds = getRestrictedBranchIds(req.authenticatedUser);
+    const visibleBranches = allowedBranchIds
+      ? (data || []).filter((b) => allowedBranchIds.includes(b.id))
+      : data || [];
+
+    const branchesWithAddress = visibleBranches.map((b) =>
       withEffectiveFullAddress(b, tenantAddressRow)
     );
 
@@ -26391,6 +26469,31 @@ const invitationTokenLimiter = rateLimit({
   message: { error: "Demasiados intentos. Intenta de nuevo en un momento." },
 });
 
+// "Acceso por sucursal" al invitar/editar: solo ids de sucursales de ESTE
+// negocio (antes se guardaba cualquier cosa que llegara). null = no vino.
+async function normalizeTenantBranchIds(tenantId, raw) {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) {
+    const err = new Error("branch_ids debe ser una lista");
+    err.status = 400;
+    throw err;
+  }
+  const ids = [...new Set(raw.map((v) => String(v || "").trim()).filter(Boolean))];
+  if (ids.length === 0) return [];
+  const { data, error } = await supabase
+    .from("branches")
+    .select("id")
+    .eq("tenant_id", tenantId)
+    .in("id", ids);
+  if (error) throw error;
+  if ((data || []).length !== ids.length) {
+    const err = new Error("Alguna sucursal elegida no pertenece a este negocio");
+    err.status = 400;
+    throw err;
+  }
+  return ids;
+}
+
 app.post("/invitations", tenantAuthWrite, async (req, res) => {
   try {
     const { tenant_id, email, role, branch_id, invited_by, permissions } = req.body;
@@ -26491,7 +26594,14 @@ app.post("/invitations", tenantAuthWrite, async (req, res) => {
     if (branch_id) insertPayload.branch_id = branch_id;
     if (invited_by) insertPayload.invited_by = invited_by;
     if (permissions) insertPayload.permissions = permissions;
-    if (req.body.branch_ids) insertPayload.branch_ids = req.body.branch_ids;
+    let safeBranchIds = null;
+    try {
+      safeBranchIds = await normalizeTenantBranchIds(tenant_id, req.body.branch_ids);
+    } catch (branchErr) {
+      if (branchErr.status === 400) return res.status(400).json({ error: branchErr.message });
+      throw branchErr;
+    }
+    if (safeBranchIds) insertPayload.branch_ids = safeBranchIds;
 
     const { data: invitation, error: insertError } = await supabase
       .from("tenant_invitations")
@@ -26977,7 +27087,14 @@ app.patch("/members/:id", tenantAuthWrite, async (req, res) => {
     if (role !== undefined) updatePayload.role = role;
     if (is_active !== undefined) updatePayload.is_active = Boolean(is_active);
     if (permissions !== undefined) updatePayload.permissions = permissions;
-    if (branch_ids !== undefined) updatePayload.branch_ids = branch_ids;
+    if (branch_ids !== undefined) {
+      try {
+        updatePayload.branch_ids = (await normalizeTenantBranchIds(tenant_id, branch_ids)) || [];
+      } catch (branchErr) {
+        if (branchErr.status === 400) return res.status(400).json({ error: branchErr.message });
+        throw branchErr;
+      }
+    }
 
     const { data: updated, error: updateError } = await supabase
       .from("tenant_users")

@@ -395,6 +395,13 @@ One-time "Migrar mis datos" for a business moving from another booking system. M
 - Loading the data is manual (Camilo + Claude): customers via the existing importer logic, future appointments inserted directly without sending confirmations.
 - Tenant deletion cascades the row; files in the bucket are not cleaned up (same as other buckets).
 
+## Team users: owner-only management + branch access (2026-10-26)
+
+- **Only the owner manages users**: `WRITE_ACCESS_MODULE_RULES` has `access: "owner_only"` for `/invitations` and `/members` (checked in `requireWriteAccess` BEFORE the owner/admin shortcut, so an `admin` can't invite either). Configuración → Equipo hides "Crear nuevo usuario", edit/desactivar/eliminar and "Cancelar invitación" unless `role === "owner"`.
+- **"Acceso por sucursal" is now enforced** (before, `tenant_users.branch_ids` was saved but never read). `resolveTenantMembership` merges `branch_access` (role `branch`) + `tenant_users.branch_ids` into `req.authenticatedUser.branch_ids`. `getRestrictedBranchIds(authUser)` = those ids for non-owner/admin users (empty = unrestricted, legacy accounts). `applyBranchScope(req,res)` runs in `enforceTenantId`/`enforceSlugOwnership`/`enforceTenantIdParam`/`requireTenantMembership`/`requireTenantWriteAccessForResource`: a `branch_id` in query/body/params outside the list → 403 "No tienes acceso a esta sucursal"; GET without `branch_id` on `/stats/`, `/customers`, `/appointments`, `/agenda`, `/reviews` is scoped to the first allowed branch (Express 5: `req.query` is replaced with `Object.defineProperty`). `GET /branches` returns only allowed branches (the dashboard branch selector is built from it). `requireTenantWriteAccessForResource(..., resourceBranchId)` also checks the resource's branch (appointment endpoints pass `branch_id`). Not covered: other resource-by-id endpoints (staff/services by id) — UI never shows them, but no hard check.
+- `normalizeTenantBranchIds(tenantId, raw)` validates `branch_ids` on `POST /invitations` and `PATCH /members/:id` (must belong to the tenant).
+- UI: with 1 branch it is assigned automatically (checkbox checked/disabled); with 2+ at least one is required. Existing members invited before this with no branches stay unrestricted until edited.
+
 ## Status and Pending (2026-10-25)
 
 - **Infra**: production runs on Render `orbyx-backend-virginia` + Supabase Virginia (`fqmdcbvtrgc…`, us-east-1). The old São Paulo project stays paused as fallback. The mirror was missing some schema; `2026-10-25-schema-repair-virginia.sql` fixed it. If an endpoint fails with "column does not exist" / "relation does not exist", suspect schema drift from the migration first and check prod directly.
