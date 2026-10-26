@@ -3876,7 +3876,9 @@ function matchesCustomerAudienceFilter(summary, { category = null, minDaysWithou
   return true;
 }
 
-const CUSTOMER_SORT_KEYS = ["oldest", "recent", "most_visits", "least_visits"];
+// "name", "newest" y "next_appointment" solo se usan en la lista de Clientes
+// (Campañas valida su propia lista: oldest/recent/most_visits/least_visits).
+const CUSTOMER_SORT_KEYS = ["oldest", "recent", "most_visits", "least_visits", "name", "newest", "next_appointment"];
 
 // Ordena una lista de clientes ya enriquecidos (last_visit_at/total_visits
 // son los de visitas asistidas). Los sin visita van al final en
@@ -3896,6 +3898,27 @@ function sortCustomersByAudienceSort(list, sortKey) {
   if (sortKey === "recent") return list.sort((a, b) => cmpNullLast(a, b, -1));
   if (sortKey === "most_visits") return list.sort((a, b) => visits(b) - visits(a));
   if (sortKey === "least_visits") return list.sort((a, b) => visits(a) - visits(b));
+  if (sortKey === "name") {
+    return list.sort((a, b) =>
+      String(a.name || "").localeCompare(String(b.name || ""), "es", { sensitivity: "base" })
+    );
+  }
+  if (sortKey === "newest") {
+    const created = (c) => (c.created_at ? new Date(c.created_at).getTime() : 0);
+    return list.sort((a, b) => created(b) - created(a));
+  }
+  if (sortKey === "next_appointment") {
+    // Próxima reserva más cercana primero; sin reserva futura al final.
+    const next = (c) => (c.next_appointment_at ? new Date(c.next_appointment_at).getTime() : null);
+    return list.sort((a, b) => {
+      const na = next(a);
+      const nb = next(b);
+      if (na === null && nb === null) return 0;
+      if (na === null) return 1;
+      if (nb === null) return -1;
+      return na - nb;
+    });
+  }
   return list;
 }
 
