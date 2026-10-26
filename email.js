@@ -2069,6 +2069,38 @@ async function sendAddonExpiryReminderEmail({ to, businessName, items, billingUr
   }
 }
 
+// Aviso interno: un negocio subió su migración de datos (archivos de su
+// sistema anterior). Solo para el equipo de Orbyx, nunca para el negocio.
+async function sendMigrationRequestAlertEmail({ to, businessName, slug, uploaderEmail, fileCount, notes, adminUrl }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Aviso de migración omitido.");
+      return { ok: false, reason: "no_resend" };
+    }
+    await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: `📦 Nueva migración de datos: ${businessName || slug}`,
+      html: `
+<div style="font-family:Arial, Helvetica, sans-serif; padding:16px; color:#0f172a;">
+  <h2 style="margin:0 0 12px;">Un negocio subió su migración de datos</h2>
+  <ul style="line-height:1.7;">
+    <li><strong>Negocio:</strong> ${escapeHtml(businessName || "")} (${escapeHtml(slug || "")})</li>
+    <li><strong>Subido por:</strong> ${escapeHtml(uploaderEmail || "—")}</li>
+    <li><strong>Archivos:</strong> ${escapeHtml(fileCount)}</li>
+  </ul>
+  ${notes ? `<p><strong>Nota del negocio:</strong><br>${escapeHtml(notes).replace(/\n/g, "<br>")}</p>` : ""}
+  <p>Hay que procesarla cuanto antes: el negocio está esperando sus clientes y reservas.</p>
+  <p><a href="${escapeHtml(adminUrl)}" style="display:inline-block; background:#2563eb; color:#fff; padding:10px 16px; border-radius:8px; text-decoration:none; font-weight:bold;">Ver en el panel admin</a></p>
+</div>`,
+    });
+    return { ok: true };
+  } catch (error) {
+    console.error("Error enviando aviso de migración:", error);
+    return { ok: false, reason: error?.message || "send_failed" };
+  }
+}
+
 module.exports = {
   sendBookingEmail,
   sendInvitationEmail,
@@ -2083,5 +2115,6 @@ module.exports = {
   sendPasswordResetEmail,
   sendWelcomeAccessEmail,
   sendAddonExpiryReminderEmail,
+  sendMigrationRequestAlertEmail,
   isDemoEmailRecipient,
 };

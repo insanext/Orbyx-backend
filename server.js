@@ -28,6 +28,7 @@ const {
   sendPasswordResetEmail,
   sendWelcomeAccessEmail,
   sendAddonExpiryReminderEmail,
+  sendMigrationRequestAlertEmail,
   isDemoEmailRecipient,
 } = require("./email");
 const {
@@ -10649,6 +10650,222 @@ app.post("/customers", tenantAuthSlugWrite, async (req, res) => {
     return res.status(500).json({ error: err.message || "Error creando cliente" });
   }
 });
+
+/* ======================================================
+   📦 Migración de datos (una sola vez por negocio)
+   (migración 2026-10-26-migration-requests.sql)
+   El negocio sube los archivos que exportó de su sistema anterior
+   (clientes y reservas pasadas/futuras). El servidor NO los abre: solo los
+   guarda en un bucket privado y avisa por correo al equipo de Orbyx, que los
+   procesa a mano desde /admin/migraciones.
+   - Una sola solicitud por negocio (unique tenant_id). Si el equipo la
+     elimina desde el admin, el negocio puede volver a subir.
+   - Solo dueño/admin. tenant_id sale del slug + membresía, nunca del cliente.
+   GET  /customers/migration-request/:slug  → { available, request }
+   POST /customers/migration-request/:slug  → multipart "files" (1-5) + "notes"
+====================================================== */
+const MIGRATION_BUCKET = "migration-uploads";
+const MIGRATION_MAX_FILES = 5;
+const MIGRATION_MAX_BYTES = 10 * 1024 * 1024;
+const MIGRATION_STATUSES = ["pending", "in_progress", "done"];
+const MIGRATION_ALERT_EMAIL = process.env.MIGRATION_ALERT_EMAIL || "camilo.merino.m@gmail.com";
+
+const migrationUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MIGRATION_MAX_BYTES, files: MIGRATION_MAX_FILES, fields: 5, fieldSize: 4 * 1024 },
+});
+
+// Formato real por contenido (no basta la extensión): xlsx = zip, xls = OLE2,
+// csv = texto (sin bytes nulos, salvo UTF-16 con BOM).
+function detectMigrationFileKind(file) {
+  const name = String(file?.originalname || "").toLowerCase();
+  const buf = file?.buffer;
+  if (!buf || buf.length === 0) return null;
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "";
+  if (ext === "xlsx") {
+    return buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04 ? "xlsx" : null;
+  }
+  if (ext === "xls") {
+    const ole = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+    return buf.length > 8 && ole.every((b, i) => buf[i] === b) ? "xls" : null;
+  }
+  if (ext === "csv" || ext === "txt") {
+    const isUtf16 = (buf[0] === 0xff && buf[1] === 0xfe) || (buf[0] === 0xfe && buf[1] === 0xff);
+    if (isUtf16) return "csv";
+    const sample = buf.subarray(0, Math.min(buf.length, 64 * 1024));
+    return sample.includes(0x00) ? null : "csv";
+  }
+  return null;
+}
+
+function sanitizeMigrationFileName(name) {
+  const base = String(name || "archivo").split(/[\\/]/).pop() || "archivo";
+  return base.replace(/[^a-zA-Z0-9._ -]/g, "_").replace(/\s+/g, " ").trim().slice(0, 120) || "archivo";
+}
+
+function toPublicMigrationRequest(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    status: row.status,
+    notes: row.notes || "",
+    files: (Array.isArray(row.files) ? row.files : []).map((f) => ({ name: f.name, size: f.size })),
+    created_at: row.created_at,
+    completed_at: row.completed_at || null,
+  };
+}
+
+function requireOwnerOrAdminForMigration(req, res, next) {
+  const role = req.authenticatedUser?.role;
+  if (role === "owner" || role === "admin") return next();
+  return res.status(403).json({ error: "Solo el dueño o un administrador puede migrar los datos del negocio." });
+}
+
+app.get(
+  "/customers/migration-request/:slug",
+  ...tenantAuthSlug,
+  requireOwnerOrAdminForMigration,
+  async (req, res) => {
+    try {
+      const tenantId = req.authenticatedUser.tenant_id;
+      const { data, error } = await supabase
+        .from("migration_requests")
+        .select("id, status, notes, files, created_at, completed_at")
+        .eq("tenant_id", tenantId)
+        .maybeSingle();
+      if (error) {
+        if (isMissingSchemaError(error)) return res.json({ available: false, request: null });
+        throw error;
+      }
+      return res.json({ available: true, request: toPublicMigrationRequest(data) });
+    } catch (err) {
+      console.error("GET /customers/migration-request/:slug error:", err.message);
+      return res.status(500).json({ error: "No pudimos revisar el estado de tu migración." });
+    }
+  }
+);
+
+app.post(
+  "/customers/migration-request/:slug",
+  customerImportLimiter,
+  ...tenantAuthSlugWrite,
+  requireOwnerOrAdminForMigration,
+  // Recibe los archivos DESPUÉS de autenticar.
+  (req, res, next) =>
+    migrationUpload.array("files", MIGRATION_MAX_FILES)(req, res, (err) => {
+      if (!err) return next();
+      if (err.code === "LIMIT_FILE_SIZE") {
+        return res.status(400).json({ error: "Cada archivo puede pesar hasta 10 MB." });
+      }
+      if (err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE") {
+        return res.status(400).json({ error: `Puedes subir hasta ${MIGRATION_MAX_FILES} archivos.` });
+      }
+      return res.status(400).json({ error: "No pudimos recibir los archivos. Inténtalo de nuevo." });
+    }),
+  async (req, res) => {
+    const tenantId = req.authenticatedUser.tenant_id;
+    const uploadedPaths = [];
+    try {
+      const files = Array.isArray(req.files) ? req.files : [];
+      if (files.length === 0) {
+        return res.status(400).json({ error: "Adjunta al menos un archivo." });
+      }
+      for (const file of files) {
+        if (!detectMigrationFileKind(file)) {
+          return res.status(400).json({
+            error: `"${sanitizeMigrationFileName(file.originalname)}" no es un Excel (.xlsx o .xls) ni un CSV válido.`,
+          });
+        }
+      }
+      const notes = String(req.body?.notes || "").trim().slice(0, 2000) || null;
+
+      const { data: existing, error: existingErr } = await supabase
+        .from("migration_requests")
+        .select("id")
+        .eq("tenant_id", tenantId)
+        .maybeSingle();
+      if (existingErr) {
+        if (isMissingSchemaError(existingErr)) {
+          return res.status(503).json({ error: "La migración de datos aún no está disponible. Inténtalo más tarde." });
+        }
+        throw existingErr;
+      }
+      if (existing) {
+        return res.status(409).json({ error: "Tu negocio ya envió su migración. Si necesitas corregir algo, escríbenos a soporte." });
+      }
+
+      const requestId = crypto.randomUUID();
+      const stored = [];
+      for (let i = 0; i < files.length; i += 1) {
+        const file = files[i];
+        const name = sanitizeMigrationFileName(file.originalname);
+        const path = `${tenantId}/${requestId}/${i + 1}-${name.replace(/\s+/g, "_")}`;
+        const { error: upErr } = await supabase.storage
+          .from(MIGRATION_BUCKET)
+          .upload(path, file.buffer, { contentType: "application/octet-stream", upsert: false });
+        if (upErr) {
+          console.error("POST /customers/migration-request upload error:", upErr.message);
+          throw new Error("storage_upload_failed");
+        }
+        uploadedPaths.push(path);
+        stored.push({ path, name, size: file.size });
+      }
+
+      const { data: row, error: insertErr } = await supabase
+        .from("migration_requests")
+        .insert({
+          id: requestId,
+          tenant_id: tenantId,
+          status: "pending",
+          notes,
+          files: stored,
+          created_by: req.authenticatedUser.user_id,
+        })
+        .select("id, status, notes, files, created_at, completed_at")
+        .single();
+      if (insertErr) {
+        await supabase.storage.from(MIGRATION_BUCKET).remove(uploadedPaths).catch(() => {});
+        if (insertErr.code === "23505") {
+          return res.status(409).json({ error: "Tu negocio ya envió su migración." });
+        }
+        throw insertErr;
+      }
+
+      // Aviso al equipo (best-effort: si falla, la solicitud igual queda guardada).
+      try {
+        if (!(await isDemoTenant(tenantId))) {
+          const [{ data: tenant }, userRes] = await Promise.all([
+            supabase.from("tenants").select("name, slug").eq("id", tenantId).maybeSingle(),
+            supabase.auth.admin.getUserById(req.authenticatedUser.user_id).catch(() => null),
+          ]);
+          const uploaderEmail = userRes?.data?.user?.email || null;
+          if (uploaderEmail) {
+            await supabase.from("migration_requests").update({ created_by_email: uploaderEmail }).eq("id", requestId);
+          }
+          await sendMigrationRequestAlertEmail({
+            to: MIGRATION_ALERT_EMAIL,
+            businessName: tenant?.name,
+            slug: tenant?.slug,
+            uploaderEmail,
+            fileCount: stored.length,
+            notes,
+            adminUrl: "https://www.orbyx.cl/admin/migraciones",
+          });
+        }
+      } catch (alertErr) {
+        console.error("POST /customers/migration-request: aviso no enviado:", alertErr.message);
+      }
+
+      return res.status(201).json({ ok: true, request: toPublicMigrationRequest(row) });
+    } catch (err) {
+      if (uploadedPaths.length) {
+        await supabase.storage.from(MIGRATION_BUCKET).remove(uploadedPaths).catch(() => {});
+      }
+      console.error("POST /customers/migration-request/:slug error:", err.message);
+      return res.status(500).json({ error: "No pudimos guardar tus archivos. Inténtalo de nuevo." });
+    }
+  }
+);
 
 app.patch("/customers/:id", tenantAuthSlugWrite, async (req, res) => {
   try {
@@ -24786,6 +25003,158 @@ app.delete("/admin/billing-documents/:docId", requireAdminAuth, async (req, res)
   } catch (err) {
     console.error("DELETE /admin/billing-documents/:docId error:", err.message);
     return res.status(500).json({ error: "No se pudo eliminar el documento" });
+  }
+});
+
+/* ======================================================
+   📦 Migraciones de datos (Super Admin)
+   GET    /admin/migration-requests                 → lista + pending_count
+   GET    /admin/migration-requests/pending-count   → contador del menú
+   GET    /admin/migration-requests/:id/files/:index → URL firmada (5 min)
+   PATCH  /admin/migration-requests/:id             → { status?, admin_notes? }
+   DELETE /admin/migration-requests/:id             → borra solicitud + archivos
+                                                      (el negocio puede volver a subir)
+====================================================== */
+app.get("/admin/migration-requests/pending-count", requireAdminAuth, async (req, res) => {
+  try {
+    const { count, error } = await supabase
+      .from("migration_requests")
+      .select("id", { count: "exact", head: true })
+      .in("status", ["pending", "in_progress"]);
+    if (error) {
+      if (isMissingSchemaError(error)) return res.json({ available: false, pending_count: 0 });
+      throw error;
+    }
+    return res.json({ available: true, pending_count: count || 0 });
+  } catch (err) {
+    console.error("GET /admin/migration-requests/pending-count error:", err.message);
+    return res.status(500).json({ error: "No se pudo contar las migraciones" });
+  }
+});
+
+app.get("/admin/migration-requests", requireAdminAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("migration_requests")
+      .select("id, tenant_id, status, notes, files, created_by_email, admin_notes, created_at, updated_at, completed_at")
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (error) {
+      if (isMissingSchemaError(error)) return res.json({ available: false, requests: [], pending_count: 0 });
+      throw error;
+    }
+    const rows = data || [];
+    const tenantIds = [...new Set(rows.map((r) => r.tenant_id).filter(Boolean))];
+    let tenantsById = {};
+    if (tenantIds.length) {
+      const { data: tenants } = await supabase.from("tenants").select("id, name, slug").in("id", tenantIds);
+      tenantsById = Object.fromEntries((tenants || []).map((t) => [t.id, t]));
+    }
+    const rank = { pending: 0, in_progress: 1, done: 2 };
+    const requests = rows
+      .map((r) => ({
+        ...r,
+        files: (Array.isArray(r.files) ? r.files : []).map((f, index) => ({ index, name: f.name, size: f.size })),
+        tenant_name: tenantsById[r.tenant_id]?.name || null,
+        tenant_slug: tenantsById[r.tenant_id]?.slug || null,
+      }))
+      .sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
+    return res.json({
+      available: true,
+      requests,
+      pending_count: rows.filter((r) => r.status === "pending" || r.status === "in_progress").length,
+    });
+  } catch (err) {
+    console.error("GET /admin/migration-requests error:", err.message);
+    return res.status(500).json({ error: "No se pudieron cargar las migraciones" });
+  }
+});
+
+async function getMigrationRequestById(id) {
+  const { data, error } = await supabase
+    .from("migration_requests")
+    .select("id, tenant_id, status, files, admin_notes")
+    .eq("id", id)
+    .maybeSingle();
+  if (error && !isMissingSchemaError(error)) throw error;
+  return data || null;
+}
+
+app.get("/admin/migration-requests/:id/files/:index", requireAdminAuth, async (req, res) => {
+  try {
+    const row = await getMigrationRequestById(req.params.id);
+    if (!row) return res.status(404).json({ error: "Migración no encontrada" });
+    const file = (Array.isArray(row.files) ? row.files : [])[Number(req.params.index)];
+    if (!file?.path) return res.status(404).json({ error: "Archivo no encontrado" });
+    const { data, error } = await supabase.storage
+      .from(MIGRATION_BUCKET)
+      .createSignedUrl(file.path, 5 * 60, { download: file.name || true });
+    if (error || !data?.signedUrl) throw error || new Error("No se pudo generar el enlace");
+    return res.json({ url: data.signedUrl });
+  } catch (err) {
+    console.error("GET /admin/migration-requests/:id/files/:index error:", err.message);
+    return res.status(500).json({ error: "No se pudo descargar el archivo" });
+  }
+});
+
+app.patch("/admin/migration-requests/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const row = await getMigrationRequestById(req.params.id);
+    if (!row) return res.status(404).json({ error: "Migración no encontrada" });
+    const updates = { updated_at: new Date().toISOString() };
+    if (req.body?.status !== undefined) {
+      const status = String(req.body.status);
+      if (!MIGRATION_STATUSES.includes(status)) return res.status(400).json({ error: "Estado inválido" });
+      updates.status = status;
+      updates.completed_at = status === "done" ? new Date().toISOString() : null;
+    }
+    if (req.body?.admin_notes !== undefined) {
+      updates.admin_notes = String(req.body.admin_notes || "").slice(0, 4000) || null;
+    }
+    const { data, error } = await supabase
+      .from("migration_requests")
+      .update(updates)
+      .eq("id", row.id)
+      .select("id, status, admin_notes, updated_at, completed_at")
+      .single();
+    if (error) throw error;
+    if (updates.status && updates.status !== row.status && row.tenant_id) {
+      await logAdminTenantAction({
+        tenantId: row.tenant_id,
+        adminUserId: req.adminUser?.user_id,
+        adminEmail: req.adminUser?.email,
+        actionType: "migration_request_status",
+        details: { request_id: row.id, from: row.status, to: updates.status },
+      });
+    }
+    return res.json({ ok: true, request: data });
+  } catch (err) {
+    console.error("PATCH /admin/migration-requests/:id error:", err.message);
+    return res.status(500).json({ error: "No se pudo actualizar la migración" });
+  }
+});
+
+app.delete("/admin/migration-requests/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const row = await getMigrationRequestById(req.params.id);
+    if (!row) return res.status(404).json({ error: "Migración no encontrada" });
+    const { error } = await supabase.from("migration_requests").delete().eq("id", row.id);
+    if (error) throw error;
+    const paths = (Array.isArray(row.files) ? row.files : []).map((f) => f.path).filter(Boolean);
+    if (paths.length) await supabase.storage.from(MIGRATION_BUCKET).remove(paths).catch(() => {});
+    if (row.tenant_id) {
+      await logAdminTenantAction({
+        tenantId: row.tenant_id,
+        adminUserId: req.adminUser?.user_id,
+        adminEmail: req.adminUser?.email,
+        actionType: "migration_request_deleted",
+        details: { request_id: row.id, status: row.status, files: paths.length },
+      });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /admin/migration-requests/:id error:", err.message);
+    return res.status(500).json({ error: "No se pudo eliminar la migración" });
   }
 });
 

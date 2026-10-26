@@ -385,6 +385,16 @@ Orbyx's own boletas/facturas to each business, for its plan and add-on charges. 
 - Missing migration: reads return `available:false`/no documents (history still works); uploads answer 503 with a clear message.
 - Agenda week headers: the "N c" badge (canceled count) was removed; the red pending-to-close count stays.
 
+## Data migration requests (2026-10-26)
+
+One-time "Migrar mis datos" for a business moving from another booking system. Migration `2026-10-26-migration-requests.sql`: table `migration_requests` (`tenant_id` UNIQUE → one per business; `status` pending | in_progress | done; `notes`; `files` jsonb `[{path,name,size}]`; `created_by(_email)`; `admin_notes`; service-role only) + private bucket `migration-uploads`.
+
+- **Business** (Clientes → "Migrar mis datos", also the empty-state link; owner/admin only, `components/customers/MigrationRequestModal.tsx`): uploads 1–5 files (.xlsx/.xls/.csv, 10 MB each, checked by content signature: zip / OLE2 / text without NUL bytes), optional comment, must tick "se envía una sola vez". After sending it only sees the status (Recibida / En proceso / Lista). No "which system do you come from" field on purpose (no competitor names).
+- **Backend**: `GET`/`POST /customers/migration-request/:slug` (`tenantAuthSlug(Write)` + owner/admin). The server never parses the files, only stores them (`application/octet-stream`). 409 if the business already sent one. Sends `sendMigrationRequestAlertEmail` to `MIGRATION_ALERT_EMAIL` (env, default camilo.merino.m@gmail.com); skipped for demo tenants.
+- **Admin** (`/admin/migraciones`, red counter in the admin menu = pending + in_progress, refreshed every 2 min): `GET /admin/migration-requests`, `GET /admin/migration-requests/pending-count`, `GET /admin/migration-requests/:id/files/:index` (signed URL 5 min), `PATCH /admin/migration-requests/:id` `{status, admin_notes}`, `DELETE /admin/migration-requests/:id` (removes row + files; the business can upload again). Status changes/deletes are logged with `logAdminTenantAction`.
+- Loading the data is manual (Camilo + Claude): customers via the existing importer logic, future appointments inserted directly without sending confirmations.
+- Tenant deletion cascades the row; files in the bucket are not cleaned up (same as other buckets).
+
 ## Status and Pending (2026-10-25)
 
 - **Infra**: production runs on Render `orbyx-backend-virginia` + Supabase Virginia (`fqmdcbvtrgc…`, us-east-1). The old São Paulo project stays paused as fallback. The mirror was missing some schema; `2026-10-25-schema-repair-virginia.sql` fixed it. If an endpoint fails with "column does not exist" / "relation does not exist", suspect schema drift from the migration first and check prod directly.
