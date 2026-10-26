@@ -7302,8 +7302,7 @@ const {
       !date ||
       !slot_start ||
       !customer_name ||
-      !customer_phone ||
-      !customer_email
+      !customer_phone
     ) {
       return res.status(400).json({
         error:
@@ -7311,7 +7310,9 @@ const {
       });
     }
 
-    if (!isValidEmail(normalizedEmail)) {
+    // El email es obligatorio solo en la reserva pública (se exige más abajo,
+    // una vez resuelto el origen). Si viene, debe ser válido en ambos casos.
+    if (normalizedEmail && !isValidEmail(normalizedEmail)) {
       return res.status(400).json({
         error: "El email ingresado no es válido.",
       });
@@ -7402,6 +7403,16 @@ const {
       cal.tenant_id
     );
     if (isDashboardBooking === null) return;
+
+    // Reserva pública: el email sigue siendo obligatorio. Reserva del
+    // negocio (dashboard): opcional — clientes migrados sin email; en ese
+    // caso no se envía ningún correo (confirmación ni recordatorio).
+    if (!isDashboardBooking && !normalizedEmail) {
+      return res.status(400).json({
+        error:
+          "Faltan campos: calendar_id, date (YYYY-MM-DD), slot_start (ISO), customer_name, customer_phone, customer_email",
+      });
+    }
 
     // Reserva pública: captcha (Turnstile) + antiabuso. La reserva manual
     // desde Agenda (isDashboardBooking, ya autenticada arriba) no pasa por
@@ -7583,14 +7594,18 @@ if (!isGroup) {
       const escapedEmailPattern = normalizedEmail.replace(/[\\%_]/g, "\\$&");
       const personSelect = "id, customer_name, customer_email, customer_phone";
 
+      // Sin email (reserva del negocio) no se busca por correo: un ilike con
+      // valor vacío igualaría a todas las citas sin email y las mezclaría.
       const [emailRes, phoneRes] = await Promise.all([
-        supabase
-          .from("appointments")
-          .select(personSelect)
-          .eq("tenant_id", cal.tenant_id)
-          .eq("status", "booked")
-          .gte("start_at", nowIso)
-          .ilike("customer_email", escapedEmailPattern),
+        normalizedEmail
+          ? supabase
+              .from("appointments")
+              .select(personSelect)
+              .eq("tenant_id", cal.tenant_id)
+              .eq("status", "booked")
+              .gte("start_at", nowIso)
+              .ilike("customer_email", escapedEmailPattern)
+          : Promise.resolve({ data: [], error: null }),
         supabase
           .from("appointments")
           .select(personSelect)
@@ -7746,7 +7761,7 @@ const slotDateStr = String(date).slice(0, 10);
 const customer = await upsertCustomerFromAppointment({
   tenant_id: cal.tenant_id,
   customer_name: String(customer_name).trim(),
-  customer_email: normalizedEmail,
+  customer_email: normalizedEmail || null,
   customer_phone: normalizedPhone,
   start_at: start.toISOString(),
 });
@@ -7804,7 +7819,7 @@ if ((overlappingAppointments || []).length > 0) {
         duration_minutes_snapshot: duration,
         customer_name: String(customer_name).trim(),
         customer_phone: normalizedPhone,
-        customer_email: normalizedEmail,
+        customer_email: normalizedEmail || null,
         start_at: start.toISOString(),
         end_at: end.toISOString(),
         source,
@@ -7990,7 +8005,7 @@ if (customerData && typeof customerData === "object" && Object.keys(customerData
 
     const event = {
       summary: `Cita - ${String(customer_name).trim()}`,
-      description: `Cliente: ${String(customer_name).trim()}\nTeléfono: ${normalizedPhone}\nEmail: ${normalizedEmail}\ncalendar_id: ${calendar_id}\nappointment_id: ${appt.id}\nstaff_id: ${staff_id || "no_asignado"}`,
+      description: `Cliente: ${String(customer_name).trim()}\nTeléfono: ${normalizedPhone}${normalizedEmail ? `\nEmail: ${normalizedEmail}` : ""}\ncalendar_id: ${calendar_id}\nappointment_id: ${appt.id}\nstaff_id: ${staff_id || "no_asignado"}`,
       start: { dateTime: start.toISOString(), timeZone },
       end: { dateTime: end.toISOString(), timeZone },
     };
@@ -13677,9 +13692,13 @@ app.patch("/appointments/:id", [dashboardLimiter, requireTenantAuth, requireWrit
     }
 
     if (customer_email !== undefined) {
-      updateData.customer_email = String(customer_email)
-        .trim()
-        .toLowerCase();
+      // Vacío = sin email (null, no ""): así no se confunde con un correo real
+      // en búsquedas, recordatorios ni deduplicación.
+      const patchedEmail = String(customer_email || "").trim().toLowerCase();
+      if (patchedEmail && !isValidEmail(patchedEmail)) {
+        return res.status(400).json({ error: "El email ingresado no es válido." });
+      }
+      updateData.customer_email = patchedEmail || null;
     }
 
     if (customer_phone !== undefined) {
