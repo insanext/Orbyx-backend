@@ -19593,6 +19593,122 @@ app.patch("/tenants/:id", tenantAuthParamWrite, async (req, res) => {
 });
 
 /* ======================================================
+   🎨 Plantillas de la página pública (/{slug}) — 2026-10-26
+   Columna tenants.public_template (text, default 'clasica'), sin CHECK en la
+   BD: los ids válidos se validan acá. IMPORTANTE: esta lista debe coincidir
+   con el registro del frontend (orbyx-web/lib/public-templates.ts); al
+   agregar una plantilla nueva hay que sumarla en AMBOS lados.
+====================================================== */
+const PUBLIC_TEMPLATE_IDS = ["clasica", "esmeralda", "grafito"];
+const DEFAULT_PUBLIC_TEMPLATE = "clasica";
+
+function normalizePublicTemplate(value) {
+  const id = String(value || "").trim().toLowerCase();
+  return PUBLIC_TEMPLATE_IDS.includes(id) ? id : DEFAULT_PUBLIC_TEMPLATE;
+}
+
+// ¿tenants ya tiene la columna public_template? Se consulta una vez y se
+// recuerda; si falta (migración pendiente) se reintenta cada 60 s. Mismo
+// patrón que hasAppointmentExtrasColumns: así un deploy ANTES de correr la
+// migración no rompe el select de la página pública (que si pidiera una
+// columna inexistente devolvería 404 para todos los negocios).
+let publicTemplateColumnCache = { value: false, checkedAt: 0 };
+async function hasPublicTemplateColumn() {
+  if (publicTemplateColumnCache.value) return true;
+  if (Date.now() - publicTemplateColumnCache.checkedAt < 60 * 1000) return false;
+  const { error } = await supabase.from("tenants").select("public_template").limit(1);
+  publicTemplateColumnCache = { value: !error, checkedAt: Date.now() };
+  return !error;
+}
+
+function publicTemplateMigrationMissingResponse(res) {
+  return res.status(503).json({
+    error:
+      "Las plantillas de la página pública todavía no están habilitadas (falta aplicar la migración 2026-10-26-public-template.sql).",
+    code: "public_template_unavailable",
+  });
+}
+
+/* ======================================================
+   ✅ GET/PATCH /tenants/:id/public-template
+   Endpoint aislado (no reusa PATCH /tenants/:id): ese exige `name` y pone en
+   null los opcionales que no vengan, y además un guardado que incluyera una
+   columna inexistente rompería TODO el guardado del negocio. Este solo toca
+   public_template; owner/admin únicamente (prefijo /tenants).
+====================================================== */
+app.get("/tenants/:id/public-template", tenantAuthParam, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!(await hasPublicTemplateColumn())) {
+      return res.json({
+        available: false,
+        public_template: DEFAULT_PUBLIC_TEMPLATE,
+        templates: PUBLIC_TEMPLATE_IDS,
+      });
+    }
+    const { data, error } = await supabase
+      .from("tenants")
+      .select("public_template")
+      .eq("id", id)
+      .maybeSingle();
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        publicTemplateColumnCache = { value: false, checkedAt: Date.now() };
+        return res.json({
+          available: false,
+          public_template: DEFAULT_PUBLIC_TEMPLATE,
+          templates: PUBLIC_TEMPLATE_IDS,
+        });
+      }
+      return res.status(500).json({ error: error.message });
+    }
+    return res.json({
+      available: true,
+      public_template: normalizePublicTemplate(data?.public_template),
+      templates: PUBLIC_TEMPLATE_IDS,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/tenants/:id/public-template", tenantAuthParamWrite, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const requested = String(req.body?.public_template ?? "").trim().toLowerCase();
+
+    if (!PUBLIC_TEMPLATE_IDS.includes(requested)) {
+      return res.status(400).json({
+        error: `Plantilla no válida. Opciones: ${PUBLIC_TEMPLATE_IDS.join(", ")}.`,
+      });
+    }
+
+    if (!(await hasPublicTemplateColumn())) {
+      return publicTemplateMigrationMissingResponse(res);
+    }
+
+    const { data, error } = await supabase
+      .from("tenants")
+      .update({ public_template: requested })
+      .eq("id", id)
+      .select("public_template")
+      .single();
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        publicTemplateColumnCache = { value: false, checkedAt: Date.now() };
+        return publicTemplateMigrationMissingResponse(res);
+      }
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({ ok: true, public_template: normalizePublicTemplate(data?.public_template) });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
    ✅ PATCH /tenants/:id/whatsapp-settings
    Endpoint chico y aislado (no reusa PATCH /tenants/:id) a propósito:
    PATCH /tenants/:id exige `name` y pone en null cualquier otro campo
@@ -21238,17 +21354,27 @@ app.get("/public/services/:slug", publicLimiter, async (req, res) => {
     const { slug } = req.params;
     const { branch_id } = req.query;
 
-    const { data: tenant, error: tenantError } = await supabase
-      .from("tenants")
-      .select(
-        `${PUBLIC_TENANT_FIELDS}, ${PUBLIC_TENANT_DEPOSIT_FIELDS.join(", ")}, is_active, paused_at, is_trial, trial_ends_at, billing_cycle_end`
-      )
-      .eq("slug", slug)
-      .single();
+    // public_template solo se pide si la columna ya existe (migración
+    // 2026-10-26): pedirla antes haría fallar el select y 404 en todas las
+    // páginas públicas. Si el select igual falla por columna faltante, se
+    // reintenta sin ella.
+    const tenantSelectBase = `${PUBLIC_TENANT_FIELDS}, ${PUBLIC_TENANT_DEPOSIT_FIELDS.join(", ")}, is_active, paused_at, is_trial, trial_ends_at, billing_cycle_end`;
+    const loadPublicTenant = (select) =>
+      supabase.from("tenants").select(select).eq("slug", slug).single();
+
+    const withTemplate = await hasPublicTemplateColumn();
+    let { data: tenant, error: tenantError } = await loadPublicTenant(
+      withTemplate ? `${tenantSelectBase}, public_template` : tenantSelectBase
+    );
+    if (tenantError && withTemplate && isMissingSchemaError(tenantError)) {
+      publicTemplateColumnCache = { value: false, checkedAt: Date.now() };
+      ({ data: tenant, error: tenantError } = await loadPublicTenant(tenantSelectBase));
+    }
 
     if (tenantError || !tenant) {
       return res.status(404).json({ error: "Negocio no encontrado" });
     }
+    tenant.public_template = normalizePublicTemplate(tenant.public_template);
 
     const bookingStatus = await getPublicBookingStatus(tenant);
     if (!bookingStatus.open) {
