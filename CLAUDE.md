@@ -427,6 +427,19 @@ Each business picks a visual "plantilla" for its public booking page (`/{slug}`)
 - **Limits**: only what is expressed as `indigo`/`violet`/`sky` colors, `rounded-sm…3xl` radii, page background/font changes. NOT affected: `rounded-none` (88 uses: most cards/buttons are square by design, so radius overrides barely show), `rounded-full`, `slate-*` neutrals, semantic `amber`/`emerald`/`rose` (deposit-pending and success screens keep their status colors), Instagram/Facebook brand icons, the Orbyx promo footer (`#F0EEFC`, Orbyx branding), shadows other than the indigo glow, layout/structure. Real structural redesigns (phase 2) need new markup or classes keyed on `data-public-template`, not just tokens. `/{slug}/opinar` and the "modo caído" fallback do not apply templates.
 - Not exercised end-to-end: the dashboard picker (needs a login) was only type/build-checked; the public page was checked headless-style in the Browser pane at 360/380/412/1280 px with a mock backend and Cloudflare's always-pass Turnstile test key.
 
+## Documentos tributarios (2026-10-26)
+
+Boleta/factura por cada pago de Flow, emitida a mano por el admin en el SII. **Reemplaza** a `billing_documents` (sus endpoints `/billing/documents/:id/download` y `/admin/.../billing-documents` siguen en `server.js` pero el panel ya no los usa; la migración copia sus filas).
+
+- **Migración**: `migrations/20261026_documentos_tributarios.sql` (idempotente; Camilo la corre a mano). Tabla `documentos_tributarios`, 7 columnas nuevas en `tenants` (`tipo_documento_preferido`, `rut_facturacion`, `razon_social`, `giro`, `direccion_facturacion`, `comuna_facturacion`, `email_dte`), bucket privado `documentos-tributarios`, RLS (tenant solo SELECT de columnas públicas).
+- **Identidad del pago = `flow_order` (UNIQUE)**. No existe tabla de pagos (el historial se lee de Flow), por eso no hay `pago_id`. `registerTaxDocumentForPayment()` (server.js, junto a los endpoints) hace upsert `ignoreDuplicates`: un reintento del webhook no duplica ni reenvía el correo. Nunca lanza.
+- **Dónde se registra un pago**: `chargeFlowCustomer(params, { tenantId, concept, origen })` (todo cargo con tarjeta: add-ons, pay-now, recurrentes, recarga automática, add-ons de signup), `POST /billing/flow/webhook` (cobros de suscripción) y `processAddonPaymentToken` (add-ons de pago único). Un cargo nuevo con `customer/charge` debe pasar el 2º argumento o no tendrá documento.
+- **Tipo y receptor** se toman de la preferencia del tenant al momento del pago (snapshot en `datos_receptor`, solo factura). Cambiar la preferencia después NO modifica documentos ya creados.
+- **Admin**: `/admin/documentos-tributarios` (menú con badge rojo + banner en todo `/admin`). Endpoints `/admin/documentos-tributarios` (lista, `resumen`, `pending-count`, `exportar` CSV, `:id/documento` subir/reemplazar, `:id/anular` con nota de crédito, `:id/pdf` URL firmada 10 min, `sincronizar`). Aviso al admin a `TAX_DOCS_ADMIN_EMAIL` (default `contacto@orbyx.cl`); al emitir, correo al negocio (`email_dte` u owner).
+- **"Sincronizar con Flow"** importa pagos históricos vía `customer/getCharges` (sin correos). Asume que `getCharges` lista también los cobros de suscripción; verificar con datos reales.
+- **Tenant**: `components/billing/TaxDocumentsSection.tsx` (Facturación y pago → Historial de pagos): "Datos de facturación" (`GET/PUT /billing/datos-facturacion`, RUT validado con dígito verificador) y "Mis pagos y documentos" (`GET /billing/documentos-tributarios`, descarga `/:id/descargar` con URL firmada 5 min; un documento de otro negocio responde 404).
+- Migrados desde `billing_documents` conservan su PDF en el bucket viejo (`archivo_bucket`). Si una boleta cubría varios cobros, el monto de cada fila queda en 0 hasta sincronizar/corregir.
+
 ## Business Categories
 
 Known categories:

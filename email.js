@@ -2101,6 +2101,69 @@ async function sendMigrationRequestAlertEmail({ to, businessName, slug, uploader
   }
 }
 
+// Aviso interno: un pago de Flow quedó confirmado y hay que emitir la boleta o
+// factura en el SII. Solo para el equipo de Orbyx.
+async function sendTaxDocumentPendingAlertEmail({ to, tipo, businessName, concept, totalFormatted, adminUrl }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Aviso de documento tributario omitido.");
+      return { ok: false, reason: "no_resend" };
+    }
+    const label = tipo === "factura" ? "factura" : "boleta";
+    await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: `Nuevo pago – emitir ${label}: ${businessName || "negocio"} (${totalFormatted})`,
+      html: `
+<div style="font-family:Arial, Helvetica, sans-serif; padding:16px; color:#0f172a;">
+  <h2 style="margin:0 0 12px;">Nuevo pago – emitir ${escapeHtml(label)}</h2>
+  <ul style="line-height:1.7;">
+    <li><strong>Negocio:</strong> ${escapeHtml(businessName || "—")}</li>
+    <li><strong>Concepto:</strong> ${escapeHtml(concept || "—")}</li>
+    <li><strong>Monto total (IVA incluido):</strong> ${escapeHtml(totalFormatted)}</li>
+    <li><strong>Documento a emitir:</strong> ${escapeHtml(label)}</li>
+  </ul>
+  <p><a href="${escapeHtml(adminUrl)}" style="display:inline-block; background:#2563eb; color:#fff; padding:10px 16px; border-radius:8px; text-decoration:none; font-weight:bold;">Ir al panel de documentos tributarios</a></p>
+</div>`,
+    });
+    return { ok: true };
+  } catch (error) {
+    console.error("Error enviando aviso de documento tributario:", error);
+    return { ok: false, reason: error?.message || "send_failed" };
+  }
+}
+
+// Al negocio: su boleta/factura ya está disponible para descargar.
+async function sendTaxDocumentIssuedEmail({ to, businessName, tipo, folio, concept, totalFormatted, paymentsUrl }) {
+  try {
+    if (!resend) {
+      console.warn("⚠️ RESEND_API_KEY no configurada. Aviso de documento emitido omitido.");
+      return { ok: false, reason: "no_resend" };
+    }
+    const label = tipo === "factura" ? "factura" : "boleta";
+    await resend.emails.send({
+      from: "Orbyx <reservas@notificaciones.orbyx.cl>",
+      to,
+      subject: `Tu ${label} de Orbyx está disponible`,
+      html: `
+<div style="font-family:Arial, Helvetica, sans-serif; padding:16px; color:#0f172a;">
+  <h2 style="margin:0 0 12px;">Tu ${escapeHtml(label)} está disponible</h2>
+  <p>Hola${businessName ? ` ${escapeHtml(businessName)}` : ""}, ya puedes descargar tu ${escapeHtml(label)} por el pago realizado en Orbyx.</p>
+  <ul style="line-height:1.7;">
+    ${folio ? `<li><strong>Folio:</strong> ${escapeHtml(folio)}</li>` : ""}
+    <li><strong>Concepto:</strong> ${escapeHtml(concept || "—")}</li>
+    <li><strong>Total:</strong> ${escapeHtml(totalFormatted)}</li>
+  </ul>
+  <p><a href="${escapeHtml(paymentsUrl)}" style="display:inline-block; background:#2563eb; color:#fff; padding:10px 16px; border-radius:8px; text-decoration:none; font-weight:bold;">Ver mis pagos y documentos</a></p>
+</div>`,
+    });
+    return { ok: true };
+  } catch (error) {
+    console.error("Error enviando aviso de documento emitido:", error);
+    return { ok: false, reason: error?.message || "send_failed" };
+  }
+}
+
 module.exports = {
   sendBookingEmail,
   sendInvitationEmail,
@@ -2116,5 +2179,7 @@ module.exports = {
   sendWelcomeAccessEmail,
   sendAddonExpiryReminderEmail,
   sendMigrationRequestAlertEmail,
+  sendTaxDocumentPendingAlertEmail,
+  sendTaxDocumentIssuedEmail,
   isDemoEmailRecipient,
 };

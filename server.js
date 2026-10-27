@@ -29,6 +29,8 @@ const {
   sendWelcomeAccessEmail,
   sendAddonExpiryReminderEmail,
   sendMigrationRequestAlertEmail,
+  sendTaxDocumentPendingAlertEmail,
+  sendTaxDocumentIssuedEmail,
   isDemoEmailRecipient,
 } = require("./email");
 const {
@@ -4305,7 +4307,7 @@ async function flowApiRequest(endpoint, params, method = "POST") {
 // miraba el status: un cargo no aprobado que Flow devolviera con HTTP 200
 // activaba igual el add-on (auditoría sesión 3, I1). Cualquier resultado
 // distinto de 2 (incluido un status ausente) se trata como fallo.
-async function chargeFlowCustomer(params) {
+async function chargeFlowCustomer(params, taxContext = null) {
   const result = await flowApiRequest("/customer/charge", params);
   const status = Number(result?.status);
   if (status !== 2) {
@@ -4325,6 +4327,17 @@ async function chargeFlowCustomer(params) {
     err.flowResponse = result;
     err.flowChargeStatus = Number.isNaN(status) ? null : status;
     throw err;
+  }
+  // Cobro aprobado: deja el documento tributario 'pendiente' (boleta/factura
+  // por emitir). Nunca lanza ni retrasa el flujo de pago.
+  if (taxContext?.tenantId) {
+    await registerTaxDocumentForPayment({
+      tenantId: taxContext.tenantId,
+      flowOrder: result?.flowOrder,
+      amount: result?.amount ?? params.amount,
+      concept: taxContext.concept || params.subject,
+      origen: taxContext.origen || "addon",
+    });
   }
   return result;
 }
@@ -15764,6 +15777,9 @@ app.post("/billing/addons/activate", tenantAuthWrite, async (req, res) => {
         amount: applyIva(chargeAmount),
         subject: `Add-on: ${addon_key} x${qty}`,
         commerceOrder: `addon_${tenant_id}_${addon_key}_${Date.now()}`,
+      }, {
+        tenantId: tenant_id,
+        concept: `Add-on Orbyx – ${ADDON_CATALOG[addon_key]?.name || addon_key} x${qty}`,
       });
     } catch (chargeErr) {
       console.error("POST /billing/addons/activate: fallo el cargo Flow", chargeErr.message);
@@ -16150,6 +16166,19 @@ async function processAddonPaymentToken(token) {
 
   const problems = await grantOneTimeAddonItems(claimed, effectivePaidAt);
 
+  // Documento tributario pendiente por este pago único (idempotente por
+  // flowOrder; nunca rompe la activación).
+  const addonItemsLabel = (Array.isArray(claimed.items) ? claimed.items : [])
+    .map((line) => `${ADDON_CATALOG[line.addon_key]?.name || line.addon_key} x${line.quantity}`)
+    .join(", ");
+  await registerTaxDocumentForPayment({
+    tenantId: claimed.tenant_id,
+    flowOrder: payment.flowOrder,
+    amount: payment.amount,
+    concept: `Add-ons Orbyx: ${addonItemsLabel || "pago único"}`,
+    origen: "addon",
+  });
+
   await supabase
     .from("addon_purchase_intents")
     .update({
@@ -16427,6 +16456,9 @@ app.patch("/billing/addons/quantity", tenantAuthWrite, async (req, res) => {
           amount: applyIva(chargeAmount),
           subject: `Add-on: ${addon_key} x${increment}`,
           commerceOrder: `addon_${tenant_id}_${addon_key}_${Date.now()}`,
+        }, {
+          tenantId: tenant_id,
+          concept: `Add-on Orbyx – ${ADDON_CATALOG[addon_key]?.name || addon_key} x${increment}`,
         });
         justCharged = true;
       } catch (chargeErr) {
@@ -17678,6 +17710,18 @@ app.post(
         console.log(
           `Flow webhook: pago confirmado para tenant ${subscription.tenant_id}, plan ${subscription.plan_id}, ciclo extendido hasta ${newCycleEnd.toISOString()}`
         );
+
+        // Documento tributario pendiente (idempotente por flowOrder: un
+        // reintento de Flow no lo duplica). Nunca rompe el webhook.
+        const paidDateSantiago = santiagoDateString();
+        await registerTaxDocumentForPayment({
+          tenantId: subscription.tenant_id,
+          flowOrder: payment.flowOrder,
+          amount: payment.amount,
+          concept: taxDocConceptForPlan(normalizePlanSlug(subscription.plan_id), tenantCycle, paidDateSantiago),
+          origen: "suscripcion",
+          paidDate: paidDateSantiago,
+        });
       } else if (flowStatus === 3 || flowStatus === 4) {
         const { error: subErrorUpdateErr } = await supabase
           .from("subscriptions")
@@ -18156,6 +18200,10 @@ app.post("/billing/flow/pay-now", tenantAuthWrite, async (req, res) => {
         amount: applyIva(monto),
         subject: `Orbyx ${plan_id} (mensual) - pago anticipado`,
         commerceOrder: `paynow_${tenant_id}_${Date.now()}`,
+      }, {
+        tenantId: tenant_id,
+        origen: "suscripcion",
+        concept: taxDocConceptForPlan(normalizePlanSlug(plan_id), "mensual", santiagoDateString()),
       });
     } catch (chargeErr) {
       console.error(`POST /billing/flow/pay-now: cobro rechazado (tenant ${tenant_id}):`, chargeErr.message);
@@ -18571,6 +18619,840 @@ app.get("/billing/documents/:id/download", tenantAuthWrite, async (req, res) => 
   }
 });
 
+/* ======================================================
+   🧾 Documentos tributarios (boleta / factura) por cada pago de Flow
+   (migración migrations/20261026_documentos_tributarios.sql).
+   Cada pago confirmado crea una fila 'pendiente' (idempotente por
+   flow_order); el admin emite el documento en el SII a mano, sube el PDF y
+   la fila pasa a 'emitido'. Reemplaza al flujo de billing_documents (esos
+   endpoints siguen existiendo, pero el panel ya no los usa y la migración
+   copia sus filas acá).
+
+   Nunca rompe un pago: registerTaxDocumentForPayment atrapa todo error.
+   Tolera que la migración aún no esté corrida (solo avisa en el log).
+====================================================== */
+const TAX_DOCS_BUCKET = "documentos-tributarios";
+const TAX_DOC_MAX_BYTES = 5 * 1024 * 1024;
+const TAX_DOC_ADMIN_EMAIL = process.env.TAX_DOCS_ADMIN_EMAIL || "contacto@orbyx.cl";
+const TAX_DOC_ADMIN_URL = "https://www.orbyx.cl/admin/documentos-tributarios";
+const TAX_DOC_PUBLIC_COLUMNS =
+  "id, tenant_id, flow_order, origen, tipo, estado, folio, fecha_emision, fecha_pago, monto_total, monto_neto, monto_iva, concepto, created_at";
+const TAX_DOC_ADMIN_COLUMNS = `${TAX_DOC_PUBLIC_COLUMNS}, datos_receptor, archivo_path, archivo_nombre, nota_credito_folio, nota_credito_path, motivo_anulacion, observaciones, subido_por_email, subido_at`;
+const TAX_DOC_MONTHS_SHORT = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+const uploadTaxDoc = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: TAX_DOC_MAX_BYTES },
+});
+
+function receiveTaxDocFile(req, res, next) {
+  uploadTaxDoc.single("file")(req, res, (err) => {
+    if (!err) return next();
+    const tooBig = err.code === "LIMIT_FILE_SIZE";
+    return res.status(400).json({ error: tooBig ? "El PDF supera los 5 MB" : "Archivo inválido" });
+  });
+}
+
+function santiagoDateString(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Santiago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function formatCLP(value) {
+  const n = Math.round(Number(value) || 0);
+  const digits = String(Math.abs(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+  return n < 0 ? `-$${digits}` : `$${digits}`;
+}
+
+// Neto = total / 1.19 redondeado; IVA = lo que falta para llegar al total.
+function splitTaxAmounts(total) {
+  const t = Math.round(Number(total) || 0);
+  const neto = Math.round(t / 1.19);
+  return { total: t, neto, iva: t - neto };
+}
+
+function normalizeRut(raw) {
+  const clean = String(raw ?? "").replace(/[^0-9kK]/g, "").toUpperCase();
+  if (clean.length < 2) return null;
+  return `${clean.slice(0, -1)}-${clean.slice(-1)}`;
+}
+
+function isValidRut(raw) {
+  const normalized = normalizeRut(raw);
+  if (!normalized) return false;
+  const [body, dv] = normalized.split("-");
+  if (!/^\d{7,8}$/.test(body)) return false;
+  let sum = 0;
+  let mul = 2;
+  for (let i = body.length - 1; i >= 0; i--) {
+    sum += Number(body[i]) * mul;
+    mul = mul === 7 ? 2 : mul + 1;
+  }
+  const rest = 11 - (sum % 11);
+  const expected = rest === 11 ? "0" : rest === 10 ? "K" : String(rest);
+  return expected === dv;
+}
+
+function monthRange(mes) {
+  const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(String(mes || ""));
+  const base = match ? mes : santiagoDateString().slice(0, 7);
+  const [y, m] = base.split("-").map(Number);
+  const next = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, "0")}`;
+  return { mes: base, from: `${base}-01`, to: `${next}-01` };
+}
+
+function taxDocConceptForPlan(planSlug, cycle, paidDate) {
+  const planLabel = planSlug ? planSlug.charAt(0).toUpperCase() + planSlug.slice(1) : "";
+  const [y, m] = paidDate.split("-").map(Number);
+  const cycleLabel = { mensual: "mensual", semestral: "semestral", anual: "anual" }[cycle] || "mensual";
+  return `Suscripción Orbyx – Plan ${planLabel} ${cycleLabel} (${TAX_DOC_MONTHS_SHORT[m - 1]}-${y})`.replace("Plan  ", "Plan ");
+}
+
+function sanitizeSearchTerm(raw) {
+  return String(raw ?? "")
+    .replace(/[^\p{L}\p{N}\s._-]/gu, "")
+    .trim()
+    .slice(0, 60);
+}
+
+// Registra el documento 'pendiente' de un pago confirmado. Idempotente por
+// flow_order: un reintento del webhook (o el mismo pago visto por dos
+// caminos) no duplica ni vuelve a avisar. NUNCA lanza.
+async function registerTaxDocumentForPayment({
+  tenantId,
+  flowOrder,
+  amount,
+  concept,
+  origen = "suscripcion",
+  paidDate = null,
+  notify = true,
+}) {
+  try {
+    const order = String(flowOrder ?? "").trim();
+    const amounts = splitTaxAmounts(amount);
+    if (!tenantId || !order || amounts.total <= 0) {
+      console.warn("registerTaxDocumentForPayment: datos incompletos, no se registra", {
+        tenantId: tenantId || null,
+        flowOrder: order || null,
+        amount,
+      });
+      return { created: false, reason: "datos_incompletos" };
+    }
+    if (await isDemoTenant(tenantId)) return { created: false, reason: "demo" };
+
+    let tenant = null;
+    {
+      const full = await supabase
+        .from("tenants")
+        .select(
+          "name, tipo_documento_preferido, rut_facturacion, razon_social, giro, direccion_facturacion, comuna_facturacion, email_dte"
+        )
+        .eq("id", tenantId)
+        .maybeSingle();
+      if (full.error) {
+        if (!isMissingSchemaError(full.error)) throw full.error;
+        const basic = await supabase.from("tenants").select("name").eq("id", tenantId).maybeSingle();
+        tenant = basic.data || null;
+      } else {
+        tenant = full.data || null;
+      }
+    }
+
+    const tipo = tenant?.tipo_documento_preferido === "factura" ? "factura" : "boleta";
+    const datosReceptor =
+      tipo === "factura"
+        ? {
+            rut: tenant.rut_facturacion || null,
+            razon_social: tenant.razon_social || null,
+            giro: tenant.giro || null,
+            direccion: tenant.direccion_facturacion || null,
+            comuna: tenant.comuna_facturacion || null,
+            email: tenant.email_dte || null,
+          }
+        : null;
+
+    const fechaPago = /^\d{4}-\d{2}-\d{2}$/.test(String(paidDate || "")) ? paidDate : santiagoDateString();
+    const conceptText = String(concept || "").trim().slice(0, 300) || `Cobro Flow #${order}`;
+
+    const { data: inserted, error: insertErr } = await supabase
+      .from("documentos_tributarios")
+      .upsert(
+        {
+          tenant_id: tenantId,
+          flow_order: order,
+          origen,
+          tipo,
+          estado: "pendiente",
+          fecha_pago: fechaPago,
+          monto_total: amounts.total,
+          monto_neto: amounts.neto,
+          monto_iva: amounts.iva,
+          concepto: conceptText,
+          datos_receptor: datosReceptor,
+        },
+        { onConflict: "flow_order", ignoreDuplicates: true }
+      )
+      .select("id");
+
+    if (insertErr) {
+      if (isMissingSchemaError(insertErr)) {
+        console.warn("registerTaxDocumentForPayment: falta correr migrations/20261026_documentos_tributarios.sql");
+        return { created: false, reason: "sin_migracion" };
+      }
+      throw insertErr;
+    }
+
+    const docId = inserted?.[0]?.id;
+    if (!docId) return { created: false, reason: "duplicado" };
+
+    if (notify) {
+      const sent = await sendTaxDocumentPendingAlertEmail({
+        to: TAX_DOC_ADMIN_EMAIL,
+        tipo,
+        businessName: tenant?.name || null,
+        concept: conceptText,
+        totalFormatted: formatCLP(amounts.total),
+        adminUrl: TAX_DOC_ADMIN_URL,
+      });
+      if (sent?.ok) {
+        await supabase
+          .from("documentos_tributarios")
+          .update({ aviso_admin_enviado_at: new Date().toISOString() })
+          .eq("id", docId);
+      } else {
+        console.warn(`registerTaxDocumentForPayment: aviso al admin no enviado (doc ${docId}):`, sent?.reason);
+      }
+    }
+
+    return { created: true, id: docId };
+  } catch (err) {
+    console.error("registerTaxDocumentForPayment error:", err.message, { flowOrder, tenantId });
+    return { created: false, reason: "error" };
+  }
+}
+
+async function signTaxDocUrl(bucket, filePath, fileName, ttlSeconds) {
+  const { data, error } = await supabase.storage
+    .from(bucket || TAX_DOCS_BUCKET)
+    .createSignedUrl(filePath, ttlSeconds, fileName ? { download: fileName } : undefined);
+  if (error || !data?.signedUrl) throw error || new Error("No se pudo generar el enlace");
+  return data.signedUrl;
+}
+
+function isPdfBuffer(file) {
+  return Boolean(
+    file?.buffer?.length &&
+      file.mimetype === "application/pdf" &&
+      file.buffer.subarray(0, 5).toString("latin1") === "%PDF-"
+  );
+}
+
+function adminTaxDocView(row, tenantsById) {
+  const tenant = row.tenant_id ? tenantsById.get(row.tenant_id) : null;
+  const { archivo_path, nota_credito_path, ...rest } = row;
+  return {
+    ...rest,
+    tiene_pdf: Boolean(archivo_path),
+    tiene_nota_credito: Boolean(nota_credito_path),
+    tenant_name: tenant?.name || null,
+    tenant_slug: tenant?.slug || null,
+  };
+}
+
+async function loadTenantsById(ids) {
+  const unique = [...new Set(ids.filter(Boolean))];
+  const map = new Map();
+  if (unique.length === 0) return map;
+  const { data } = await supabase.from("tenants").select("id, name, slug").in("id", unique);
+  for (const t of data || []) map.set(t.id, t);
+  return map;
+}
+
+function csvCell(value) {
+  let text = value == null ? "" : String(value);
+  // Evita inyección de fórmulas al abrir el CSV en Excel.
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+// ---------- Admin ----------
+
+app.get("/admin/documentos-tributarios/pending-count", requireAdminAuth, async (req, res) => {
+  try {
+    const today = santiagoDateString();
+    const [pending, overdue] = await Promise.all([
+      supabase.from("documentos_tributarios").select("id", { count: "exact", head: true }).eq("estado", "pendiente"),
+      supabase
+        .from("documentos_tributarios")
+        .select("id", { count: "exact", head: true })
+        .eq("estado", "pendiente")
+        .lt("fecha_pago", today),
+    ]);
+    const err = pending.error || overdue.error;
+    if (err) {
+      if (isMissingSchemaError(err)) return res.json({ available: false, pending_count: 0, overdue_count: 0 });
+      throw err;
+    }
+    return res.json({ available: true, pending_count: pending.count || 0, overdue_count: overdue.count || 0 });
+  } catch (err) {
+    console.error("GET /admin/documentos-tributarios/pending-count error:", err.message);
+    return res.status(500).json({ error: "No se pudo contar los documentos pendientes" });
+  }
+});
+
+app.get("/admin/documentos-tributarios/resumen", requireAdminAuth, async (req, res) => {
+  try {
+    const { mes, from, to } = monthRange(req.query.mes);
+    const today = santiagoDateString();
+
+    const [pending, overdue, issued, monthRows] = await Promise.all([
+      supabase.from("documentos_tributarios").select("id", { count: "exact", head: true }).eq("estado", "pendiente"),
+      supabase
+        .from("documentos_tributarios")
+        .select("id", { count: "exact", head: true })
+        .eq("estado", "pendiente")
+        .lt("fecha_pago", today),
+      supabase
+        .from("documentos_tributarios")
+        .select("id", { count: "exact", head: true })
+        .eq("estado", "emitido")
+        .gte("fecha_emision", from)
+        .lt("fecha_emision", to),
+      supabase
+        .from("documentos_tributarios")
+        .select("monto_total, monto_neto, monto_iva")
+        .neq("estado", "anulado")
+        .gte("fecha_pago", from)
+        .lt("fecha_pago", to)
+        .limit(5000),
+    ]);
+    const err = pending.error || overdue.error || issued.error || monthRows.error;
+    if (err) {
+      if (isMissingSchemaError(err)) return res.json({ available: false });
+      throw err;
+    }
+
+    const totals = (monthRows.data || []).reduce(
+      (acc, r) => ({
+        total: acc.total + Number(r.monto_total || 0),
+        neto: acc.neto + Number(r.monto_neto || 0),
+        iva: acc.iva + Number(r.monto_iva || 0),
+      }),
+      { total: 0, neto: 0, iva: 0 }
+    );
+
+    return res.json({
+      available: true,
+      mes,
+      pendientes: pending.count || 0,
+      atrasados: overdue.count || 0,
+      emitidos_mes: issued.count || 0,
+      totales_mes: totals,
+    });
+  } catch (err) {
+    console.error("GET /admin/documentos-tributarios/resumen error:", err.message);
+    return res.status(500).json({ error: "No se pudo cargar el resumen" });
+  }
+});
+
+app.get("/admin/documentos-tributarios/exportar", requireAdminAuth, async (req, res) => {
+  try {
+    const { mes, from, to } = monthRange(req.query.mes);
+    const { data, error } = await supabase
+      .from("documentos_tributarios")
+      .select(TAX_DOC_ADMIN_COLUMNS)
+      .gte("fecha_pago", from)
+      .lt("fecha_pago", to)
+      .order("fecha_pago", { ascending: true })
+      .limit(5000);
+    if (error) {
+      if (isMissingSchemaError(error)) return res.status(503).json({ error: "Falta correr la migración de documentos tributarios" });
+      throw error;
+    }
+    const tenantsById = await loadTenantsById((data || []).map((r) => r.tenant_id));
+
+    const header = [
+      "Fecha pago",
+      "Fecha emisión",
+      "Tipo",
+      "Folio",
+      "Negocio",
+      "RUT receptor",
+      "Concepto",
+      "Neto",
+      "IVA",
+      "Total",
+      "Estado",
+    ];
+    const lines = [header.map(csvCell).join(";")];
+    for (const r of data || []) {
+      lines.push(
+        [
+          r.fecha_pago,
+          r.fecha_emision || "",
+          r.tipo,
+          r.folio || "",
+          tenantsById.get(r.tenant_id)?.name || "",
+          r.datos_receptor?.rut || "",
+          r.concepto,
+          r.monto_neto,
+          r.monto_iva,
+          r.monto_total,
+          r.estado,
+        ]
+          .map(csvCell)
+          .join(";")
+      );
+    }
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="documentos-tributarios-${mes}.csv"`);
+    // BOM para que Excel respete los acentos.
+    return res.send(`﻿${lines.join("\r\n")}\r\n`);
+  } catch (err) {
+    console.error("GET /admin/documentos-tributarios/exportar error:", err.message);
+    return res.status(500).json({ error: "No se pudo exportar el CSV" });
+  }
+});
+
+app.get("/admin/documentos-tributarios", requireAdminAuth, async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.page_size, 10) || 25));
+    const estado = ["pendiente", "emitido", "anulado"].includes(req.query.estado) ? req.query.estado : null;
+    const tipo = ["boleta", "factura"].includes(req.query.tipo) ? req.query.tipo : null;
+    const q = sanitizeSearchTerm(req.query.q);
+
+    let query = supabase.from("documentos_tributarios").select(TAX_DOC_ADMIN_COLUMNS, { count: "exact" });
+    if (estado) query = query.eq("estado", estado);
+    if (tipo) query = query.eq("tipo", tipo);
+    if (req.query.mes) {
+      const { from, to } = monthRange(req.query.mes);
+      query = query.gte("fecha_pago", from).lt("fecha_pago", to);
+    }
+    if (q) {
+      const { data: matchTenants } = await supabase
+        .from("tenants")
+        .select("id")
+        .or(`name.ilike.%${q}%,slug.ilike.%${q}%`)
+        .limit(200);
+      const parts = [`folio.ilike.%${q}%`, `flow_order.ilike.%${q}%`, `concepto.ilike.%${q}%`];
+      const ids = (matchTenants || []).map((t) => t.id);
+      if (ids.length) parts.push(`tenant_id.in.(${ids.join(",")})`);
+      query = query.or(parts.join(","));
+    }
+
+    // 'pendiente' > 'emitido' > 'anulado' alfabéticamente: desc deja los
+    // pendientes primero; dentro de cada estado, el pago más reciente arriba.
+    const fromIdx = (page - 1) * pageSize;
+    const { data, error, count } = await query
+      .order("estado", { ascending: false })
+      .order("fecha_pago", { ascending: false })
+      .order("created_at", { ascending: false })
+      .range(fromIdx, fromIdx + pageSize - 1);
+
+    if (error) {
+      if (isMissingSchemaError(error)) return res.json({ available: false, documentos: [], total: 0, page, page_size: pageSize });
+      throw error;
+    }
+    const tenantsById = await loadTenantsById((data || []).map((r) => r.tenant_id));
+    return res.json({
+      available: true,
+      documentos: (data || []).map((r) => adminTaxDocView(r, tenantsById)),
+      total: count || 0,
+      page,
+      page_size: pageSize,
+    });
+  } catch (err) {
+    console.error("GET /admin/documentos-tributarios error:", err.message);
+    return res.status(500).json({ error: "No se pudieron cargar los documentos" });
+  }
+});
+
+// Sube (o reemplaza) el PDF del documento y lo marca 'emitido'.
+app.post("/admin/documentos-tributarios/:id/documento", requireAdminAuth, receiveTaxDocFile, async (req, res) => {
+  try {
+    const { data: doc, error } = await supabase
+      .from("documentos_tributarios")
+      .select(TAX_DOC_ADMIN_COLUMNS + ", archivo_bucket")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (error) {
+      if (isMissingSchemaError(error)) return res.status(503).json({ error: "Falta correr la migración de documentos tributarios" });
+      throw error;
+    }
+    if (!doc) return res.status(404).json({ error: "Documento no encontrado" });
+    if (doc.estado === "anulado") {
+      return res.status(409).json({ error: "El documento está anulado: no se puede subir otro PDF" });
+    }
+    if (!doc.tenant_id) {
+      return res.status(409).json({ error: "El negocio de este documento fue eliminado" });
+    }
+
+    if (!isPdfBuffer(req.file)) {
+      return res.status(400).json({ error: "Adjunta un archivo PDF (máx. 5 MB)" });
+    }
+    const folio = String(req.body?.folio || "").trim().slice(0, 40);
+    if (!folio) return res.status(400).json({ error: "El folio es obligatorio" });
+    const fechaRaw = String(req.body?.fecha_emision || "").trim();
+    if (fechaRaw && !/^\d{4}-\d{2}-\d{2}$/.test(fechaRaw)) {
+      return res.status(400).json({ error: "Fecha de emisión inválida" });
+    }
+    const fechaEmision = fechaRaw || santiagoDateString();
+
+    const filePath = `${doc.tenant_id}/${doc.id}.pdf`;
+    const { error: uploadErr } = await supabase.storage
+      .from(TAX_DOCS_BUCKET)
+      .upload(filePath, req.file.buffer, { contentType: "application/pdf", upsert: true });
+    if (uploadErr) {
+      console.error("POST /admin/documentos-tributarios/:id/documento upload error:", uploadErr.message);
+      return res.status(500).json({ error: "No se pudo guardar el PDF (¿corriste la migración del bucket?)" });
+    }
+
+    const wasPending = doc.estado === "pendiente";
+    const nowIso = new Date().toISOString();
+    const { data: updated, error: updErr } = await supabase
+      .from("documentos_tributarios")
+      .update({
+        estado: "emitido",
+        folio,
+        fecha_emision: fechaEmision,
+        archivo_bucket: TAX_DOCS_BUCKET,
+        archivo_path: filePath,
+        archivo_nombre: `${doc.tipo}-${folio}.pdf`.replace(/[^a-zA-Z0-9._-]/g, "_"),
+        subido_por: req.adminUser?.user_id || null,
+        subido_por_email: req.adminUser?.email || null,
+        subido_at: nowIso,
+        updated_at: nowIso,
+      })
+      .eq("id", doc.id)
+      .select(TAX_DOC_ADMIN_COLUMNS)
+      .single();
+    if (updErr) throw updErr;
+
+    await logAdminTenantAction({
+      tenantId: doc.tenant_id,
+      adminUserId: req.adminUser?.user_id,
+      adminEmail: req.adminUser?.email,
+      actionType: wasPending ? "tax_document_issued" : "tax_document_replaced",
+      details: { document_id: doc.id, tipo: doc.tipo, folio, flow_order: doc.flow_order },
+    });
+
+    // Correo al negocio solo la primera vez (no al reemplazar el archivo).
+    if (wasPending) {
+      try {
+        const { data: tenant } = await supabase
+          .from("tenants")
+          .select("name, slug, email_dte")
+          .eq("id", doc.tenant_id)
+          .maybeSingle();
+        const { ownerEmail } = await getActiveOwnerEmail(doc.tenant_id);
+        const to = tenant?.email_dte || ownerEmail;
+        if (to && tenant?.slug) {
+          const sent = await sendTaxDocumentIssuedEmail({
+            to,
+            businessName: tenant.name,
+            tipo: doc.tipo,
+            folio,
+            concept: doc.concepto,
+            totalFormatted: formatCLP(doc.monto_total),
+            paymentsUrl: `https://www.orbyx.cl/dashboard/${tenant.slug}/billing`,
+          });
+          if (sent?.ok) {
+            await supabase
+              .from("documentos_tributarios")
+              .update({ aviso_tenant_enviado_at: new Date().toISOString() })
+              .eq("id", doc.id);
+          }
+        }
+      } catch (mailErr) {
+        console.error("tax document issued: aviso al negocio falló:", mailErr.message);
+      }
+    }
+
+    const tenantsById = await loadTenantsById([doc.tenant_id]);
+    return res.json({ ok: true, documento: adminTaxDocView(updated, tenantsById) });
+  } catch (err) {
+    console.error("POST /admin/documentos-tributarios/:id/documento error:", err.message);
+    return res.status(500).json({ error: "No se pudo subir el documento" });
+  }
+});
+
+// Anula un documento emitido con su nota de crédito (PDF + folio + motivo).
+app.post("/admin/documentos-tributarios/:id/anular", requireAdminAuth, receiveTaxDocFile, async (req, res) => {
+  try {
+    const { data: doc, error } = await supabase
+      .from("documentos_tributarios")
+      .select("id, tenant_id, estado, tipo, folio, flow_order")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (error) {
+      if (isMissingSchemaError(error)) return res.status(503).json({ error: "Falta correr la migración de documentos tributarios" });
+      throw error;
+    }
+    if (!doc) return res.status(404).json({ error: "Documento no encontrado" });
+    if (doc.estado !== "emitido") {
+      return res.status(409).json({ error: "Solo se puede anular un documento emitido" });
+    }
+    if (!doc.tenant_id) return res.status(409).json({ error: "El negocio de este documento fue eliminado" });
+
+    if (!isPdfBuffer(req.file)) {
+      return res.status(400).json({ error: "Adjunta el PDF de la nota de crédito (máx. 5 MB)" });
+    }
+    const folioNc = String(req.body?.nota_credito_folio || "").trim().slice(0, 40);
+    const motivo = String(req.body?.motivo || "").trim().slice(0, 500);
+    if (!folioNc) return res.status(400).json({ error: "El folio de la nota de crédito es obligatorio" });
+    if (!motivo) return res.status(400).json({ error: "El motivo de la anulación es obligatorio" });
+
+    const ncPath = `${doc.tenant_id}/${doc.id}-nc.pdf`;
+    const { error: uploadErr } = await supabase.storage
+      .from(TAX_DOCS_BUCKET)
+      .upload(ncPath, req.file.buffer, { contentType: "application/pdf", upsert: true });
+    if (uploadErr) {
+      console.error("POST /admin/documentos-tributarios/:id/anular upload error:", uploadErr.message);
+      return res.status(500).json({ error: "No se pudo guardar el PDF de la nota de crédito" });
+    }
+
+    const nowIso = new Date().toISOString();
+    const { data: updated, error: updErr } = await supabase
+      .from("documentos_tributarios")
+      .update({
+        estado: "anulado",
+        nota_credito_folio: folioNc,
+        nota_credito_path: ncPath,
+        motivo_anulacion: motivo,
+        updated_at: nowIso,
+      })
+      .eq("id", doc.id)
+      .eq("estado", "emitido")
+      .select(TAX_DOC_ADMIN_COLUMNS)
+      .single();
+    if (updErr) throw updErr;
+
+    await logAdminTenantAction({
+      tenantId: doc.tenant_id,
+      adminUserId: req.adminUser?.user_id,
+      adminEmail: req.adminUser?.email,
+      actionType: "tax_document_voided",
+      details: { document_id: doc.id, folio: doc.folio, nota_credito_folio: folioNc, motivo, flow_order: doc.flow_order },
+    });
+
+    const tenantsById = await loadTenantsById([doc.tenant_id]);
+    return res.json({ ok: true, documento: adminTaxDocView(updated, tenantsById) });
+  } catch (err) {
+    console.error("POST /admin/documentos-tributarios/:id/anular error:", err.message);
+    return res.status(500).json({ error: "No se pudo anular el documento" });
+  }
+});
+
+// URL firmada (10 min) para ver el PDF del documento o de su nota de crédito.
+app.get("/admin/documentos-tributarios/:id/pdf", requireAdminAuth, async (req, res) => {
+  try {
+    const wantsNc = req.query.tipo === "nota_credito";
+    const { data: doc, error } = await supabase
+      .from("documentos_tributarios")
+      .select("id, tipo, folio, archivo_bucket, archivo_path, archivo_nombre, nota_credito_folio, nota_credito_path")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (error && !isMissingSchemaError(error)) throw error;
+    const filePath = wantsNc ? doc?.nota_credito_path : doc?.archivo_path;
+    if (!doc || !filePath) return res.status(404).json({ error: "El documento no tiene PDF" });
+    const bucket = wantsNc ? TAX_DOCS_BUCKET : doc.archivo_bucket;
+    const name = wantsNc
+      ? `nota-credito-${doc.nota_credito_folio || doc.id}.pdf`
+      : doc.archivo_nombre || `${doc.tipo}-${doc.folio || doc.id}.pdf`;
+    return res.json({ url: await signTaxDocUrl(bucket, filePath, null, 10 * 60), file_name: name });
+  } catch (err) {
+    console.error("GET /admin/documentos-tributarios/:id/pdf error:", err.message);
+    return res.status(500).json({ error: "No se pudo abrir el PDF" });
+  }
+});
+
+// Importa a documentos_tributarios los pagos de Flow que no pasaron por el
+// webhook/cargo (histórico previo a este módulo o avisos perdidos). Idempotente
+// por flow_order; no envía correos. body: { tenant_id? } (sin él, todos).
+app.post("/admin/documentos-tributarios/sincronizar", requireAdminAuth, async (req, res) => {
+  try {
+    const onlyTenant = req.body?.tenant_id ? String(req.body.tenant_id) : null;
+    let subsQuery = supabase
+      .from("subscriptions")
+      .select("tenant_id, flow_customer_id")
+      .not("flow_customer_id", "is", null)
+      .not("tenant_id", "is", null);
+    if (onlyTenant) subsQuery = subsQuery.eq("tenant_id", onlyTenant);
+    const { data: subs, error: subsErr } = await subsQuery;
+    if (subsErr) throw subsErr;
+
+    const tenantIds = [...new Set((subs || []).map((s) => s.tenant_id))];
+    let created = 0;
+    let seen = 0;
+    for (const tenantId of tenantIds) {
+      const charges = await getTenantFlowCharges(tenantId, 100);
+      for (const charge of charges) {
+        if (charge.status !== "Pagado" || !charge.flowOrder || !charge.amount) continue;
+        seen += 1;
+        const result = await registerTaxDocumentForPayment({
+          tenantId,
+          flowOrder: charge.flowOrder,
+          amount: charge.amount,
+          concept: charge.subject || `Cobro Flow #${charge.flowOrder}`,
+          origen: "otro",
+          paidDate: charge.date ? String(charge.date).slice(0, 10) : null,
+          notify: false,
+        });
+        if (result.reason === "sin_migracion") {
+          return res.status(503).json({ error: "Falta correr la migración de documentos tributarios" });
+        }
+        if (result.created) created += 1;
+      }
+    }
+    return res.json({ ok: true, negocios_revisados: tenantIds.length, pagos_encontrados: seen, documentos_creados: created });
+  } catch (err) {
+    console.error("POST /admin/documentos-tributarios/sincronizar error:", err.message);
+    return res.status(500).json({ error: "No se pudo sincronizar con Flow" });
+  }
+});
+
+// ---------- Negocio (tenant) ----------
+
+// Mis pagos y documentos: cada pago registrado con el estado de su documento.
+app.get("/billing/documentos-tributarios", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+    const { data, error } = await supabase
+      .from("documentos_tributarios")
+      .select(`${TAX_DOC_PUBLIC_COLUMNS}, archivo_path, nota_credito_path`)
+      .eq("tenant_id", tenant_id)
+      .order("fecha_pago", { ascending: false })
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (error) {
+      if (isMissingSchemaError(error)) return res.json({ available: false, documentos: [] });
+      throw error;
+    }
+    const documentos = (data || []).map(({ archivo_path, nota_credito_path, tenant_id: _t, ...rest }) => ({
+      ...rest,
+      puede_descargar: rest.estado !== "pendiente" && Boolean(archivo_path),
+      tiene_nota_credito: Boolean(nota_credito_path),
+    }));
+    return res.json({ available: true, documentos });
+  } catch (err) {
+    console.error("GET /billing/documentos-tributarios error:", err.message);
+    return res.status(500).json({ error: "No se pudieron cargar tus documentos" });
+  }
+});
+
+// Descarga por el propio negocio (URL firmada de 5 min). Un documento de
+// otro negocio responde 404 igual que uno inexistente.
+app.get("/billing/documentos-tributarios/:id/descargar", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+    const wantsNc = req.query.tipo === "nota_credito";
+    const { data: doc, error } = await supabase
+      .from("documentos_tributarios")
+      .select("id, tenant_id, tipo, estado, folio, archivo_bucket, archivo_path, nota_credito_folio, nota_credito_path")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (error) {
+      if (isMissingSchemaError(error)) return res.status(404).json({ error: "Documento no encontrado" });
+      throw error;
+    }
+    if (!doc || doc.tenant_id !== tenant_id) {
+      return res.status(404).json({ error: "Documento no encontrado" });
+    }
+    const filePath = wantsNc ? doc.nota_credito_path : doc.archivo_path;
+    if (!filePath || doc.estado === "pendiente") {
+      return res.status(404).json({ error: "El documento aún está en proceso" });
+    }
+    const name = wantsNc
+      ? `nota-credito-${doc.nota_credito_folio || doc.id}.pdf`
+      : `${doc.tipo}-${doc.folio || doc.id}.pdf`;
+    const bucket = wantsNc ? TAX_DOCS_BUCKET : doc.archivo_bucket;
+    return res.json({ url: await signTaxDocUrl(bucket, filePath, name, 5 * 60) });
+  } catch (err) {
+    console.error("GET /billing/documentos-tributarios/:id/descargar error:", err.message);
+    return res.status(500).json({ error: "No se pudo descargar el documento" });
+  }
+});
+
+const BILLING_DATA_COLUMNS =
+  "tipo_documento_preferido, rut_facturacion, razon_social, giro, direccion_facturacion, comuna_facturacion, email_dte";
+
+app.get("/billing/datos-facturacion", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.query;
+    const { data, error } = await supabase.from("tenants").select(BILLING_DATA_COLUMNS).eq("id", tenant_id).maybeSingle();
+    if (error) {
+      if (isMissingSchemaError(error)) return res.json({ available: false });
+      throw error;
+    }
+    if (!data) return res.status(404).json({ error: "Negocio no encontrado" });
+    return res.json({ available: true, ...data, tipo_documento_preferido: data.tipo_documento_preferido || "boleta" });
+  } catch (err) {
+    console.error("GET /billing/datos-facturacion error:", err.message);
+    return res.status(500).json({ error: "No se pudieron cargar los datos de facturación" });
+  }
+});
+
+app.put("/billing/datos-facturacion", tenantAuthWrite, async (req, res) => {
+  try {
+    const { tenant_id } = req.body;
+    const clean = (value, max) => {
+      const text = String(value ?? "").trim().slice(0, max);
+      return text || null;
+    };
+    const tipo = req.body.tipo_documento_preferido === "factura" ? "factura" : "boleta";
+    const rutRaw = clean(req.body.rut_facturacion, 20);
+    const payload = {
+      tipo_documento_preferido: tipo,
+      rut_facturacion: rutRaw ? normalizeRut(rutRaw) : null,
+      razon_social: clean(req.body.razon_social, 200),
+      giro: clean(req.body.giro, 200),
+      direccion_facturacion: clean(req.body.direccion_facturacion, 250),
+      comuna_facturacion: clean(req.body.comuna_facturacion, 100),
+      email_dte: clean(req.body.email_dte, 254),
+    };
+
+    if (payload.email_dte && !/^[^\s@<>"']+@[^\s@<>"']+\.[^\s@<>"']{2,}$/.test(payload.email_dte)) {
+      return res.status(400).json({ error: "El correo para recibir el documento no es válido." });
+    }
+    if (payload.rut_facturacion && !isValidRut(payload.rut_facturacion)) {
+      return res.status(400).json({ error: "El RUT no es válido. Revisa el dígito verificador." });
+    }
+    if (tipo === "factura") {
+      const missing = [];
+      if (!payload.rut_facturacion) missing.push("RUT");
+      if (!payload.razon_social) missing.push("razón social");
+      if (!payload.giro) missing.push("giro");
+      if (!payload.direccion_facturacion) missing.push("dirección");
+      if (missing.length) {
+        return res.status(400).json({ error: `Para recibir factura completa: ${missing.join(", ")}.` });
+      }
+    }
+
+    const { data, error } = await supabase
+      .from("tenants")
+      .update(payload)
+      .eq("id", tenant_id)
+      .select(BILLING_DATA_COLUMNS)
+      .maybeSingle();
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        return res.status(503).json({ error: "Falta correr la migración de documentos tributarios." });
+      }
+      throw error;
+    }
+    if (!data) return res.status(404).json({ error: "Negocio no encontrado" });
+    return res.json({ ok: true, available: true, ...data });
+  } catch (err) {
+    console.error("PUT /billing/datos-facturacion error:", err.message);
+    return res.status(500).json({ error: "No se pudieron guardar los datos de facturación" });
+  }
+});
+
 // =======================
 // SIGNUP PAGADO — PREMIUM/VIP/PLATINUM (pago primero, tenant después)
 // =======================
@@ -18849,6 +19731,11 @@ async function attemptSignupIntentTenantCreation(intent, req) {
           amount: applyIva(addonsCharge.netTotal),
           subject: `Add-ons iniciales: ${addonsCharge.items.map((i) => `${i.addon_key} x${i.quantity}`).join(", ")}`,
           commerceOrder: `addons_signup_${intent.id}_${Date.now()}`,
+        }, {
+          tenantId: tenant.id,
+          concept: `Add-ons Orbyx: ${addonsCharge.items
+            .map((i) => `${ADDON_CATALOG[i.addon_key]?.name || i.addon_key} x${i.quantity}`)
+            .join(", ")}`,
         });
 
         const nowIso = new Date().toISOString();
@@ -19378,6 +20265,9 @@ async function chargeRecurringAddons() {
             amount: applyIva(netAmount),
             subject: `Add-on recurrente: ${row.addon_key} x${row.quantity}`,
             commerceOrder: `addon_recurring_${row.tenant_id}_${row.addon_key}_${Date.now()}`,
+          }, {
+            tenantId: row.tenant_id,
+            concept: `Add-on Orbyx (renovación) – ${ADDON_CATALOG[row.addon_key]?.name || row.addon_key} x${row.quantity}`,
           });
 
           // Renovación mensual pagada = suma otro cupo de pack_size al saldo
@@ -19510,6 +20400,9 @@ async function triggerLowBalanceRecharge(tenant_id, addonId) {
       amount: applyIva(unitPrice),
       subject: "Add-on: wa_confirmacion x1 (recarga automática por saldo bajo)",
       commerceOrder: `addon_lowbalance_${tenant_id}_wa_confirmacion_${Date.now()}`,
+    }, {
+      tenantId: tenant_id,
+      concept: `Add-on Orbyx (recarga automática) – ${addon.name} x1`,
     });
 
     const { error: successErr } = await supabase
