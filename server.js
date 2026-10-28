@@ -3044,6 +3044,124 @@ async function getManualBookingExceptions({
   };
 }
 
+// Fecha (YYYY-MM-DD) + hora manual (HH:MM, múltiplo de 5) → inicio en UTC,
+// armado en America/Santiago. Compartido por POST /appointments/slot y
+// GET /dashboard/booking-check: mismos mensajes, misma conversión.
+function parseManualBookingDateTime(date, time) {
+  const timeMatch = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(time));
+  if (!timeMatch) {
+    return { ok: false, status: 400, error: "La hora manual debe tener formato HH:MM." };
+  }
+  const hour = Number(timeMatch[1]);
+  const minute = Number(timeMatch[2]);
+  if (minute % 5 !== 0) {
+    return { ok: false, status: 400, error: "La hora manual debe ser múltiplo de 5 minutos." };
+  }
+
+  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date));
+  const dateCheck = dateMatch
+    ? new Date(Date.UTC(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3])))
+    : null;
+  if (
+    !dateMatch ||
+    !dateCheck ||
+    dateCheck.getUTCFullYear() !== Number(dateMatch[1]) ||
+    dateCheck.getUTCMonth() !== Number(dateMatch[2]) - 1 ||
+    dateCheck.getUTCDate() !== Number(dateMatch[3])
+  ) {
+    return { ok: false, status: 400, error: "La fecha no es válida (YYYY-MM-DD)." };
+  }
+
+  return {
+    ok: true,
+    startIso: santiagoLocalToUtcIso(String(date), hour, minute),
+    startMin: hour * 60 + minute,
+  };
+}
+
+// Validaciones duras + excepciones (cruces y fuera de horario) de una reserva
+// manual del panel. ÚNICA fuente de estas reglas: la usan POST
+// /appointments/slot (que decide con los flags forzar_*) y
+// GET /dashboard/booking-check (aviso inmediato, solo lectura).
+// Devuelve { ok: false, status, error } o
+// { ok: true, conflicts, outOfHours, outOfHoursReason, endIso, sobrecupoColumnReady }.
+async function checkManualBooking({
+  tenant_id,
+  branch_id,
+  staff_id,
+  service_id,
+  date,
+  startMin,
+  startIso,
+  totalMinutes,
+  isGroup,
+  forceOverlap,
+}) {
+  if (!service_id) {
+    return { ok: false, status: 400, error: "Selecciona un servicio para agendar a una hora manual." };
+  }
+  if (isGroup && forceOverlap) {
+    return {
+      ok: false,
+      status: 400,
+      error: "El sobrecupo no aplica a servicios grupales: los cupos grupales no se pueden exceder.",
+    };
+  }
+
+  const endMin = startMin + totalMinutes;
+  if (endMin > 24 * 60) {
+    return {
+      ok: false,
+      status: 400,
+      error: "La cita no puede cruzar la medianoche. Elige una hora más temprana.",
+    };
+  }
+
+  const { data: staffRow, error: staffErr } = await supabase
+    .from("staff")
+    .select("id")
+    .eq("id", staff_id)
+    .eq("tenant_id", tenant_id)
+    .eq("branch_id", branch_id)
+    .maybeSingle();
+  if (staffErr) {
+    return { ok: false, status: 500, error: staffErr.message };
+  }
+  if (!staffRow) {
+    return { ok: false, status: 404, error: "Profesional no encontrado en esta sucursal." };
+  }
+
+  const serviceStaffIds = await getServiceStaffIds({ tenant_id, branch_id, service_id });
+  if (!serviceStaffIds.includes(String(staff_id))) {
+    return { ok: false, status: 400, error: "El profesional seleccionado no realiza este servicio." };
+  }
+
+  const sobrecupoColumnReady = await hasAppointmentSobrecupoColumn();
+  const endIso = new Date(new Date(startIso).getTime() + totalMinutes * 60 * 1000).toISOString();
+  const exceptions = await getManualBookingExceptions({
+    tenant_id,
+    branch_id,
+    staff_id,
+    date: String(date),
+    startMin,
+    endMin,
+    startIso,
+    endIso,
+    isGroup,
+    withSobrecupoColumn: sobrecupoColumnReady,
+  });
+  if (!exceptions.ok) return exceptions;
+
+  return {
+    ok: true,
+    conflicts: exceptions.conflicts,
+    outOfHours: exceptions.outOfHours,
+    outOfHoursReason: exceptions.outOfHoursReason,
+    endIso,
+    sobrecupoColumnReady,
+  };
+}
+
 async function getServiceStaffIds({ tenant_id, branch_id, service_id }) {
   const { data, error } = await supabase
     .from("staff_services")
@@ -7473,6 +7591,123 @@ async function checkPublicBookingAbuse({ tenantId, normalizedEmail, normalizedPh
   return null;
 }
 
+/* ======================================================
+   GET /dashboard/booking-check  (solo lectura, sin insert)
+   Aviso inmediato del modal "Nueva reserva" del panel: dice si una hora
+   manual está libre, se cruza con otras reservas del profesional y/o queda
+   fuera de su horario. Usa EXACTAMENTE las mismas reglas que POST
+   /appointments/slot (checkManualBooking / parseManualBookingDateTime) y la
+   misma autorización (sesión de un miembro con permiso de Agenda sobre ese
+   negocio y sucursal). El POST sigue siendo la verdad final.
+   Query: slug, staff_id, service_id, date (YYYY-MM-DD), time (HH:MM),
+   branch_id (opcional) y extra_ids (opcional).
+====================================================== */
+app.get("/dashboard/booking-check", dashboardLimiter, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    const queryText = (value) => (typeof value === "string" ? value.trim() : "");
+    const slug = queryText(req.query.slug);
+    const staffId = queryText(req.query.staff_id);
+    const serviceId = queryText(req.query.service_id);
+    const date = queryText(req.query.date);
+    const time = queryText(req.query.time);
+    const branchParam = queryText(req.query.branch_id);
+
+    if (!slug || !serviceId || !staffId || !date || !time) {
+      return res.status(400).json({
+        error: "Faltan campos: slug, staff_id, service_id, date (YYYY-MM-DD) y time (HH:MM).",
+      });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from("tenants")
+      .select("id")
+      .eq("slug", slug)
+      .eq("is_active", true)
+      .single();
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: "negocio no encontrado" });
+    }
+
+    let resolvedBranchId;
+    try {
+      resolvedBranchId = await resolveBranchId({ tenant_id: tenant.id, branch_id: branchParam || null });
+    } catch (branchErr) {
+      return res.status(404).json({ error: "sucursal no encontrada" });
+    }
+
+    // Misma autorización que la reserva del panel (401/403 ya respondidos).
+    const access = await resolveDashboardBookingAccess(req, res, "dashboard", tenant.id, resolvedBranchId);
+    if (access !== true) return;
+
+    const parsed = parseManualBookingDateTime(date, time);
+    if (!parsed.ok) {
+      return res.status(parsed.status).json({ error: parsed.error });
+    }
+
+    const { data: service, error: serviceErr } = await supabase
+      .from("services")
+      .select("*")
+      .eq("id", serviceId)
+      .eq("tenant_id", tenant.id)
+      .eq("branch_id", resolvedBranchId)
+      .is("deleted_at", null)
+      .limit(1)
+      .maybeSingle();
+    if (serviceErr || !service) {
+      return res.status(404).json({ error: "Servicio no encontrado" });
+    }
+
+    const isGroup = Boolean(service.is_group);
+    const bookingExtras = await resolveBookingExtras({
+      tenant_id: tenant.id,
+      branch_id: resolvedBranchId,
+      service_id: serviceId,
+      rawExtraIds: req.query.extra_ids,
+      isGroup,
+    });
+    if (!bookingExtras.ok) {
+      return res.status(bookingExtras.status).json({ error: bookingExtras.error });
+    }
+
+    const totalMinutes =
+      Number(service.duration_minutes || 0) +
+      bookingExtras.minutes +
+      Number(service.buffer_before_minutes || 0) +
+      Number(service.buffer_after_minutes || 0);
+
+    const check = await checkManualBooking({
+      tenant_id: tenant.id,
+      branch_id: resolvedBranchId,
+      staff_id: staffId,
+      service_id: serviceId,
+      date,
+      startMin: parsed.startMin,
+      startIso: parsed.startIso,
+      totalMinutes,
+      isGroup,
+      forceOverlap: false,
+    });
+    if (!check.ok) {
+      return res.status(check.status).json({ error: check.error });
+    }
+
+    return res.json({
+      ok: true,
+      conflicts: check.conflicts,
+      out_of_hours: check.outOfHours,
+      out_of_hours_reason: check.outOfHoursReason,
+      slot_start: parsed.startIso,
+      slot_end: check.endIso,
+      // El POST rechaza horas que ya pasaron (409 "Ese horario ya pasó.").
+      in_past: new Date(parsed.startIso).getTime() < Date.now(),
+    });
+  } catch (err) {
+    console.error("GET /dashboard/booking-check error:", err.message);
+    return res.status(500).json({ error: "No se pudo revisar el horario." });
+  }
+});
+
 app.post(
   "/appointments/slot",
   publicLimiter,
@@ -7650,34 +7885,15 @@ const {
     }
 
     if (manualMode) {
-      const timeMatch = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(manualTimeRaw));
-      if (!timeMatch) {
-        return res.status(400).json({ error: "La hora manual debe tener formato HH:MM." });
-      }
-      const manualHour = Number(timeMatch[1]);
-      const manualMinute = Number(timeMatch[2]);
-      if (manualMinute % 5 !== 0) {
-        return res.status(400).json({ error: "La hora manual debe ser múltiplo de 5 minutos." });
-      }
-
-      const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date));
-      const dateCheck = dateMatch
-        ? new Date(Date.UTC(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3])))
-        : null;
-      if (
-        !dateMatch ||
-        !dateCheck ||
-        dateCheck.getUTCFullYear() !== Number(dateMatch[1]) ||
-        dateCheck.getUTCMonth() !== Number(dateMatch[2]) - 1 ||
-        dateCheck.getUTCDate() !== Number(dateMatch[3])
-      ) {
-        return res.status(400).json({ error: "La fecha no es válida (YYYY-MM-DD)." });
+      const manualParsed = parseManualBookingDateTime(date, manualTimeRaw);
+      if (!manualParsed.ok) {
+        return res.status(manualParsed.status).json({ error: manualParsed.error });
       }
 
       // La hora se arma en el backend con la zona America/Santiago: no se
       // confía en el ISO que arme el navegador.
-      effectiveSlotStart = santiagoLocalToUtcIso(String(date), manualHour, manualMinute);
-      manualStartMin = manualHour * 60 + manualMinute;
+      effectiveSlotStart = manualParsed.startIso;
+      manualStartMin = manualParsed.startMin;
 
       if (!staff_id) {
         return res.status(400).json({ error: "Selecciona un profesional para agendar a una hora manual." });
@@ -7835,62 +8051,23 @@ const appointmentRequiresDeposit = tenantRequiresDeposit && serviceRequiresDepos
     // medianoche, profesional/servicio del negocio y sucursal.
     let sobrecupoForced = false;
     if (manualMode) {
-      if (!service_id) {
-        return res.status(400).json({ error: "Selecciona un servicio para agendar a una hora manual." });
-      }
-      if (isGroup && forceOverlap) {
-        return res.status(400).json({
-          error: "El sobrecupo no aplica a servicios grupales: los cupos grupales no se pueden exceder.",
-        });
-      }
-
-      const manualTotalMinutes = duration + extrasMinutes + bufferBefore + bufferAfter;
-      const manualEndMin = manualStartMin + manualTotalMinutes;
-      if (manualEndMin > 24 * 60) {
-        return res.status(400).json({
-          error: "La cita no puede cruzar la medianoche. Elige una hora más temprana.",
-        });
-      }
-
-      const { data: manualStaffRow, error: manualStaffErr } = await supabase
-        .from("staff")
-        .select("id")
-        .eq("id", staff_id)
-        .eq("tenant_id", cal.tenant_id)
-        .eq("branch_id", resolvedBranchId)
-        .maybeSingle();
-      if (manualStaffErr) {
-        return res.status(500).json({ error: manualStaffErr.message });
-      }
-      if (!manualStaffRow) {
-        return res.status(404).json({ error: "Profesional no encontrado en esta sucursal." });
-      }
-
-      const manualServiceStaffIds = await getServiceStaffIds({
-        tenant_id: cal.tenant_id,
-        branch_id: resolvedBranchId,
-        service_id,
-      });
-      if (!manualServiceStaffIds.includes(String(staff_id))) {
-        return res.status(400).json({ error: "El profesional seleccionado no realiza este servicio." });
-      }
-
-      const sobrecupoColumnReady = await hasAppointmentSobrecupoColumn();
-      const manualExceptions = await getManualBookingExceptions({
+      const manualCheck = await checkManualBooking({
         tenant_id: cal.tenant_id,
         branch_id: resolvedBranchId,
         staff_id,
+        service_id,
         date: String(date),
         startMin: manualStartMin,
-        endMin: manualEndMin,
         startIso,
-        endIso: new Date(start.getTime() + manualTotalMinutes * 60 * 1000).toISOString(),
+        totalMinutes: duration + extrasMinutes + bufferBefore + bufferAfter,
         isGroup,
-        withSobrecupoColumn: sobrecupoColumnReady,
+        forceOverlap,
       });
-      if (!manualExceptions.ok) {
-        return res.status(manualExceptions.status).json({ error: manualExceptions.error });
+      if (!manualCheck.ok) {
+        return res.status(manualCheck.status).json({ error: manualCheck.error });
       }
+      const manualExceptions = manualCheck;
+      const sobrecupoColumnReady = manualCheck.sobrecupoColumnReady;
 
       const hasConflicts = manualExceptions.conflicts.length > 0;
       const needsOverlapConfirm = hasConflicts && !forceOverlap;
