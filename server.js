@@ -2937,6 +2937,113 @@ async function subtractAppointmentsFromWindows({
   return result;
 }
 
+/* ======================================================
+   Reserva manual desde el panel: hora libre, sobrecupo y fuera de horario
+   (2026-10-28). Solo la usa POST /appointments/slot cuando la reserva viene
+   del panel (isDashboardBooking === true) con `manual_time`.
+====================================================== */
+
+// Motivo por el que [startMin, endMin) (minutos del día local) no cabe en las
+// ventanas de disponibilidad del profesional, o null si cabe.
+//   dia_cerrado    : sin horario ese día (o cierre por fecha especial)
+//   bloqueo        : cae sobre un bloqueo (rápido o de fecha especial) o un hueco entre ventanas
+//   antes_apertura : empieza antes de la primera ventana
+//   despues_cierre : termina después de la última ventana
+function classifyManualOutOfHours(availability, startMin, endMin) {
+  const windows = availability?.windows || [];
+  if (windows.some((w) => startMin >= w.start && endMin <= w.end)) return null;
+
+  const closedRows = (availability?.appliedSpecialDates || []).filter((row) => row.is_closed);
+  const closedRange = (row) => {
+    const start = timeToMinutes(row.start_time);
+    const end = timeToMinutes(row.end_time);
+    return start !== null && end !== null ? { start, end } : { start: 0, end: 24 * 60 };
+  };
+  const intersecting = closedRows.filter((row) => {
+    const range = closedRange(row);
+    return range.start < endMin && range.end > startMin;
+  });
+
+  if (windows.length === 0) {
+    return intersecting.some((row) => row.source === "quick_block") ? "bloqueo" : "dia_cerrado";
+  }
+
+  if (intersecting.length > 0) return "bloqueo";
+
+  const firstStart = Math.min(...windows.map((w) => w.start));
+  const lastEnd = Math.max(...windows.map((w) => w.end));
+  if (startMin < firstStart) return "antes_apertura";
+  if (endMin > lastEnd) return "despues_cierre";
+  return "bloqueo"; // hueco entre dos ventanas (descanso)
+}
+
+// Excepciones de una reserva manual: citas `booked` del profesional que se
+// cruzan con [startIso, endIso) y, aparte, si queda fuera de sus ventanas de
+// disponibilidad. Los servicios grupales no tienen "cruces" (usan cupos).
+async function getManualBookingExceptions({
+  tenant_id,
+  branch_id,
+  staff_id,
+  date,
+  startMin,
+  endMin,
+  startIso,
+  endIso,
+  isGroup,
+  withSobrecupoColumn,
+}) {
+  const availability = await getEffectiveStaffAvailability({
+    tenant_id,
+    branch_id,
+    staff_id,
+    date,
+  });
+
+  if (availability.source === "staff_inactive") {
+    return { ok: false, status: 400, error: "El profesional no está activo." };
+  }
+
+  const outOfHoursReason = classifyManualOutOfHours(availability, startMin, endMin);
+
+  let conflicts = [];
+  if (!isGroup) {
+    const { data, error } = await supabase
+      .from("appointments")
+      .select(
+        withSobrecupoColumn
+          ? "id, start_at, end_at, staff_id, customer_name, service_name_snapshot, sobrecupo"
+          : "id, start_at, end_at, staff_id, customer_name, service_name_snapshot"
+      )
+      .eq("tenant_id", tenant_id)
+      .eq("branch_id", branch_id)
+      .eq("staff_id", staff_id)
+      .eq("status", "booked")
+      .lt("start_at", endIso)
+      .gt("end_at", startIso)
+      .order("start_at", { ascending: true })
+      .limit(20);
+
+    if (error) throw error;
+
+    conflicts = (data || []).map((appt) => ({
+      id: appt.id,
+      start_at: appt.start_at,
+      end_at: appt.end_at,
+      customer_name: appt.customer_name || null,
+      service_name: appt.service_name_snapshot || null,
+      staff_id: appt.staff_id || null,
+      sobrecupo: Boolean(appt.sobrecupo),
+    }));
+  }
+
+  return {
+    ok: true,
+    conflicts,
+    outOfHours: outOfHoursReason !== null,
+    outOfHoursReason,
+  };
+}
+
 async function getServiceStaffIds({ tenant_id, branch_id, service_id }) {
   const { data, error } = await supabase
     .from("staff_services")
@@ -7255,7 +7362,9 @@ app.get("/slots", publicLimiter, async (req, res) => {
 // con permiso de escritura en Agenda. Devuelve false si no viene del
 // dashboard, true si viene y la sesión alcanza, y null si dice venir del
 // dashboard pero no alcanza (en ese caso ya respondió 401/403).
-async function resolveDashboardBookingAccess(req, res, origin, tenantId) {
+// `branchId` (opcional): sucursal de la reserva; un usuario restringido a otras
+// sucursales recibe 403 (antes solo se validaba el negocio, no la sucursal).
+async function resolveDashboardBookingAccess(req, res, origin, tenantId, branchId) {
   if (origin !== "dashboard") return false;
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -7271,7 +7380,13 @@ async function resolveDashboardBookingAccess(req, res, origin, tenantId) {
     return null;
   }
   req.authenticatedUser = { user_id: user.id };
-  const allowed = await requireTenantWriteAccessForResource(req, res, tenantId, "agenda");
+  const allowed = await requireTenantWriteAccessForResource(
+    req,
+    res,
+    tenantId,
+    "agenda",
+    branchId || undefined
+  );
   return allowed ? true : null;
 }
 
@@ -7406,10 +7521,12 @@ const {
     const normalizedEmail = String(customer_email || "").trim().toLowerCase();
     const normalizedPhone = normalizeBookingPhone(customer_phone);
 
+    // `manual_time` (hora libre del panel) reemplaza a slot_start, pero solo
+    // se honra más abajo si la reserva viene del panel con sesión válida.
     if (
       !calendar_id ||
       !date ||
-      !slot_start ||
+      (!slot_start && !req.body?.manual_time) ||
       !customer_name ||
       !customer_phone
     ) {
@@ -7509,9 +7626,63 @@ const {
       req,
       res,
       req.body?.booking_origin,
-      cal.tenant_id
+      cal.tenant_id,
+      resolvedBranchId
     );
     if (isDashboardBooking === null) return;
+
+    // Hora libre / sobrecupo / fuera de horario (2026-10-28): SOLO desde el
+    // panel con sesión válida (isDashboardBooking === true). En la reserva
+    // pública estos campos se ignoran por completo (no se leen).
+    const manualTimeRaw = isDashboardBooking === true ? req.body?.manual_time : undefined;
+    const manualMode = manualTimeRaw !== undefined && manualTimeRaw !== null && manualTimeRaw !== "";
+    const forceOverlap = manualMode && req.body?.forzar_sobrecupo === true;
+    const forceOutOfHours = manualMode && req.body?.forzar_fuera_horario === true;
+
+    let effectiveSlotStart = slot_start;
+    let manualStartMin = 0;
+
+    if (!manualMode && !slot_start) {
+      return res.status(400).json({
+        error:
+          "Faltan campos: calendar_id, date (YYYY-MM-DD), slot_start (ISO), customer_name, customer_phone, customer_email",
+      });
+    }
+
+    if (manualMode) {
+      const timeMatch = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(manualTimeRaw));
+      if (!timeMatch) {
+        return res.status(400).json({ error: "La hora manual debe tener formato HH:MM." });
+      }
+      const manualHour = Number(timeMatch[1]);
+      const manualMinute = Number(timeMatch[2]);
+      if (manualMinute % 5 !== 0) {
+        return res.status(400).json({ error: "La hora manual debe ser múltiplo de 5 minutos." });
+      }
+
+      const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date));
+      const dateCheck = dateMatch
+        ? new Date(Date.UTC(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3])))
+        : null;
+      if (
+        !dateMatch ||
+        !dateCheck ||
+        dateCheck.getUTCFullYear() !== Number(dateMatch[1]) ||
+        dateCheck.getUTCMonth() !== Number(dateMatch[2]) - 1 ||
+        dateCheck.getUTCDate() !== Number(dateMatch[3])
+      ) {
+        return res.status(400).json({ error: "La fecha no es válida (YYYY-MM-DD)." });
+      }
+
+      // La hora se arma en el backend con la zona America/Santiago: no se
+      // confía en el ISO que arme el navegador.
+      effectiveSlotStart = santiagoLocalToUtcIso(String(date), manualHour, manualMinute);
+      manualStartMin = manualHour * 60 + manualMinute;
+
+      if (!staff_id) {
+        return res.status(400).json({ error: "Selecciona un profesional para agendar a una hora manual." });
+      }
+    }
 
     // Reserva pública: el email sigue siendo obligatorio. Reserva del
     // negocio (dashboard): opcional — clientes migrados sin email; en ese
@@ -7562,7 +7733,7 @@ const {
       tenantConfig.max_booking_days_ahead || 60
     );
 
-    const start = new Date(slot_start);
+    const start = new Date(effectiveSlotStart);
 
     const minAllowedStart = new Date(
       Date.now() + minBookingNoticeMinutes * 60 * 1000
@@ -7655,6 +7826,102 @@ const extrasMinutes = bookingExtras.minutes;
 // forma de saber esto, así que no se exige depósito.
 const appointmentRequiresDeposit = tenantRequiresDeposit && serviceRequiresDeposit;
 
+    // ---- Reserva manual desde el panel (hora libre) ----
+    // Reemplaza la validación contra la grilla por dos chequeos explícitos:
+    //  a) cruce con citas `booked` del profesional  -> pide forzar_sobrecupo
+    //  b) fuera de sus ventanas de disponibilidad    -> pide forzar_fuera_horario
+    // Si falta algún flag responde UN solo 409 con ambas advertencias.
+    // Siguen siendo duras (400): hora múltiplo de 5, fecha válida, no cruzar
+    // medianoche, profesional/servicio del negocio y sucursal.
+    let sobrecupoForced = false;
+    if (manualMode) {
+      if (!service_id) {
+        return res.status(400).json({ error: "Selecciona un servicio para agendar a una hora manual." });
+      }
+      if (isGroup && forceOverlap) {
+        return res.status(400).json({
+          error: "El sobrecupo no aplica a servicios grupales: los cupos grupales no se pueden exceder.",
+        });
+      }
+
+      const manualTotalMinutes = duration + extrasMinutes + bufferBefore + bufferAfter;
+      const manualEndMin = manualStartMin + manualTotalMinutes;
+      if (manualEndMin > 24 * 60) {
+        return res.status(400).json({
+          error: "La cita no puede cruzar la medianoche. Elige una hora más temprana.",
+        });
+      }
+
+      const { data: manualStaffRow, error: manualStaffErr } = await supabase
+        .from("staff")
+        .select("id")
+        .eq("id", staff_id)
+        .eq("tenant_id", cal.tenant_id)
+        .eq("branch_id", resolvedBranchId)
+        .maybeSingle();
+      if (manualStaffErr) {
+        return res.status(500).json({ error: manualStaffErr.message });
+      }
+      if (!manualStaffRow) {
+        return res.status(404).json({ error: "Profesional no encontrado en esta sucursal." });
+      }
+
+      const manualServiceStaffIds = await getServiceStaffIds({
+        tenant_id: cal.tenant_id,
+        branch_id: resolvedBranchId,
+        service_id,
+      });
+      if (!manualServiceStaffIds.includes(String(staff_id))) {
+        return res.status(400).json({ error: "El profesional seleccionado no realiza este servicio." });
+      }
+
+      const sobrecupoColumnReady = await hasAppointmentSobrecupoColumn();
+      const manualExceptions = await getManualBookingExceptions({
+        tenant_id: cal.tenant_id,
+        branch_id: resolvedBranchId,
+        staff_id,
+        date: String(date),
+        startMin: manualStartMin,
+        endMin: manualEndMin,
+        startIso,
+        endIso: new Date(start.getTime() + manualTotalMinutes * 60 * 1000).toISOString(),
+        isGroup,
+        withSobrecupoColumn: sobrecupoColumnReady,
+      });
+      if (!manualExceptions.ok) {
+        return res.status(manualExceptions.status).json({ error: manualExceptions.error });
+      }
+
+      const hasConflicts = manualExceptions.conflicts.length > 0;
+      const needsOverlapConfirm = hasConflicts && !forceOverlap;
+      const needsHoursConfirm = manualExceptions.outOfHours && !forceOutOfHours;
+
+      if (needsOverlapConfirm || needsHoursConfirm) {
+        const warningParts = [];
+        if (hasConflicts) warningParts.push("se cruza con otra reserva");
+        if (manualExceptions.outOfHours) warningParts.push("queda fuera de tu horario de atención");
+        return res.status(409).json({
+          error: `Esta hora ${warningParts.join(" y ")}.`,
+          requires_confirmation: true,
+          conflicts: manualExceptions.conflicts,
+          out_of_hours: manualExceptions.outOfHours,
+          out_of_hours_reason: manualExceptions.outOfHoursReason,
+        });
+      }
+
+      if (hasConflicts) {
+        // forceOverlap está activo: se agenda encima de otra cita.
+        if (!sobrecupoColumnReady) {
+          return res.status(503).json({
+            error:
+              "El sobrecupo todavía no está habilitado (falta aplicar la migración 2026-10-28-appointments-sobrecupo.sql).",
+            code: "sobrecupo_unavailable",
+          });
+        }
+        sobrecupoForced = true;
+      }
+    }
+
     let bookingQuery = supabase
   .from("appointments")
   .select("id", { count: "exact" })
@@ -7678,7 +7945,8 @@ if (countErr) {
 
 // 🧠 Lógica híbrida
 if (!isGroup) {
-  if (existingCount > 0) {
+  // Sobrecupo confirmado desde el panel: el mismo inicio ya no es un error.
+  if (existingCount > 0 && !sobrecupoForced) {
     return res.status(409).json({
       error: "Este horario acaba de ser reservado por otro cliente.",
     });
@@ -7699,7 +7967,10 @@ if (!isGroup) {
     // Antes se traían TODAS las reservas futuras del negocio para filtrarlas
     // acá (se rompía sobre 1000 filas, el tope de PostgREST). Ahora cada
     // consulta trae solo las de ese correo / ese teléfono.
-    if (!isGroup) {
+    // Límites de reservas futuras por persona: solo para la reserva pública.
+    // Quien agenda desde el panel (isDashboardBooking, ya autenticado) no los
+    // tiene: una clienta habitual puede tener varias citas a la vez.
+    if (!isGroup && !isDashboardBooking) {
       const escapedEmailPattern = normalizedEmail.replace(/[\\%_]/g, "\\$&");
       const personSelect = "id, customer_name, customer_email, customer_phone";
 
@@ -7765,6 +8036,9 @@ if (!isGroup) {
 
 const slotDateStr = String(date).slice(0, 10);
 
+    // Con hora manual del panel la validación ya se hizo arriba (cruces y
+    // fuera de horario, con sus flags); sin ella, la grilla de siempre.
+    if (!manualMode) {
     let validSlots = [];
 
     if (staff_id) {
@@ -7862,6 +8136,7 @@ const slotDateStr = String(date).slice(0, 10);
         error: "Ese horario ya no está disponible.",
       });
     }
+    }
 
     const end = new Date(
       start.getTime() + (duration + extrasMinutes + bufferBefore + bufferAfter) * 60 * 1000
@@ -7937,6 +8212,9 @@ reason: reason || null,
 notes: notes || null,
 next_control_at: next_control_at || null,
         cancel_token: cancelToken,
+        // Trazabilidad del sobrecupo confirmado desde el panel. Solo se envía
+        // cuando es true (el trigger se salta el cruce SOLO con este valor).
+        ...(sobrecupoForced && { sobrecupo: true }),
         ...(appointmentRequiresDeposit && {
           deposit_status: "pending",
           deposit_hold_expires_at: depositHoldExpiresAt,
@@ -21910,6 +22188,19 @@ async function hasAppointmentExtrasColumns() {
     .select("extras, extras_minutes, extras_price, price_snapshot")
     .limit(1);
   appointmentExtrasColumnsCache = { value: !error, checkedAt: Date.now() };
+  return !error;
+}
+
+// ¿appointments ya tiene la columna `sobrecupo`? (migración
+// 2026-10-28-appointments-sobrecupo.sql). Mismo patrón que arriba: sin la
+// migración, POST /appointments/slot sigue funcionando igual y solo rechaza
+// el sobrecupo explícito con un 503 claro.
+let appointmentSobrecupoColumnCache = { value: false, checkedAt: 0 };
+async function hasAppointmentSobrecupoColumn() {
+  if (appointmentSobrecupoColumnCache.value) return true;
+  if (Date.now() - appointmentSobrecupoColumnCache.checkedAt < 60 * 1000) return false;
+  const { error } = await supabase.from("appointments").select("sobrecupo").limit(1);
+  appointmentSobrecupoColumnCache = { value: !error, checkedAt: Date.now() };
   return !error;
 }
 
