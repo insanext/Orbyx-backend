@@ -374,6 +374,7 @@ Optional add-ons a customer adds to a service when booking (e.g. "Lavado +$2.000
 - Block content by height: name (+ start time) → time range → service (only full width) → professional name (week, no staff filter). Left border = staff color; background = status color (`getCardClass`). Group classes keep `getGroupBookingStyles`.
 - List view (compact card): professional on its own line with a staff-color dot (it used to be appended to the service and got truncated).
 - The old "N Agendamientos" week aggregate (`getWeekSlotDisplayGroups`) was removed; the popover (`selectedWeekGroup`) is now only opened by "+N".
+- **Mobile week grid (2026-10-28)**, `agenda/page.tsx` (the `mobileTab === "week"` block, <768px only; desktop untouched): each cell is a button with a rounded tile inside (the gap between tiles is the button's padding, so the TODAY column can carry one continuous border: `mobileWeekColumnStyle`). Single appointment → status gradient; 2+ blocks with different statuses → diagonal stripes, one per distinct status (max 4) + count badge (`statusSplitGradient`/`statusTileGradient`/`statusTileShadow` in `lib/appointment-status-colors.ts`). Today uses cyan (`--agenda-today-accent` in the page's scoped `<style>`, darker in the light theme) so it doesn't clash with the blue of "Agendado". Palette button next to "Lista" opens the status legend (`STATUS_LEGEND_ITEMS`, shared with the desktop "!" legend). Verified headless at 390px in both themes with a throwaway harness (not committed).
 
 ## Billing documents / boletas (2026-10-26)
 
